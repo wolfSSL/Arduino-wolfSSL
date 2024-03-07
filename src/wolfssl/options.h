@@ -237,6 +237,15 @@ extern "C" {
 #undef  HAVE_X963_KDF
 #define HAVE_X963_KDF
 
+#undef  WC_SRTP_KDF
+#define WC_SRTP_KDF
+
+#undef  HAVE_AES_ECB
+#define HAVE_AES_ECB
+
+#undef  WOLFSSL_AES_DIRECT
+#define WOLFSSL_AES_DIRECT
+
 #undef  HAVE_ECC
 #define HAVE_ECC
 
@@ -357,14 +366,14 @@ extern "C" {
 #undef  WOLFSSL_AES_DIRECT
 #define WOLFSSL_AES_DIRECT
 
+#undef  HAVE_WEBSERVER
+#define HAVE_WEBSERVER
+
 #undef  WOLFSSL_AES_XTS
 #define WOLFSSL_AES_XTS
 
 #undef  WOLFSSL_AES_DIRECT
 #define WOLFSSL_AES_DIRECT
-
-#undef  HAVE_WEBSERVER
-#define HAVE_WEBSERVER
 
 #undef  WOLFSSL_SHA3
 #define WOLFSSL_SHA3
@@ -434,6 +443,9 @@ extern "C" {
 
 #undef  HAVE_FALLBACK_SCSV
 #define HAVE_FALLBACK_SCSV
+
+#undef  HAVE_KEYING_MATERIAL
+#define HAVE_KEYING_MATERIAL
 
 #undef  HAVE_TLS_EXTENSIONS
 #define HAVE_TLS_EXTENSIONS
@@ -767,6 +779,9 @@ extern "C" {
 
 #undef  WOLFSSL_AESGCM_STREAM
 #define WOLFSSL_AESGCM_STREAM
+
+#undef  WOLFSSL_SRTP
+#define WOLFSSL_SRTP
 
 #undef  WOLFSSL_MULTICAST
 #define WOLFSSL_MULTICAST

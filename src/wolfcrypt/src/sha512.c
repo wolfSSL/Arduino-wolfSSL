@@ -39,8 +39,8 @@
      * By default the HW acceleration is on for ESP32 Chipsets,
      * but individual components can be turned off. See user_settings.h
      */
+    #define TAG "wc_sha_512"
     #define WOLFSSL_USE_ESP32_CRYPT_HASH_HW
-    static const char* TAG = "wc_sha_512";
 #else
     #undef WOLFSSL_USE_ESP32_CRYPT_HASH_HW
 #endif
@@ -321,8 +321,6 @@ static int InitSha512_256(wc_Sha512* sha512)
 #if defined(USE_INTEL_SPEEDUP) && \
     (defined(HAVE_INTEL_AVX1) || defined(HAVE_INTEL_AVX2))
 
-#ifdef WOLFSSL_SHA512
-
     /*****
     Intel AVX1/AVX2 Macro Control Structure
 
@@ -486,7 +484,6 @@ static int InitSha512_256(wc_Sha512* sha512)
 
         transform_check = 1;
     }
-#endif /* WOLFSSL_SHA512 */
 
 #else
     #define Transform_Sha512(sha512) _Transform_Sha512(sha512)
@@ -942,7 +939,11 @@ static WC_INLINE int Sha512Final(wc_Sha512* sha512)
 
     /* pad with zeros */
     if (sha512->buffLen > WC_SHA512_PAD_SIZE) {
-        XMEMSET(&local[sha512->buffLen], 0, WC_SHA512_BLOCK_SIZE - sha512->buffLen);
+        if (sha512->buffLen < WC_SHA512_BLOCK_SIZE ) {
+            XMEMSET(&local[sha512->buffLen], 0,
+                WC_SHA512_BLOCK_SIZE - sha512->buffLen);
+        }
+
         sha512->buffLen += WC_SHA512_BLOCK_SIZE - sha512->buffLen;
 #if defined(LITTLE_ENDIAN_ORDER)
     #if defined(USE_INTEL_SPEEDUP) && \

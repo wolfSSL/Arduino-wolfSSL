@@ -2314,12 +2314,6 @@ int InitSSL_Ctx(WOLFSSL_CTX* ctx, WOLFSSL_METHOD* method, void* heap)
             ctx->CBIORecvFrom = uIPRecvFrom;
         }
         #endif
-    #elif defined(ARDUINO)
-        #if defined(__AVR__)
-            /* likely not available here*/
-        #elif defined(ESP32) || defined(ESP8266)
-            /* TODO */
-        #endif /* Arduino */
     #else
         ctx->CBIORecv = EmbedReceive;
         ctx->CBIOSend = EmbedSend;
@@ -5434,7 +5428,9 @@ int EccMakeKey(WOLFSSL* ssl, ecc_key* key, ecc_key* peer)
         keySz = ssl->eccTempKeySz;
         /* get curve type */
         if (ssl->ecdhCurveOID > 0) {
+            WOLFSSL_MSG("calling ecc_cuve"); /* TODO; review */
             ecc_curve = wc_ecc_get_oid(ssl->ecdhCurveOID, NULL, NULL);
+            WOLFSSL_MSG("ecc_curve done");
         }
     #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3) && \
         (defined(WOLFSSL_SM4_CBC) || defined(WOLFSSL_SM4_GCM) || \
@@ -5468,7 +5464,9 @@ int EccMakeKey(WOLFSSL* ssl, ecc_key* key, ecc_key* peer)
     else
 #endif
     {
+        WOLFSSL_MSG("make key"); /* TODO review */
         ret = wc_ecc_make_key_ex(ssl->rng, keySz, key, ecc_curve);
+        WOLFSSL_MSG("make key done");
     }
 
     /* make sure the curve is set for TLS */
@@ -7411,6 +7409,7 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
 
     /* all done with init, now can return errors, call other stuff */
     if ((ret = ReinitSSL(ssl, ctx, writeDup)) != 0) {
+        WOLFSSL_MSG_EX("ReinitSSL failed. err = %d", ret);
         return ret;
     }
 
@@ -7444,6 +7443,7 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
         && ret != NO_PRIVATE_KEY
 #endif
         ) {
+        WOLFSSL_MSG_EX("SetSSL_CTX failed. err = %d", ret);
         return ret;
     }
     ssl->options.dtls = ssl->version.major == DTLS_MAJOR;
@@ -7457,20 +7457,21 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
 
     /* hsHashes */
     ret = InitHandshakeHashes(ssl);
-    if (ret != 0)
+    if (ret != 0) {
+        WOLFSSL_MSG_EX("InitHandshakeHashes failed. err = %d", ret);
         return ret;
+    }
 
 #if defined(WOLFSSL_DTLS) && !defined(NO_WOLFSSL_SERVER)
     if (ssl->options.dtls && ssl->options.side == WOLFSSL_SERVER_END) {
-        if (!IsAtLeastTLSv1_3(ssl->version)) {
-                ret = wolfSSL_DTLS_SetCookieSecret(ssl, NULL, 0);
-                if (ret != 0) {
-                    WOLFSSL_MSG("DTLS Cookie Secret error");
-                    return ret;
-                }
+        /* Initialize both in case we allow downgrading. */
+        ret = wolfSSL_DTLS_SetCookieSecret(ssl, NULL, 0);
+        if (ret != 0) {
+            WOLFSSL_MSG("DTLS Cookie Secret error");
+            return ret;
         }
 #if defined(WOLFSSL_DTLS13) && defined(WOLFSSL_SEND_HRR_COOKIE)
-        else {
+        if (IsAtLeastTLSv1_3(ssl->version)) {
             ret = wolfSSL_send_hrr_cookie(ssl, NULL, 0);
             if (ret != WOLFSSL_SUCCESS) {
                 WOLFSSL_MSG("DTLS1.3 Cookie secret error");
@@ -7500,10 +7501,10 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
 
     ssl->session = wolfSSL_NewSession(ssl->heap);
     if (ssl->session == NULL) {
-        WOLFSSL_MSG("SSL Session Memory error");
+        WOLFSSL_MSG_EX("SSL Session Memory error. wolfSSL_NewSession "
+                       "err = %d", ret);
         return MEMORY_E;
     }
-
 #ifdef HAVE_SESSION_TICKET
     ssl->options.noTicketTls12 = ctx->noTicketTls12;
 #endif
@@ -7580,6 +7581,8 @@ int InitSSL(WOLFSSL* ssl, WOLFSSL_CTX* ctx, int writeDup)
     ssl->sigSpec = ctx->sigSpec;
     ssl->sigSpecSz = ctx->sigSpecSz;
 #endif /* WOLFSSL_DUAL_ALG_CERTS */
+    /* Returns 0 on success, not WOLFSSL_SUCCESS (1) */
+    WOLFSSL_MSG_EX("InitSSL done. return 0 (success)");
     return 0;
 }
 
@@ -11003,18 +11006,11 @@ int EarlySanityCheckMsgReceived(WOLFSSL* ssl, byte type, word32 msgSz)
 {
     int ret = 0;
 #ifndef WOLFSSL_DISABLE_EARLY_SANITY_CHECKS
-    byte version_negotiated = 0;
-
-    WOLFSSL_ENTER("EarlySanityCheckMsgReceived");
-
-#ifdef WOLFSSL_DTLS
     /* Version has only been negotiated after we either send or process a
      * ServerHello message */
-    if (ssl->options.dtls)
-        version_negotiated = ssl->options.serverState >= SERVER_HELLO_COMPLETE;
-    else
-#endif
-        version_negotiated = 1;
+    byte version_negotiated = ssl->options.serverState >= SERVER_HELLO_COMPLETE;
+
+    WOLFSSL_ENTER("EarlySanityCheckMsgReceived");
 
     if (version_negotiated)
         ret = MsgCheckEncryption(ssl, type, ssl->keys.decryptedCur == 1);
@@ -20750,8 +20746,10 @@ int ProcessReplyEx(WOLFSSL* ssl, int allowSocketErr)
 #endif
 
     ret = RetrySendAlert(ssl);
-    if (ret != 0)
+    if (ret != 0) {
+        WOLFSSL_MSG_EX("RetrySendAlert failed, giving up. err = %d", ret);
         return ret;
+    }
 
     for (;;) {
         switch (ssl->options.processReply) {
@@ -24046,6 +24044,52 @@ static int CheckTLS13AEADSendLimit(WOLFSSL* ssl)
 }
 #endif /* WOLFSSL_TLS13 && !WOLFSSL_TLS13_IGNORE_AEAD_LIMITS */
 
+/**
+ * ssl_in_handshake():
+ * Invoked in wolfSSL_read/wolfSSL_write to check if wolfSSL_negotiate() is
+ * needed in the handshake.
+ *
+ * In TLSv1.2 negotiate until the end of the handshake, unless:
+ * 1 in SCR and sending data or
+ * 2 in SCR and we have plain data ready
+ * Early data logic may bypass this logic in TLSv1.3 when appropriate.
+ */
+static int ssl_in_handshake(WOLFSSL *ssl, int send)
+{
+    if (IsSCR(ssl)) {
+        if (send) {
+            /* allow sending data in SCR */
+            return 0;
+        } else {
+            /* allow reading buffered data in SCR */
+            if (ssl->buffers.clearOutputBuffer.length != 0)
+                return 0;
+        }
+        return 1;
+    }
+
+    if (ssl->options.handShakeState != HANDSHAKE_DONE)
+        return 1;
+
+    if (ssl->options.side == WOLFSSL_SERVER_END) {
+        if (IsAtLeastTLSv1_3(ssl->version))
+            return ssl->options.acceptState < TLS13_TICKET_SENT;
+        if (IsAtLeastTLSv1_2(ssl))
+            return ssl->options.acceptState < ACCEPT_THIRD_REPLY_DONE;
+        return 0;
+    }
+
+    if (ssl->options.side == WOLFSSL_CLIENT_END) {
+        if (IsAtLeastTLSv1_3(ssl->version))
+            return ssl->options.connectState < FINISHED_DONE;
+        if (IsAtLeastTLSv1_2(ssl))
+            return ssl->options.connectState < SECOND_REPLY_DONE;
+        return 0;
+    }
+
+    return 0;
+}
+
 int SendData(WOLFSSL* ssl, const void* data, int sz)
 {
     int sent = 0,  /* plainText size */
@@ -24097,7 +24141,7 @@ int SendData(WOLFSSL* ssl, const void* data, int sz)
     }
     else
 #endif
-    if (ssl->options.handShakeState != HANDSHAKE_DONE && !IsSCR(ssl)) {
+    if (ssl_in_handshake(ssl, 1)) {
         int err;
         WOLFSSL_MSG("handshake not complete, trying to finish");
         if ( (err = wolfSSL_negotiate(ssl)) != WOLFSSL_SUCCESS) {
@@ -24349,19 +24393,7 @@ int ReceiveData(WOLFSSL* ssl, byte* output, int sz, int peek)
     else
 #endif
     {
-        int negotiate = 0;
-#ifdef HAVE_SECURE_RENEGOTIATION
-        if (ssl->secure_renegotiation && ssl->secure_renegotiation->enabled) {
-            if (ssl->options.handShakeState != HANDSHAKE_DONE
-                && ssl->buffers.clearOutputBuffer.length == 0)
-                negotiate = 1;
-        }
-        else
-#endif
-        if (ssl->options.handShakeState != HANDSHAKE_DONE)
-            negotiate = 1;
-
-        if (negotiate) {
+        if (ssl_in_handshake(ssl, 0)) {
             int err;
             WOLFSSL_MSG("Handshake not complete, trying to finish");
             if ( (err = wolfSSL_negotiate(ssl)) != WOLFSSL_SUCCESS) {
@@ -24648,8 +24680,16 @@ static int SendAlert_ex(WOLFSSL* ssl, int severity, int type)
 
 int RetrySendAlert(WOLFSSL* ssl)
 {
-    int type = ssl->pendingAlert.code;
-    int severity = ssl->pendingAlert.level;
+    int type;
+    int severity;
+    WOLFSSL_ENTER("RetrySendAlert");
+
+    if (ssl == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    type = ssl->pendingAlert.code;
+    severity = ssl->pendingAlert.level;
 
     if (severity == alert_none)
         return 0;
@@ -24663,6 +24703,12 @@ int RetrySendAlert(WOLFSSL* ssl)
 /* send alert message */
 int SendAlert(WOLFSSL* ssl, int severity, int type)
 {
+    WOLFSSL_ENTER("SendAlert");
+
+    if (ssl == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
     if (ssl->pendingAlert.level != alert_none) {
         int ret = RetrySendAlert(ssl);
         if (ret != 0) {
@@ -26635,6 +26681,8 @@ static int ParseCipherList(Suites* suites,
 #endif
         suites->setSuites = 1;
     }
+
+    (void)privateKeySz;
 
     return ret;
 }
@@ -29638,8 +29686,6 @@ typedef struct DskeArgs {
     word16 verifySigSz;
 #endif
     word16 sigSz;
-    byte   sigAlgo;
-    byte   hashAlgo;
 #if !defined(NO_RSA) && defined(WC_RSA_PSS)
     int    bits;
 #endif
@@ -29958,8 +30004,8 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
         XMEMSET(args, 0, sizeof(DskeArgs));
         args->idx = *inOutIdx;
         args->begin = *inOutIdx;
-        args->sigAlgo = ssl->specs.sig_algo;
-        args->hashAlgo = sha_mac;
+        ssl->options.peerSigAlgo = ssl->specs.sig_algo;
+        ssl->options.peerHashAlgo = sha_mac;
     #ifdef WOLFSSL_ASYNC_CRYPT
         ssl->async->freeArgs = FreeDskeArgs;
     #endif
@@ -30410,43 +30456,43 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                             ERROR_OUT(BUFFER_ERROR, exit_dske);
                         }
 
-                        DecodeSigAlg(&input[args->idx], &args->hashAlgo,
+                        DecodeSigAlg(&input[args->idx], &ssl->options.peerHashAlgo,
                                      &sigAlgo);
                     #ifndef NO_RSA
                         if (sigAlgo == rsa_pss_sa_algo &&
-                                                 args->sigAlgo == rsa_sa_algo) {
-                            args->sigAlgo = sigAlgo;
+                                                 ssl->options.peerSigAlgo == rsa_sa_algo) {
+                            ssl->options.peerSigAlgo = sigAlgo;
                         }
                         else
                     #endif
                     #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
                         if (sigAlgo == sm2_sa_algo &&
-                                             args->sigAlgo == ecc_dsa_sa_algo) {
-                            args->sigAlgo = sigAlgo;
+                                             ssl->options.peerSigAlgo == ecc_dsa_sa_algo) {
+                            ssl->options.peerSigAlgo = sigAlgo;
                         }
                         else
                     #endif
                     #ifdef HAVE_ED25519
                         if (sigAlgo == ed25519_sa_algo &&
-                                             args->sigAlgo == ecc_dsa_sa_algo) {
-                            args->sigAlgo = sigAlgo;
+                                             ssl->options.peerSigAlgo == ecc_dsa_sa_algo) {
+                            ssl->options.peerSigAlgo = sigAlgo;
                         }
                         else
                     #endif
                     #ifdef HAVE_ED448
                         if (sigAlgo == ed448_sa_algo &&
-                                             args->sigAlgo == ecc_dsa_sa_algo) {
-                            args->sigAlgo = sigAlgo;
+                                             ssl->options.peerSigAlgo == ecc_dsa_sa_algo) {
+                            ssl->options.peerSigAlgo = sigAlgo;
                         }
                         else
                     #endif
                         /* Signature algorithm from message must match signature
                          * algorithm in cipher suite. */
-                        if (sigAlgo != args->sigAlgo) {
+                        if (sigAlgo != ssl->options.peerSigAlgo) {
                             ERROR_OUT(ALGO_ID_E, exit_dske);
                         }
                         args->idx += 2;
-                        hashType = HashAlgoToType(args->hashAlgo);
+                        hashType = HashAlgoToType(ssl->options.peerHashAlgo);
                         if (hashType == WC_HASH_TYPE_NONE) {
                             ERROR_OUT(ALGO_ID_E, exit_dske);
                         }
@@ -30454,7 +30500,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                         /* only using sha and md5 for rsa */
                         #ifndef NO_OLD_TLS
                             hashType = WC_HASH_TYPE_SHA;
-                            if (args->sigAlgo == rsa_sa_algo) {
+                            if (ssl->options.peerSigAlgo == rsa_sa_algo) {
                                 hashType = WC_HASH_TYPE_MD5_SHA;
                             }
                         #else
@@ -30475,12 +30521,12 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                     }
 
                     ret = HashSkeData(ssl, hashType, input + args->begin,
-                        verifySz, args->sigAlgo);
+                        verifySz, ssl->options.peerSigAlgo);
                     if (ret != 0) {
                         goto exit_dske;
                     }
 
-                    switch (args->sigAlgo)
+                    switch (ssl->options.peerSigAlgo)
                     {
                     #ifndef NO_RSA
                     #ifdef WC_RSA_PSS
@@ -30528,7 +30574,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
 
                     default:
                         ret = ALGO_ID_E;
-                    } /* switch (args->sigAlgo) */
+                    } /* switch (ssl->options.peerSigAlgo) */
 
             #endif /* NO_DH && !HAVE_ECC && !HAVE_ED25519 && !HAVE_ED448 */
                     break;
@@ -30580,7 +30626,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                                                             args->verifySigSz);
                     }
 
-                    switch (args->sigAlgo)
+                    switch (ssl->options.peerSigAlgo)
                     {
                     #ifndef NO_RSA
                     #ifdef WC_RSA_PSS
@@ -30591,7 +30637,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                             ret = RsaVerify(ssl,
                                 args->verifySig, args->verifySigSz,
                                 &args->output,
-                                args->sigAlgo, args->hashAlgo,
+                                ssl->options.peerSigAlgo, ssl->options.peerHashAlgo,
                                 ssl->peerRsaKey,
                             #ifdef HAVE_PK_CALLBACKS
                                 &ssl->buffers.peerRsaKey
@@ -30629,7 +30675,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                         #ifdef HAVE_PK_CALLBACKS
                             if (ssl->ctx && ssl->ctx->ProcessServerSigKexCb) {
                                 ret = ssl->ctx->ProcessServerSigKexCb(ssl,
-                                    args->sigAlgo,
+                                    ssl->options.peerSigAlgo,
                                     args->verifySig, args->verifySigSz,
                                     ssl->buffers.sig.buffer, SEED_LEN,
                                     &ssl->buffers.sig.buffer[SEED_LEN],
@@ -30638,7 +30684,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                         #endif /* HAVE_PK_CALLBACKS */
                             if (ret == NOT_COMPILED_IN) {
                             #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
-                                if (args->sigAlgo == sm2_sa_algo) {
+                                if (ssl->options.peerSigAlgo == sm2_sa_algo) {
                                     ret = Sm2wSm3Verify(ssl,
                                         TLS12_SM2_SIG_ID, TLS12_SM2_SIG_ID_SZ,
                                         args->verifySig, args->verifySigSz,
@@ -30791,7 +30837,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                     /* increment index after verify is done */
                     args->idx += args->verifySigSz;
 
-                    switch(args->sigAlgo)
+                    switch(ssl->options.peerSigAlgo)
                     {
                     #ifndef NO_RSA
                     #ifdef WC_RSA_PSS
@@ -30801,13 +30847,13 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                                              ssl->buffers.digest.buffer,
                                              ssl->buffers.digest.length,
                                              args->output, args->sigSz,
-                                             HashAlgoToType(args->hashAlgo));
+                                             HashAlgoToType(ssl->options.peerHashAlgo));
                         #else
                             ret = wc_RsaPSS_CheckPadding_ex(
                                              ssl->buffers.digest.buffer,
                                              ssl->buffers.digest.length,
                                              args->output, args->sigSz,
-                                             HashAlgoToType(args->hashAlgo),
+                                             HashAlgoToType(ssl->options.peerHashAlgo),
                                              -1, args->bits);
                         #endif
                             if (ret != 0)
@@ -30847,7 +30893,7 @@ static int DoServerKeyExchange(WOLFSSL* ssl, const byte* input,
                                 encSigSz = wc_EncodeSignature(encodedSig,
                                     ssl->buffers.digest.buffer,
                                     ssl->buffers.digest.length,
-                                    TypeHash(args->hashAlgo));
+                                    TypeHash(ssl->options.peerHashAlgo));
                                 if (encSigSz != args->sigSz || !args->output ||
                                     XMEMCMP(args->output, encodedSig,
                                             min(encSigSz, MAX_ENCODED_SIG_SZ)) != 0) {
@@ -33037,6 +33083,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
             case PSK_KEY_ERROR:
             case INVALID_PARAMETER:
             case HRR_COOKIE_ERROR:
+            case BAD_BINDER:
                 return illegal_parameter;
             case INCOMPLETE_DATA:
                 return missing_extension;
@@ -36239,8 +36286,6 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
         word32 sigSz;
         word32 idx;
         word32 begin;
-        byte   hashAlgo;
-        byte   sigAlgo;
     } DcvArgs;
 
     static void FreeDcvArgs(WOLFSSL* ssl, void* pArgs)
@@ -36289,8 +36334,8 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
             ret = 0;
             ssl->options.asyncState = TLS_ASYNC_BEGIN;
             XMEMSET(args, 0, sizeof(DcvArgs));
-            args->hashAlgo = sha_mac;
-            args->sigAlgo = anonymous_sa_algo;
+            ssl->options.peerHashAlgo = sha_mac;
+            ssl->options.peerSigAlgo = anonymous_sa_algo;
             args->idx = *inOutIdx;
             args->begin = *inOutIdx;
         #ifdef WOLFSSL_ASYNC_CRYPT
@@ -36321,34 +36366,34 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                         ERROR_OUT(BUFFER_ERROR, exit_dcv);
                     }
 
-                    DecodeSigAlg(&input[args->idx], &args->hashAlgo,
-                                 &args->sigAlgo);
+                    DecodeSigAlg(&input[args->idx], &ssl->options.peerHashAlgo,
+                                 &ssl->options.peerSigAlgo);
                     args->idx += 2;
                 }
             #ifndef NO_RSA
                 else if (ssl->peerRsaKey != NULL && ssl->peerRsaKeyPresent != 0)
-                    args->sigAlgo = rsa_sa_algo;
+                    ssl->options.peerSigAlgo = rsa_sa_algo;
             #endif
             #ifdef HAVE_ECC
                 else if (ssl->peerEccDsaKeyPresent) {
                 #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
                     if (ssl->peerEccDsaKey->dp->id == ECC_SM2P256V1) {
-                        args->sigAlgo = sm2_sa_algo;
+                        ssl->options.peerSigAlgo = sm2_sa_algo;
                     }
                     else
                 #endif
                     {
-                        args->sigAlgo = ecc_dsa_sa_algo;
+                        ssl->options.peerSigAlgo = ecc_dsa_sa_algo;
                     }
                 }
             #endif
             #if defined(HAVE_ED25519) && !defined(NO_ED25519_CLIENT_AUTH)
                 else if (ssl->peerEd25519KeyPresent)
-                    args->sigAlgo = ed25519_sa_algo;
+                    ssl->options.peerSigAlgo = ed25519_sa_algo;
             #endif /* HAVE_ED25519 && !NO_ED25519_CLIENT_AUTH */
             #if defined(HAVE_ED448) && !defined(NO_ED448_CLIENT_AUTH)
                 else if (ssl->peerEd448KeyPresent)
-                    args->sigAlgo = ed448_sa_algo;
+                    ssl->options.peerSigAlgo = ed448_sa_algo;
             #endif /* HAVE_ED448 && !NO_ED448_CLIENT_AUTH */
 
                 if ((args->idx - args->begin) + OPAQUE16_LEN > size) {
@@ -36384,15 +36429,15 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                 #endif
 
                     if (IsAtLeastTLSv1_2(ssl)) {
-                        if (args->sigAlgo != ecc_dsa_sa_algo
+                        if (ssl->options.peerSigAlgo != ecc_dsa_sa_algo
                         #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
-                            && args->sigAlgo != sm2_sa_algo
+                            && ssl->options.peerSigAlgo != sm2_sa_algo
                         #endif
                             ) {
                             WOLFSSL_MSG("Oops, peer sent ECC key but not in verify");
                         }
 
-                        SetDigest(ssl, args->hashAlgo);
+                        SetDigest(ssl, ssl->options.peerHashAlgo);
                     }
                 }
             #endif /* HAVE_ECC */
@@ -36400,7 +36445,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                 if (ssl->peerEd25519KeyPresent) {
                     WOLFSSL_MSG("Doing ED25519 peer cert verify");
                     if (IsAtLeastTLSv1_2(ssl) &&
-                                             args->sigAlgo != ed25519_sa_algo) {
+                                             ssl->options.peerSigAlgo != ed25519_sa_algo) {
                         WOLFSSL_MSG(
                                "Oops, peer sent ED25519 key but not in verify");
                     }
@@ -36410,7 +36455,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                 if (ssl->peerEd448KeyPresent) {
                     WOLFSSL_MSG("Doing ED448 peer cert verify");
                     if (IsAtLeastTLSv1_2(ssl) &&
-                                               args->sigAlgo != ed448_sa_algo) {
+                                               ssl->options.peerSigAlgo != ed448_sa_algo) {
                         WOLFSSL_MSG(
                                  "Oops, peer sent ED448 key but not in verify");
                     }
@@ -36432,7 +36477,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                         input + args->idx,
                         args->sz,
                         &args->output,
-                        args->sigAlgo, args->hashAlgo,
+                        ssl->options.peerSigAlgo, ssl->options.peerHashAlgo,
                         ssl->peerRsaKey,
                     #ifdef HAVE_PK_CALLBACKS
                         &ssl->buffers.peerRsaKey
@@ -36441,7 +36486,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                     #endif
                     );
                     if (ret >= 0) {
-                        if (args->sigAlgo == rsa_sa_algo)
+                        if (ssl->options.peerSigAlgo == rsa_sa_algo)
                             args->sendSz = ret;
                         else {
                             args->sigSz = ret;
@@ -36456,7 +36501,7 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                     WOLFSSL_MSG("Doing ECC peer cert verify");
 
                 #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
-                    if (args->sigAlgo == sm2_sa_algo) {
+                    if (ssl->options.peerSigAlgo == sm2_sa_algo) {
                         ret = Sm2wSm3Verify(ssl,
                             TLS12_SM2_SIG_ID, TLS12_SM2_SIG_ID_SZ,
                             input + args->idx, args->sz,
@@ -36551,21 +36596,21 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                 if (ssl->peerRsaKey != NULL && ssl->peerRsaKeyPresent != 0) {
                     if (IsAtLeastTLSv1_2(ssl)) {
                     #ifdef WC_RSA_PSS
-                        if (args->sigAlgo == rsa_pss_sa_algo) {
-                            SetDigest(ssl, args->hashAlgo);
+                        if (ssl->options.peerSigAlgo == rsa_pss_sa_algo) {
+                            SetDigest(ssl, ssl->options.peerHashAlgo);
 
                         #ifdef HAVE_SELFTEST
                             ret = wc_RsaPSS_CheckPadding(
                                             ssl->buffers.digest.buffer,
                                             ssl->buffers.digest.length,
                                             args->output, args->sigSz,
-                                            HashAlgoToType(args->hashAlgo));
+                                            HashAlgoToType(ssl->options.peerHashAlgo));
                         #else
                             ret = wc_RsaPSS_CheckPadding_ex(
                                             ssl->buffers.digest.buffer,
                                             ssl->buffers.digest.length,
                                             args->output, args->sigSz,
-                                            HashAlgoToType(args->hashAlgo), -1,
+                                            HashAlgoToType(ssl->options.peerHashAlgo), -1,
                                             mp_count_bits(&ssl->peerRsaKey->n));
                         #endif
                             if (ret != 0) {
@@ -36586,17 +36631,17 @@ static int DoSessionTicket(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
                             }
                         #endif
 
-                            if (args->sigAlgo != rsa_sa_algo) {
+                            if (ssl->options.peerSigAlgo != rsa_sa_algo) {
                                 WOLFSSL_MSG("Oops, peer sent RSA key but not "
                                             "in verify");
                             }
 
-                            SetDigest(ssl, args->hashAlgo);
+                            SetDigest(ssl, ssl->options.peerHashAlgo);
 
                             args->sigSz = wc_EncodeSignature(encodedSig,
                                 ssl->buffers.digest.buffer,
                                 ssl->buffers.digest.length,
-                                TypeHash(args->hashAlgo));
+                                TypeHash(ssl->options.peerHashAlgo));
 
                             if (args->sendSz != args->sigSz || !args->output ||
                                 XMEMCMP(args->output, encodedSig,

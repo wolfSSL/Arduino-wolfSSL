@@ -935,7 +935,7 @@ enum Misc_ASN {
 #ifdef HAVE_SPHINCS
     MAX_ENCODED_SIG_SZ  = 51200,
 #elif defined(HAVE_PQC)
-    MAX_ENCODED_SIG_SZ  = 5120;
+    MAX_ENCODED_SIG_SZ  = 5120,
 #elif !defined(NO_RSA)
 #ifdef WOLFSSL_HAPROXY
     MAX_ENCODED_SIG_SZ  = 1024,    /* Supports 8192 bit keys */
@@ -1023,6 +1023,7 @@ enum Misc_ASN {
 #endif
     TRAILING_ZERO       = 1,       /* Used for size of zero pad */
     ASN_TAG_SZ          = 1,       /* single byte ASN.1 tag */
+    ASN_INDEF_END_SZ    = 2,       /* 0x00 0x00 at end of indef */
     MIN_VERSION_SZ      = 3,       /* Min bytes needed for GetMyVersion */
     MAX_X509_VERSION    = 3,       /* Max X509 version allowed */
     MIN_X509_VERSION    = 0,       /* Min X509 version allowed */
@@ -2021,6 +2022,7 @@ struct Signer {
     byte *sapkiDer;
     int sapkiLen;
 #endif /* WOLFSSL_DUAL_ALG_CERTS */
+    byte type;
 
     Signer* next;
 };
@@ -2100,6 +2102,8 @@ WOLFSSL_LOCAL int GetName(DecodedCert* cert, int nameType, int maxIdx);
 
 WOLFSSL_ASN_API int wc_BerToDer(const byte* ber, word32 berSz, byte* der,
                                 word32* derSz);
+WOLFSSL_LOCAL int StreamOctetString(const byte* inBuf, word32 inBufSz,
+    byte* out, word32* outSz, word32* idx);
 
 WOLFSSL_ASN_API void FreeAltNames(DNS_entry* altNames, void* heap);
 WOLFSSL_ASN_API DNS_entry* AltNameNew(void* heap);
@@ -2164,6 +2168,8 @@ WOLFSSL_LOCAL const byte* OidFromId(word32 id, word32 type, word32* oidSz);
 WOLFSSL_LOCAL Signer* MakeSigner(void* heap);
 WOLFSSL_LOCAL void    FreeSigner(Signer* signer, void* heap);
 WOLFSSL_LOCAL void    FreeSignerTable(Signer** table, int rows, void* heap);
+WOLFSSL_LOCAL void    FreeSignerTableType(Signer** table, int rows, byte type,
+                                          void* heap);
 #ifdef WOLFSSL_TRUST_PEER_CERT
 WOLFSSL_LOCAL void    FreeTrustedPeer(TrustedPeerCert* tp, void* heap);
 WOLFSSL_LOCAL void    FreeTrustedPeerTable(TrustedPeerCert** table, int rows,
@@ -2274,12 +2280,18 @@ WOLFSSL_LOCAL word32 SetASNExplicit(byte number, word32 len, byte* output);
 WOLFSSL_LOCAL word32 SetASNSet(word32 len, byte* output);
 
 WOLFSSL_LOCAL word32 SetLength(word32 length, byte* output);
+WOLFSSL_LOCAL word32 SetLengthEx(word32 length, byte* output, byte isIndef);
 WOLFSSL_LOCAL word32 SetSequence(word32 len, byte* output);
+WOLFSSL_LOCAL word32 SetSequenceEx(word32 len, byte* output, byte isIndef);
+WOLFSSL_LOCAL word32 SetIndefEnd(byte* output);
 WOLFSSL_LOCAL word32 SetOctetString(word32 len, byte* output);
+WOLFSSL_LOCAL word32 SetOctetStringEx(word32 len, byte* output, byte indef);
 WOLFSSL_LOCAL int SetASNInt(int len, byte firstByte, byte* output);
 WOLFSSL_LOCAL word32 SetBitString(word32 len, byte unusedBits, byte* output);
-WOLFSSL_LOCAL word32 SetImplicit(byte tag,byte number,word32 len,byte* output);
-WOLFSSL_LOCAL word32 SetExplicit(byte number, word32 len, byte* output);
+WOLFSSL_LOCAL word32 SetImplicit(byte tag,byte number,word32 len,byte* output,
+        byte isIndef);
+WOLFSSL_LOCAL word32 SetExplicit(byte number, word32 len, byte* output,
+    byte isIndef);
 WOLFSSL_LOCAL word32 SetSet(word32 len, byte* output);
 WOLFSSL_API word32 SetAlgoID(int algoOID, byte* output, int type, int curveSz);
 WOLFSSL_LOCAL int SetMyVersion(word32 version, byte* output, int header);
