@@ -1384,9 +1384,8 @@ int GetASN_Items(const ASNItem* asn, ASNGetData *data, int count, int complete,
     int    len;
     /* Current index into buffer. */
     word32 idx = *inOutIdx;
-    /* Initialize the end index at each depth to be the length. */
-    word32 endIdx[GET_ASN_MAX_DEPTH] = { length, length, length, length, length,
-                                         length, length };
+    /* Declare the end index array. */
+    word32 endIdx[GET_ASN_MAX_DEPTH];
     /* Set choices to -1 to indicate they haven't been seen or found. */
     signed char   choiceMet[GET_ASN_MAX_CHOICES] = { -1, -1 };
     /* Not matching a choice right now. */
@@ -1401,6 +1400,11 @@ int GetASN_Items(const ASNItem* asn, ASNGetData *data, int count, int complete,
 #ifdef WOLFSSL_DEBUG_ASN_TEMPLATE
     WOLFSSL_ENTER("GetASN_Items");
 #endif
+
+    /* Set the end index at each depth to be the length. */
+    for (i=0; i<GET_ASN_MAX_DEPTH; i++) {
+        endIdx[i] = length;
+    }
 
     /* Start depth at first items depth. */
     minDepth = depth = asn[0].depth;
@@ -3014,7 +3018,7 @@ int GetMyVersion(const byte* input, word32* inOutIdx,
 #else
     ASNGetData dataASN[intASN_Length];
     int ret;
-    byte num;
+    byte num = 0;
 
     /* Clear dynamic data and set the version number variable. */
     XMEMSET(dataASN, 0, sizeof(dataASN));
@@ -3081,7 +3085,7 @@ int GetShortInt(const byte* input, word32* inOutIdx, int* number, word32 maxIdx)
 #else
     ASNGetData dataASN[intASN_Length];
     int ret;
-    word32 num;
+    word32 num = 0;
 
     /* Clear dynamic data and set the 32-bit number variable. */
     XMEMSET(dataASN, 0, sizeof(dataASN));
@@ -3460,6 +3464,70 @@ word32 SetBitString(word32 len, byte unusedBits, byte* output)
 #endif /* !NO_RSA || HAVE_ECC || HAVE_ED25519 || HAVE_ED448 */
 
 #ifdef ASN_BER_TO_DER
+
+#define BER_OCTET_LENGTH 4096
+
+/* sets the terminating 0x00 0x00 at the end of an indefinite length
+ * returns the number of bytes written */
+word32 SetIndefEnd(byte* output)
+{
+    byte terminate[ASN_INDEF_END_SZ] = { 0x00, 0x00 };
+
+    if (output != NULL) {
+        XMEMCPY(output, terminate, ASN_INDEF_END_SZ);
+    }
+
+    return (word32)ASN_INDEF_END_SZ;
+}
+
+
+/* Breaks an octet string up into chunks for use with streaming
+ * returns 0 on success and updates idx */
+int StreamOctetString(const byte* inBuf, word32 inBufSz, byte* out, word32* outSz,
+    word32* idx)
+{
+    word32 i  = 0;
+    word32 outIdx = *idx;
+    byte* tmp = out;
+
+    if (tmp) tmp += outIdx;
+
+    while (i < inBufSz) {
+        word32 ret, sz;
+
+        sz = BER_OCTET_LENGTH;
+
+        if ((sz + i) > inBufSz) {
+            sz = inBufSz - i;
+        }
+
+        ret = SetOctetString(sz, tmp);
+        if (ret > 0) {
+            outIdx += ret;
+        }
+
+        if (tmp) {
+            if ((word32)ret + sz + i + outIdx > *outSz) {
+                return BUFFER_E;
+            }
+            XMEMCPY(tmp + ret, inBuf + i, sz);
+            tmp += sz + ret;
+        }
+        outIdx += sz;
+        i      += sz;
+    }
+
+    if (tmp) {
+        *idx = outIdx;
+        return 0;
+    }
+    else {
+        *outSz = outIdx;
+        return LENGTH_ONLY_E;
+    }
+}
+
+
 /* Convert BER to DER */
 
 /* Pull informtation from the ASN.1 BER encoded item header */
@@ -6763,7 +6831,7 @@ int ToTraditionalInline_ex(const byte* input, word32* inOutIdx, word32 sz,
     DECL_ASNGETDATA(dataASN, pkcs8KeyASN_Length);
     int ret = 0;
     word32 oid = 9;
-    byte version;
+    byte version = 0;
     word32 idx;
 
     /* Check validity of parameters. */
@@ -8681,7 +8749,7 @@ exit_dc:
     int    version;
     word32 idx = 0;
     word32 pIdx = 0;
-    word32 iterations;
+    word32 iterations = 0;
     word32 keySz = 0;
     word32 saltSz = 0;
     word32 shaOid = 0;
@@ -15334,6 +15402,18 @@ word32 SetLength(word32 length, byte* output)
     return i;
 }
 
+word32 SetLengthEx(word32 length, byte* output, byte isIndef)
+{
+    if (isIndef) {
+        if (output != NULL) {
+            output[0] = ASN_INDEF_LENGTH;
+        }
+        return 1;
+    }
+    else {
+        return SetLength(length, output);
+    }
+}
 /* Encode a DER header - type/tag and length.
  *
  * @param [in]  tag     DER tag of ASN.1 item.
@@ -15341,14 +15421,15 @@ word32 SetLength(word32 length, byte* output)
  * @param [out] output  Buffer to encode into.
  * @return  Number of bytes encoded.
  */
-static word32 SetHeader(byte tag, word32 len, byte* output)
+static word32 SetHeader(byte tag, word32 len, byte* output, byte isIndef)
 {
     if (output) {
         /* Encode tag first. */
         output[0] = tag;
     }
     /* Encode the length. */
-    return SetLength(len, output ? output + ASN_TAG_SZ : NULL) + ASN_TAG_SZ;
+    return SetLengthEx(len, output ? output + ASN_TAG_SZ : NULL, isIndef) +
+        ASN_TAG_SZ;
 }
 
 /* Encode a SEQUENCE header in DER.
@@ -15359,7 +15440,12 @@ static word32 SetHeader(byte tag, word32 len, byte* output)
  */
 word32 SetSequence(word32 len, byte* output)
 {
-    return SetHeader(ASN_SEQUENCE | ASN_CONSTRUCTED, len, output);
+    return SetHeader(ASN_SEQUENCE | ASN_CONSTRUCTED, len, output, 0);
+}
+
+word32 SetSequenceEx(word32 len, byte* output, byte isIndef)
+{
+    return SetHeader(ASN_SEQUENCE | ASN_CONSTRUCTED, len, output, isIndef);
 }
 
 /* Encode an OCTET STRING header in DER.
@@ -15370,7 +15456,14 @@ word32 SetSequence(word32 len, byte* output)
  */
 word32 SetOctetString(word32 len, byte* output)
 {
-    return SetHeader(ASN_OCTET_STRING, len, output);
+    return SetHeader(ASN_OCTET_STRING, len, output, 0);
+}
+
+word32 SetOctetStringEx(word32 len, byte* output, byte indef)
+{
+    if (indef)
+        return SetHeader(ASN_OCTET_STRING | ASN_CONSTRUCTED, len, output, indef);
+    return SetOctetString(len, output);
 }
 
 /* Encode a SET header in DER.
@@ -15381,7 +15474,7 @@ word32 SetOctetString(word32 len, byte* output)
  */
 word32 SetSet(word32 len, byte* output)
 {
-    return SetHeader(ASN_SET | ASN_CONSTRUCTED, len, output);
+    return SetHeader(ASN_SET | ASN_CONSTRUCTED, len, output, 0);
 }
 
 /* Encode an implicit context specific header in DER.
@@ -15394,11 +15487,23 @@ word32 SetSet(word32 len, byte* output)
  * @param [out] output  Buffer to encode into.
  * @return  Number of bytes encoded.
  */
-word32 SetImplicit(byte tag, byte number, word32 len, byte* output)
+word32 SetImplicit(byte tag, byte number, word32 len, byte* output, byte isIndef)
 {
-    tag = (byte)(((tag == ASN_SEQUENCE || tag == ASN_SET) ? ASN_CONSTRUCTED : 0)
-                 | ASN_CONTEXT_SPECIFIC | number);
-    return SetHeader(tag, len, output);
+    byte useIndef = 0;
+
+    if ((tag == ASN_OCTET_STRING) && isIndef) {
+        tag = ASN_CONSTRUCTED | ASN_CONTEXT_SPECIFIC | number;
+    }
+    else {
+        tag = (byte)(((tag == ASN_SEQUENCE || tag == ASN_SET) ?
+            ASN_CONSTRUCTED : 0) | ASN_CONTEXT_SPECIFIC | number);
+    }
+
+    if (isIndef && (tag & ASN_CONSTRUCTED)) {
+        useIndef = 1;
+    }
+
+    return SetHeader(tag, len, output, useIndef);
 }
 
 /* Encode an explicit context specific header in DER.
@@ -15410,10 +15515,10 @@ word32 SetImplicit(byte tag, byte number, word32 len, byte* output)
  * @param [out] output  Buffer to encode into.
  * @return  Number of bytes encoded.
  */
-word32 SetExplicit(byte number, word32 len, byte* output)
+word32 SetExplicit(byte number, word32 len, byte* output, byte isIndef)
 {
     return SetHeader((byte)(ASN_CONTEXT_SPECIFIC | ASN_CONSTRUCTED | number),
-                     len, output);
+                     len, output, isIndef);
 }
 
 #if defined(OPENSSL_EXTRA)
@@ -15439,8 +15544,8 @@ word32 SetOthername(void *name, byte *output)
     nameSz = (word32)nm->value->value.utf8string->length;
 
     len = nm->type_id->objSz +
-          SetHeader(ASN_CONSTRUCTED | ASN_CONTEXT_SPECIFIC, nameSz + 2, NULL) +
-          SetHeader(CTC_UTF8, nameSz, NULL) + nameSz;
+          SetHeader(ASN_CONSTRUCTED | ASN_CONTEXT_SPECIFIC, nameSz + 2, NULL, 0) +
+          SetHeader(CTC_UTF8, nameSz, NULL, 0) + nameSz;
 
     if (output != NULL) {
         /* otherName OID */
@@ -15448,9 +15553,9 @@ word32 SetOthername(void *name, byte *output)
         output += nm->type_id->objSz;
 
         output += SetHeader(ASN_CONSTRUCTED | ASN_CONTEXT_SPECIFIC, nameSz + 2,
-                            output);
+                            output, 0);
 
-        output += SetHeader(CTC_UTF8, nameSz, output);
+        output += SetHeader(CTC_UTF8, nameSz, output, 0);
 
         XMEMCPY(output, nameStr, nameSz);
     }
@@ -19551,7 +19656,7 @@ enum {
 static int DecodeSubtreeGeneralName(const byte* input, word32 sz, byte tag,
                                     Base_entry** head, void* heap)
 {
-    Base_entry* entry;
+    Base_entry* entry = NULL;
     word32 nameIdx = 0;
     word32 len = sz;
     int strLen;
@@ -23502,6 +23607,28 @@ void FreeSignerTable(Signer** table, int rows, void* heap)
             signer = next;
         }
         table[i] = NULL;
+    }
+}
+
+void FreeSignerTableType(Signer** table, int rows, byte type, void* heap)
+{
+    int i;
+
+    for (i = 0; i < rows; i++) {
+        Signer* signer = table[i];
+        Signer** next = &table[i];
+
+        while (signer) {
+            if (signer->type == type) {
+                *next = signer->next;
+                FreeSigner(signer, heap);
+                signer = *next;
+            }
+            else {
+                next = &signer->next;
+                signer = signer->next;
+            }
+        }
     }
 }
 
@@ -31515,8 +31642,8 @@ int wc_SetExtKeyUsage(Cert *cert, const char *value)
 int wc_SetExtKeyUsageOID(Cert *cert, const char *in, word32 sz, byte idx,
         void* heap)
 {
-    byte oid[MAX_OID_SZ];
-    word32 oidSz = MAX_OID_SZ;
+    byte oid[CTC_MAX_EKU_OID_SZ];
+    word32 oidSz = CTC_MAX_EKU_OID_SZ;
 
     if (idx >= CTC_MAX_EKU_NB || sz >= CTC_MAX_EKU_OID_SZ) {
         WOLFSSL_MSG("Either idx or sz was too large");
@@ -32734,12 +32861,12 @@ static int EccSpecifiedECDomainDecode(const byte* input, word32 inSz,
 {
     DECL_ASNGETDATA(dataASN, eccSpecifiedASN_Length);
     int ret = 0;
-    ecc_set_type* curve;
+    ecc_set_type* curve = NULL;
     word32 idx = 0;
-    byte version;
-    byte cofactor;
-    const byte *base;
-    word32 baseLen;
+    byte version = 0;
+    byte cofactor = 0;
+    const byte *base = NULL;
+    word32 baseLen = 0;
 
     /* Allocate a new parameter set. */
     curve = (ecc_set_type*)XMALLOC(sizeof(*curve), heap,
@@ -33077,7 +33204,7 @@ int wc_EccPrivateKeyDecode(const byte* input, word32* inOutIdx, ecc_key* key,
     return ret;
 #else
     DECL_ASNGETDATA(dataASN, eccKeyASN_Length);
-    byte version;
+    byte version = 0;
     int ret = 0;
     int curve_id = ECC_CURVE_DEF;
 #if defined(HAVE_PKCS8) || defined(HAVE_PKCS12) || defined(SM2)
@@ -33197,7 +33324,7 @@ static int ASNToHexString(const byte* input, word32* inOutIdx, char** out,
     return 0;
 }
 
-static int EccKeyParamCopy(char** dst, char* src)
+static int EccKeyParamCopy(char** dst, char* src, void* heap)
 {
     int ret = 0;
 #ifdef WOLFSSL_ECC_CURVE_STATIC
@@ -33218,8 +33345,9 @@ static int EccKeyParamCopy(char** dst, char* src)
     else {
         XSTRNCPY(*dst, src, MAX_ECC_STRING);
     }
-    XFREE(src, key->heap, DYNAMIC_TYPE_ECC_BUFFER);
+    XFREE(src, heap, DYNAMIC_TYPE_ECC_BUFFER);
 #endif
+    (void)heap;
 
     return ret;
 }
@@ -33327,10 +33455,10 @@ int wc_EccPublicKeyDecode(const byte* input, word32* inOutIdx,
                                             key->heap, DYNAMIC_TYPE_ECC_BUFFER);
             if (ret == 0) {
 #ifndef WOLFSSL_ECC_CURVE_STATIC
-                ret = EccKeyParamCopy((char**)&curve->prime, p);
+                ret = EccKeyParamCopy((char**)&curve->prime, p, key->heap);
 #else
                 const char *_tmp_ptr = &curve->prime[0];
-                ret = EccKeyParamCopy((char**)&_tmp_ptr, p);
+                ret = EccKeyParamCopy((char**)&_tmp_ptr, p, key->heap);
 #endif
             }
         }
@@ -33346,10 +33474,10 @@ int wc_EccPublicKeyDecode(const byte* input, word32* inOutIdx,
                                             key->heap, DYNAMIC_TYPE_ECC_BUFFER);
             if (ret == 0) {
 #ifndef WOLFSSL_ECC_CURVE_STATIC
-                ret = EccKeyParamCopy((char**)&curve->Af, af);
+                ret = EccKeyParamCopy((char**)&curve->Af, af, key->heap);
 #else
                 const char *_tmp_ptr = &curve->Af[0];
-                ret = EccKeyParamCopy((char**)&_tmp_ptr, af);
+                ret = EccKeyParamCopy((char**)&_tmp_ptr, af, key->heap);
 #endif
             }
         }
@@ -33359,10 +33487,10 @@ int wc_EccPublicKeyDecode(const byte* input, word32* inOutIdx,
                                             key->heap, DYNAMIC_TYPE_ECC_BUFFER);
             if (ret == 0) {
 #ifndef WOLFSSL_ECC_CURVE_STATIC
-                ret = EccKeyParamCopy((char**)&curve->Bf, bf);
+                ret = EccKeyParamCopy((char**)&curve->Bf, bf, key->heap);
 #else
                 const char *_tmp_ptr = &curve->Bf[0];
-                ret = EccKeyParamCopy((char**)&_tmp_ptr, bf);
+                ret = EccKeyParamCopy((char**)&_tmp_ptr, bf, key->heap);
 #endif
             }
         }
@@ -33419,10 +33547,10 @@ int wc_EccPublicKeyDecode(const byte* input, word32* inOutIdx,
                                             key->heap, DYNAMIC_TYPE_ECC_BUFFER);
             if (ret == 0) {
 #ifndef WOLFSSL_ECC_CURVE_STATIC
-                ret = EccKeyParamCopy((char**)&curve->order, o);
+                ret = EccKeyParamCopy((char**)&curve->order, o, key->heap);
 #else
                 const char *_tmp_ptr = &curve->order[0];
-                ret = EccKeyParamCopy((char**)&_tmp_ptr, o);
+                ret = EccKeyParamCopy((char**)&_tmp_ptr, o, key->heap);
 #endif
             }
         }
@@ -34453,7 +34581,7 @@ int SetAsymKeyDer(const byte* privKey, word32 privKeyLen,
         /* pubKey */
         if (pubKey) {
             idx += SetHeader(ASN_CONTEXT_SPECIFIC | ASN_ASYMKEY_PUBKEY |
-                             1, pubKeyLen, output + idx);
+                             1, pubKeyLen, output + idx, 0);
             XMEMCPY(output + idx, pubKey, pubKeyLen);
             idx += pubKeyLen;
         }
@@ -34831,7 +34959,7 @@ static const ASNItem singleResponseASN[] = {
                                                           /* revocationTime */
 /* CS_REVOKED_TIME       */         { 2, ASN_GENERALIZED_TIME, 0, 0, 0 },
                                                           /* revocationReason  [0] EXPLICIT CRLReason OPTIONAL */
-/* CS_REVOKED_REASON     */         { 2, ASN_CONTEXT_SPECIFIC | 0, 0, 1, 1 },
+/* CS_REVOKED_REASON     */         { 2, ASN_CONTEXT_SPECIFIC | 0, 1, 1, 1 },
                                                               /* crlReason */
 /* CS_REVOKED_REASON_VAL */             { 3, ASN_ENUMERATED, 0, 0, 0 },
                                                       /* unknown           [2] IMPLICIT UnknownInfo ::= NULL */
@@ -35828,13 +35956,11 @@ static int DecodeBasicOcspResponse(byte* source, word32* ioIndex,
     if (ret == 0) {
         word32 dataIdx = 0;
         /* Decode the response data. */
-        if (DecodeResponseData(
+        ret = DecodeResponseData(
                 GetASNItem_Addr(dataASN[OCSPBASICRESPASN_IDX_TBS_SEQ], source),
                 &dataIdx, resp,
                 GetASNItem_Length(dataASN[OCSPBASICRESPASN_IDX_TBS_SEQ], source)
-                ) < 0) {
-            ret = ASN_PARSE_E;
-        }
+                );
     }
 #ifdef WC_RSA_PSS
     if (ret == 0 && (dataASN[OCSPBASICRESPASN_IDX_SIGNATURE_PARAMS].tag != 0)) {
@@ -36108,7 +36234,7 @@ int OcspResponseDecode(OcspResponse* resp, void* cm, void* heap, int noVerify)
     int ret = 0;
     word32 idx = 0, size = resp->maxIdx;
     byte* source = resp->source;
-    byte status;
+    byte status = 0;
     byte* basic;
     word32 basicSz;
 
@@ -36233,18 +36359,20 @@ word32 EncodeOcspRequestExtensions(OcspRequest* req, byte* output, word32 size)
     /* Check request has nonce to write in extension. */
     if (req != NULL && req->nonceSz != 0) {
         DECL_ASNSETDATA(dataASN, ocspNonceExtASN_Length);
-        int sz;
+        int sz = 0;
 
         CALLOC_ASNSETDATA(dataASN, ocspNonceExtASN_Length, ret, req->heap);
 
-        /* Set nonce extension OID and nonce. */
-        SetASN_Buffer(&dataASN[OCSPNONCEEXTASN_IDX_EXT_OID], NonceObjId,
-                sizeof(NonceObjId));
-        SetASN_Buffer(&dataASN[OCSPNONCEEXTASN_IDX_EXT_NONCE], req->nonce,
-                (word32)req->nonceSz);
-        /* Calculate size of nonce extension. */
-        ret = SizeASN_Items(ocspNonceExtASN, dataASN, ocspNonceExtASN_Length,
-                            &sz);
+        if ((ret == 0) && (output != NULL)) {
+            /* Set nonce extension OID and nonce. */
+            SetASN_Buffer(&dataASN[OCSPNONCEEXTASN_IDX_EXT_OID], NonceObjId,
+                    sizeof(NonceObjId));
+            SetASN_Buffer(&dataASN[OCSPNONCEEXTASN_IDX_EXT_NONCE], req->nonce,
+                    (word32)req->nonceSz);
+            /* Calculate size of nonce extension. */
+            ret = SizeASN_Items(ocspNonceExtASN, dataASN,
+                                ocspNonceExtASN_Length, &sz);
+        }
         /* Check buffer big enough for encoding if supplied. */
         if ((ret == 0) && (output != NULL) && (sz > (int)size)) {
             ret = BUFFER_E;
@@ -36354,7 +36482,7 @@ int EncodeOcspRequest(OcspRequest* req, byte* output, word32 size)
          */
         extSz = EncodeOcspRequestExtensions(req, extArray + 2,
                                             OCSP_NONCE_EXT_SZ);
-        extSz += SetExplicit(2, extSz, extArray);
+        extSz += SetExplicit(2, extSz, extArray, 0);
     }
 
     totalSz = algoSz + issuerSz + issuerKeySz + snSz;

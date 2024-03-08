@@ -182,6 +182,7 @@ int BuildTlsFinished(WOLFSSL* ssl, Hashes* hashes, const byte* sender)
     byte handshake_hash[HSHASH_SZ];
 #else
     WC_DECLARE_VAR(handshake_hash, byte, HSHASH_SZ, ssl->heap);
+    WC_ALLOC_VAR(handshake_hash, byte, HSHASH_SZ, ssl->heap);
     if (handshake_hash == NULL)
         return MEMORY_E;
 #endif
@@ -317,6 +318,7 @@ static int _DeriveTlsKeys(byte* key_dig, word32 key_dig_len,
     int ret;
 #if defined(WOLFSSL_ASYNC_CRYPT) && !defined(WC_ASYNC_NO_HASH)
     WC_DECLARE_VAR(seed, byte, SEED_LEN, heap);
+    WC_ALLOC_VAR(seed, byte, SEED_LEN, heap);
     if (seed == NULL)
         return MEMORY_E;
 #else
@@ -422,6 +424,7 @@ static int _MakeTlsMasterSecret(byte* ms, word32 msLen,
     byte seed[SEED_LEN];
 #else
     WC_DECLARE_VAR(seed, byte, SEED_LEN, heap);
+    WC_ALLOC_VAR(seed, byte, SEED_LEN, heap);
     if (seed == NULL)
         return MEMORY_E;
 #endif
@@ -3094,6 +3097,7 @@ static word16 TLSX_CSR_Write(CertificateStatusRequest* csr, byte* output,
 
 #ifndef NO_WOLFSSL_CLIENT
     if (isRequest) {
+        int ret = 0;
         word16 offset = 0;
         word16 length = 0;
 
@@ -3107,11 +3111,15 @@ static word16 TLSX_CSR_Write(CertificateStatusRequest* csr, byte* output,
                 offset += OPAQUE16_LEN;
 
                 /* request extensions */
-                if (csr->request.ocsp.nonceSz)
-                    length = (word16)EncodeOcspRequestExtensions(
-                                                 &csr->request.ocsp,
+                if (csr->request.ocsp.nonceSz) {
+                    ret = (int)EncodeOcspRequestExtensions(&csr->request.ocsp,
                                                  output + offset + OPAQUE16_LEN,
                                                  OCSP_NONCE_EXT_SZ);
+
+                    if (ret > 0) {
+                        length = (word16)ret;
+                    }
+                }
 
                 c16toa(length, output + offset);
                 offset += OPAQUE16_LEN + length;
@@ -3555,6 +3563,7 @@ static word16 TLSX_CSR2_Write(CertificateStatusRequestItemV2* csr2,
 
 #ifndef NO_WOLFSSL_CLIENT
     if (isRequest) {
+        int ret = 0;
         word16 offset;
         word16 length;
 
@@ -3582,11 +3591,16 @@ static word16 TLSX_CSR2_Write(CertificateStatusRequestItemV2* csr2,
                     /* request extensions */
                     length = 0;
 
-                    if (csr2->request.ocsp[0].nonceSz)
-                        length = (word16)EncodeOcspRequestExtensions(
+                    if (csr2->request.ocsp[0].nonceSz) {
+                        ret = (int)EncodeOcspRequestExtensions(
                                                  &csr2->request.ocsp[0],
                                                  output + offset + OPAQUE16_LEN,
                                                  OCSP_NONCE_EXT_SZ);
+
+                        if (ret > 0) {
+                            length = (word16)ret;
+                        }
+                    }
 
                     c16toa(length, output + offset);
                     offset += OPAQUE16_LEN + length;
@@ -6479,7 +6493,7 @@ static int TLSX_Cookie_Parse(WOLFSSL* ssl, const byte* input, word16 length,
         return BUFFER_E;
 
     if (msgType == hello_retry_request)
-        return TLSX_Cookie_Use(ssl, input + idx, len, NULL, 0, 0,
+        return TLSX_Cookie_Use(ssl, input + idx, len, NULL, 0, 1,
                                &ssl->extensions);
 
     /* client_hello */
@@ -7459,7 +7473,9 @@ static int TLSX_KeyShare_GenEccKey(WOLFSSL *ssl, KeyShareEntry* kse)
         /* Allocate an ECC key to hold private key. */
         kse->key = (byte*)XMALLOC(sizeof(ecc_key), ssl->heap, DYNAMIC_TYPE_ECC);
         if (kse->key == NULL) {
-            WOLFSSL_MSG("EccTempKey Memory error");
+            WOLFSSL_MSG_EX("Failed to allocate %d bytes, ssl->heap: %p",
+                           (int)sizeof(ecc_key), (uintptr_t)ssl->heap);
+            WOLFSSL_MSG("EccTempKey Memory error!");
             return MEMORY_E;
         }
 
@@ -7658,6 +7674,13 @@ static int TLSX_KeyShare_GenPqcKey(WOLFSSL *ssl, KeyShareEntry* kse)
     word32 privSz = 0;
     word32 pubSz = 0;
 
+    /* This gets called twice. Once during parsing of the key share and once
+     * during the population of the extension. No need to do work the second
+     * time. Just return success if its already been done. */
+    if (kse->pubKey != NULL) {
+        return ret;
+    }
+
     findEccPqc(&ecc_group, &oqs_group, kse->group);
     ret = kyber_id2type(oqs_group, &type);
     if (ret == NOT_COMPILED_IN) {
@@ -7735,10 +7758,11 @@ static int TLSX_KeyShare_GenPqcKey(WOLFSSL *ssl, KeyShareEntry* kse)
 
         /* Note we are saving the OQS private key and ECC private key
          * separately. That's because the ECC private key is not simply a
-         * buffer. Its is an ecc_key struct.
-         */
+         * buffer. Its is an ecc_key struct. Typically do not need the private
+         * key size, but will need to zero it out upon freeing. */
         kse->privKey = privKey;
         privKey = NULL;
+        kse->privKeyLen = privSz;
 
         kse->key = ecc_kse->key;
         ecc_kse->key = NULL;
@@ -7814,9 +7838,19 @@ static void TLSX_KeyShare_FreeAll(KeyShareEntry* list, void* heap)
 #endif
         }
 #ifdef HAVE_PQC
-        else if (WOLFSSL_NAMED_GROUP_IS_PQC(current->group) &&
-                 current->key != NULL) {
-            ForceZero((byte*)current->key, current->keyLen);
+        else if (WOLFSSL_NAMED_GROUP_IS_PQC(current->group)) {
+            if (current->key != NULL) {
+                ForceZero((byte*)current->key, current->keyLen);
+            }
+            if (current->pubKey != NULL) {
+                XFREE(current->pubKey, heap, DYNAMIC_TYPE_PUBLIC_KEY);
+                current->pubKey = NULL;
+            }
+            if (current->privKey != NULL) {
+                ForceZero(current->privKey, current->privKeyLen);
+                XFREE(current->privKey, heap, DYNAMIC_TYPE_PRIVATE_KEY);
+                current->privKey = NULL;
+            }
         }
 #endif
         else {

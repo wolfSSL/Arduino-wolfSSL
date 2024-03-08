@@ -136,6 +136,15 @@
     #define FALSE 0
 #endif
 
+#ifndef HAVE_AEAD
+    #ifndef _MSC_VER
+        #error "The build option HAVE_AEAD is required for TLS 1.3"
+    #else
+        #pragma \
+        message("error: The build option HAVE_AEAD is required for TLS 1.3")
+    #endif
+#endif
+
 #ifndef HAVE_HKDF
     #ifndef _MSC_VER
         #error "The build option HAVE_HKDF is required for TLS 1.3"
@@ -3546,6 +3555,12 @@ int CreateCookieExt(const WOLFSSL* ssl, byte* hash, word16 hashSz,
         return BAD_FUNC_ARG;
     }
 
+    if (ssl->buffers.tls13CookieSecret.buffer == NULL ||
+            ssl->buffers.tls13CookieSecret.length == 0) {
+        WOLFSSL_MSG("Missing DTLS 1.3 cookie secret");
+        return COOKIE_ERROR;
+    }
+
     /* Cookie Data = Hash Len | Hash | CS | KeyShare Group */
     cookie[cookieSz++] = (byte)hashSz;
     XMEMCPY(cookie + cookieSz, hash, hashSz);
@@ -4693,7 +4708,7 @@ int SendTls13ClientHello(WOLFSSL* ssl)
 }
 
 #if defined(WOLFSSL_DTLS13) && !defined(WOLFSSL_NO_CLIENT)
-static int Dtls13DoDowngrade(WOLFSSL* ssl)
+static int Dtls13ClientDoDowngrade(WOLFSSL* ssl)
 {
     int ret;
     if (ssl->dtls13ClientHello == NULL)
@@ -4724,8 +4739,8 @@ static int EchCheckAcceptance(WOLFSSL* ssl, const byte* input,
     int serverRandomOffset, int helloSz)
 {
     int ret = 0;
-    int digestType;
-    int digestSize;
+    int digestType = 0;
+    int digestSize = 0;
     HS_Hashes* tmpHashes;
     HS_Hashes* acceptHashes;
     byte zeros[WC_MAX_DIGEST_SIZE];
@@ -4857,10 +4872,10 @@ static int EchWriteAcceptance(WOLFSSL* ssl, byte* output,
   int serverRandomOffset, int helloSz)
 {
     int ret = 0;
-    int digestType;
-    int digestSize;
-    HS_Hashes* tmpHashes;
-    HS_Hashes* acceptHashes;
+    int digestType = 0;
+    int digestSize = 0;
+    HS_Hashes* tmpHashes = NULL;
+    HS_Hashes* acceptHashes = NULL;
     byte zeros[WC_MAX_DIGEST_SIZE];
     byte transcriptEchConf[WC_MAX_DIGEST_SIZE];
     byte expandLabelPrk[WC_MAX_DIGEST_SIZE];
@@ -5099,7 +5114,7 @@ int DoTls13ServerHello(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
             if (ssl->options.dtls) {
                 ssl->chVersion.minor = DTLSv1_2_MINOR;
                 ssl->version.minor = DTLSv1_2_MINOR;
-                ret = Dtls13DoDowngrade(ssl);
+                ret = Dtls13ClientDoDowngrade(ssl);
                 if (ret != 0)
                     return ret;
             }
@@ -5193,7 +5208,7 @@ int DoTls13ServerHello(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
         if (ssl->options.dtls) {
             ssl->chVersion.minor = DTLSv1_2_MINOR;
             ssl->version.minor = DTLSv1_2_MINOR;
-            ret = Dtls13DoDowngrade(ssl);
+            ret = Dtls13ClientDoDowngrade(ssl);
             if (ret != 0)
                 return ret;
         }
@@ -5266,7 +5281,7 @@ int DoTls13ServerHello(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
 
 #ifdef WOLFSSL_DTLS13
             if (ssl->options.dtls) {
-                ret = Dtls13DoDowngrade(ssl);
+                ret = Dtls13ClientDoDowngrade(ssl);
                 if (ret != 0)
                     return ret;
             }
@@ -6321,6 +6336,12 @@ int TlsCheckCookie(const WOLFSSL* ssl, const byte* cookie, word16 cookieSz)
     byte cookieType = 0;
     byte macSz = 0;
 
+    if (ssl->buffers.tls13CookieSecret.buffer == NULL ||
+            ssl->buffers.tls13CookieSecret.length == 0) {
+        WOLFSSL_MSG("Missing DTLS 1.3 cookie secret");
+        return COOKIE_ERROR;
+    }
+
 #if !defined(NO_SHA) && defined(NO_SHA256)
     cookieType = SHA;
     macSz = WC_SHA_DIGEST_SIZE;
@@ -6695,6 +6716,7 @@ int DoTls13ClientHello(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
      * wolfSSL_accept_TLSv13 when changing this one. */
     if (IsDtlsNotSctpMode(ssl) && ssl->options.sendCookie &&
             !ssl->options.dtlsStateful) {
+        DtlsSetSeqNumForReply(ssl);
         ret = DoClientHelloStateless(ssl, input + *inOutIdx, helloSz, 0, NULL);
         if (ret != 0 || !ssl->options.dtlsStateful) {
             *inOutIdx += helloSz;
@@ -9407,8 +9429,6 @@ typedef struct Dcv13Args {
     word32 sigSz;
     word32 idx;
     word32 begin;
-    byte   hashAlgo;
-    byte   sigAlgo;
 
     byte*  sigData;
     word16 sigDataSz;
@@ -9562,8 +9582,8 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
         ret = 0;
         ssl->options.asyncState = TLS_ASYNC_BEGIN;
         XMEMSET(args, 0, sizeof(Dcv13Args));
-        args->hashAlgo = sha_mac;
-        args->sigAlgo = anonymous_sa_algo;
+        ssl->options.peerHashAlgo = sha_mac;
+        ssl->options.peerSigAlgo = anonymous_sa_algo;
         args->idx = *inOutIdx;
         args->begin = *inOutIdx;
     #ifdef WOLFSSL_ASYNC_CRYPT
@@ -9612,14 +9632,14 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
                 *ssl->sigSpec == WOLFSSL_CKS_SIGSPEC_NATIVE ||
                 *ssl->sigSpec == WOLFSSL_CKS_SIGSPEC_ALTERNATIVE) {
 #endif /* WOLFSSL_DUAL_ALG_CERTS */
-                ret = DecodeTls13SigAlg(input + args->idx, &args->hashAlgo,
-                                        &args->sigAlgo);
+                ret = DecodeTls13SigAlg(input + args->idx,
+                        &ssl->options.peerHashAlgo, &ssl->options.peerSigAlgo);
 #ifdef WOLFSSL_DUAL_ALG_CERTS
             }
             else {
                 ret = DecodeTls13HybridSigAlg(input + args->idx,
-                                              &args->hashAlgo,
-                                              &args->sigAlgo,
+                                              &ssl->options.peerHashAlgo,
+                                              &ssl->options.peerSigAlgo,
                                               &args->altSigAlgo);
             }
 #endif /* WOLFSSL_DUAL_ALG_CERTS */
@@ -9648,7 +9668,7 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
 
                 word16 sa;
                 if (args->altSigAlgo == 0)
-                    sa = args->sigAlgo;
+                    sa = ssl->options.peerSigAlgo;
                 else
                     sa = args->altSigAlgo;
 
@@ -9734,66 +9754,66 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
             /* Assume invalid unless signature algo matches the key provided */
             validSigAlgo = 0;
         #ifdef HAVE_ED25519
-            if (args->sigAlgo == ed25519_sa_algo) {
+            if (ssl->options.peerSigAlgo == ed25519_sa_algo) {
                 WOLFSSL_MSG("Peer sent ED25519 sig");
                 validSigAlgo = (ssl->peerEd25519Key != NULL) &&
                                                      ssl->peerEd25519KeyPresent;
             }
         #endif
         #ifdef HAVE_ED448
-            if (args->sigAlgo == ed448_sa_algo) {
+            if (ssl->options.peerSigAlgo == ed448_sa_algo) {
                 WOLFSSL_MSG("Peer sent ED448 sig");
                 validSigAlgo = (ssl->peerEd448Key != NULL) &&
                                                        ssl->peerEd448KeyPresent;
             }
         #endif
         #ifdef HAVE_ECC
-            if (args->sigAlgo == ecc_dsa_sa_algo) {
+            if (ssl->options.peerSigAlgo == ecc_dsa_sa_algo) {
                 WOLFSSL_MSG("Peer sent ECC sig");
                 validSigAlgo = (ssl->peerEccDsaKey != NULL) &&
                                                       ssl->peerEccDsaKeyPresent;
             }
         #endif
         #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
-            if (args->sigAlgo == sm2_sa_algo) {
+            if (ssl->options.peerSigAlgo == sm2_sa_algo) {
                 WOLFSSL_MSG("Peer sent SM2 sig");
                 validSigAlgo = (ssl->peerEccDsaKey != NULL) &&
                                                       ssl->peerEccDsaKeyPresent;
             }
         #endif
         #ifdef HAVE_PQC
-            if (args->sigAlgo == falcon_level1_sa_algo) {
+            if (ssl->options.peerSigAlgo == falcon_level1_sa_algo) {
                 WOLFSSL_MSG("Peer sent Falcon Level 1 sig");
                 validSigAlgo = (ssl->peerFalconKey != NULL) &&
                                ssl->peerFalconKeyPresent;
             }
-            if (args->sigAlgo == falcon_level5_sa_algo) {
+            if (ssl->options.peerSigAlgo == falcon_level5_sa_algo) {
                 WOLFSSL_MSG("Peer sent Falcon Level 5 sig");
                 validSigAlgo = (ssl->peerFalconKey != NULL) &&
                                ssl->peerFalconKeyPresent;
             }
-            if (args->sigAlgo == dilithium_level2_sa_algo) {
+            if (ssl->options.peerSigAlgo == dilithium_level2_sa_algo) {
                 WOLFSSL_MSG("Peer sent Dilithium Level 2 sig");
                 validSigAlgo = (ssl->peerDilithiumKey != NULL) &&
                                ssl->peerDilithiumKeyPresent;
             }
-            if (args->sigAlgo == dilithium_level3_sa_algo) {
+            if (ssl->options.peerSigAlgo == dilithium_level3_sa_algo) {
                 WOLFSSL_MSG("Peer sent Dilithium Level 3 sig");
                 validSigAlgo = (ssl->peerDilithiumKey != NULL) &&
                                ssl->peerDilithiumKeyPresent;
             }
-            if (args->sigAlgo == dilithium_level5_sa_algo) {
+            if (ssl->options.peerSigAlgo == dilithium_level5_sa_algo) {
                 WOLFSSL_MSG("Peer sent Dilithium Level 5 sig");
                 validSigAlgo = (ssl->peerDilithiumKey != NULL) &&
                                ssl->peerDilithiumKeyPresent;
             }
         #endif
         #ifndef NO_RSA
-            if (args->sigAlgo == rsa_sa_algo) {
+            if (ssl->options.peerSigAlgo == rsa_sa_algo) {
                 WOLFSSL_MSG("Peer sent PKCS#1.5 algo - not valid TLS 1.3");
                 ERROR_OUT(INVALID_PARAMETER, exit_dcv);
             }
-            if (args->sigAlgo == rsa_pss_sa_algo) {
+            if (ssl->options.peerSigAlgo == rsa_pss_sa_algo) {
                 WOLFSSL_MSG("Peer sent RSA sig");
                 validSigAlgo = (ssl->peerRsaKey != NULL) &&
                                                          ssl->peerRsaKeyPresent;
@@ -9817,10 +9837,10 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
                  * don't do:
                  *   sig->length -= args->altSignatureSz; */
                 #define RSA3072_SIG_LEN 384
-                if (args->sigAlgo == rsa_pss_sa_algo) {
+                if (ssl->options.peerSigAlgo == rsa_pss_sa_algo) {
                     sig->length = RSA3072_SIG_LEN;
                 }
-                else if (args->sigAlgo == ecc_dsa_sa_algo) {
+                else if (ssl->options.peerSigAlgo == ecc_dsa_sa_algo) {
                     word32 tmpIdx = args->idx;
                     sig->length = wc_SignatureGetSize(WC_SIGNATURE_TYPE_ECC,
                                       ssl->peerEccDsaKey,
@@ -9860,11 +9880,11 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
                 if (ret != 0)
                     goto exit_dcv;
             #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
-                if (args->sigAlgo != sm2_sa_algo)
+                if (ssl->options.peerSigAlgo != sm2_sa_algo)
             #endif
                 {
                     ret = CreateECCEncodedSig(args->sigData,
-                        args->sigDataSz, args->hashAlgo);
+                        args->sigDataSz, ssl->options.peerHashAlgo);
                     if (ret < 0)
                         goto exit_dcv;
                     args->sigDataSz = (word16)ret;
@@ -9944,7 +9964,7 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
         #ifndef NO_RSA
             if (ssl->peerRsaKey != NULL && ssl->peerRsaKeyPresent != 0) {
                 ret = RsaVerify(ssl, sig->buffer, (word32)sig->length, &args->output,
-                    args->sigAlgo, args->hashAlgo, ssl->peerRsaKey,
+                    ssl->options.peerSigAlgo, ssl->options.peerHashAlgo, ssl->peerRsaKey,
                 #ifdef HAVE_PK_CALLBACKS
                     &ssl->buffers.peerRsaKey
                 #else
@@ -9960,7 +9980,7 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
         #ifdef HAVE_ECC
             if (ssl->peerEccDsaKeyPresent) {
             #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
-                if (args->sigAlgo == sm2_sa_algo) {
+                if (ssl->options.peerSigAlgo == sm2_sa_algo) {
                     ret = Sm2wSm3Verify(ssl, TLS13_SM2_SIG_ID,
                         TLS13_SM2_SIG_ID_SZ, input + args->idx, args->sz,
                         args->sigData, args->sigDataSz,
@@ -10140,8 +10160,8 @@ static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,
         {
         #if !defined(NO_RSA) && defined(WC_RSA_PSS)
             if (ssl->peerRsaKey != NULL && ssl->peerRsaKeyPresent != 0) {
-                ret = CheckRSASignature(ssl, args->sigAlgo, args->hashAlgo,
-                                        args->output, args->sendSz);
+                ret = CheckRSASignature(ssl, ssl->options.peerSigAlgo,
+                        ssl->options.peerHashAlgo, args->output, args->sendSz);
                 if (ret != 0)
                     goto exit_dcv;
 
@@ -12620,7 +12640,7 @@ int wolfSSL_connect_TLSv13(WOLFSSL* ssl)
             }
 
             ssl->options.connectState = CLIENT_HELLO_SENT;
-            WOLFSSL_MSG("connect state: CLIENT_HELLO_SENT");
+            WOLFSSL_MSG("TLSv13 connect state: CLIENT_HELLO_SENT");
     #ifdef WOLFSSL_EARLY_DATA
             if (ssl->earlyData != no_early_data) {
         #if defined(WOLFSSL_TLS13_MIDDLEBOX_COMPAT)
@@ -14344,6 +14364,7 @@ int wolfSSL_read_early_data(WOLFSSL* ssl, void* data, int sz, int* outSz)
     if (!IsAtLeastTLSv1_3(ssl->version))
         return BAD_FUNC_ARG;
 
+    *outSz = 0;
 #ifndef NO_WOLFSSL_SERVER
     if (ssl->options.side == WOLFSSL_CLIENT_END)
         return SIDE_ERROR;

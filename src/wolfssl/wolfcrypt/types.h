@@ -259,7 +259,9 @@ decouple library dependencies with standard string, memory and so on.
     #endif
 
 #elif defined(WC_16BIT_CPU)
+    #ifndef MICROCHIP_PIC24
         #undef WORD64_AVAILABLE
+    #endif
         typedef word16 wolfssl_word;
         #define MP_16BIT  /* for mp_int, mp_word needs to be twice as big as \
                            * mp_digit, no 64 bit type so make mp_digit 16 bit */
@@ -556,6 +558,10 @@ typedef struct w64wrapper {
                 #endif
                 #define XREALLOC(p, n, h, t) wolfSSL_Realloc((p), (n), (h), (t))
             #endif /* WOLFSSL_DEBUG_MEMORY */
+        #elif  defined(WOLFSSL_EMBOS) && !defined(XMALLOC_USER) \
+                && !defined(NO_WOLFSSL_MEMORY) \
+                && !defined(WOLFSSL_STATIC_MEMORY)
+            /* settings.h solve this case already. Avoid redefinition. */
         #elif (!defined(FREERTOS) && !defined(FREERTOS_TCP)) || defined(WOLFSSL_TRACK_MEMORY)
             #ifdef WOLFSSL_DEBUG_MEMORY
                 #define XMALLOC(s, h, t)     ((void)(h), (void)(t), wolfSSL_Malloc((s), __func__, __LINE__))
@@ -578,71 +584,94 @@ typedef struct w64wrapper {
     #endif
 
     /* declare/free variable handling for async and smallstack */
+    #ifndef WC_ALLOC_DO_ON_FAILURE
+        #define WC_ALLOC_DO_ON_FAILURE() WC_DO_NOTHING
+    #endif
+
+    #define WC_DECLARE_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+        VAR_TYPE* VAR_NAME[VAR_ITEMS]; \
+        int idx##VAR_NAME = 0, inner_idx_##VAR_NAME
+    #define WC_HEAP_ARRAY_ARG(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE) \
+        VAR_TYPE* VAR_NAME[VAR_ITEMS]
+    #define WC_ALLOC_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+        for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
+            (VAR_NAME)[idx##VAR_NAME] = (VAR_TYPE*)XMALLOC(VAR_SIZE, (HEAP), DYNAMIC_TYPE_TMP_BUFFER); \
+            if ((VAR_NAME)[idx##VAR_NAME] == NULL) { \
+                for (inner_idx_##VAR_NAME = 0; inner_idx_##VAR_NAME < idx##VAR_NAME; inner_idx_##VAR_NAME++) { \
+                    XFREE((VAR_NAME)[inner_idx_##VAR_NAME], (HEAP), DYNAMIC_TYPE_TMP_BUFFER); \
+                    (VAR_NAME)[inner_idx_##VAR_NAME] = NULL; \
+                } \
+                for (inner_idx_##VAR_NAME = idx##VAR_NAME + 1; inner_idx_##VAR_NAME < (VAR_ITEMS); inner_idx_##VAR_NAME++) { \
+                    (VAR_NAME)[inner_idx_##VAR_NAME] = NULL; \
+                } \
+                idx##VAR_NAME = 0; \
+                WC_ALLOC_DO_ON_FAILURE(); \
+                break; \
+            } \
+        }
+    #define WC_CALLOC_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+            do { \
+                WC_ALLOC_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP); \
+                if (idx##VAR_NAME != 0) { \
+                    for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
+                        XMEMSET((VAR_NAME)[idx##VAR_NAME], 0, VAR_SIZE); \
+                    } \
+                } \
+            } while (0)
+    #define WC_HEAP_ARRAY_OK(VAR_NAME) (idx##VAR_NAME != 0)
+    #define WC_FREE_HEAP_ARRAY(VAR_NAME, VAR_ITEMS, HEAP)               \
+        if (WC_HEAP_ARRAY_OK(VAR_NAME)) {                               \
+            for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
+                XFREE((VAR_NAME)[idx##VAR_NAME], (HEAP), DYNAMIC_TYPE_TMP_BUFFER); \
+            }                                                           \
+            idx##VAR_NAME = 0;                                          \
+        }
+
     #if defined(WOLFSSL_ASYNC_CRYPT) || defined(WOLFSSL_SMALL_STACK)
         #define WC_DECLARE_VAR_IS_HEAP_ALLOC
         #define WC_DECLARE_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP) \
-            VAR_TYPE* VAR_NAME = (VAR_TYPE*)XMALLOC(sizeof(VAR_TYPE) * (VAR_SIZE), (HEAP), DYNAMIC_TYPE_WOLF_BIGINT)
-        #define WC_DECLARE_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            VAR_TYPE* VAR_NAME[VAR_ITEMS]; \
-            int idx##VAR_NAME, inner_idx_##VAR_NAME
-        #define WC_INIT_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
-                (VAR_NAME)[idx##VAR_NAME] = (VAR_TYPE*)XMALLOC(VAR_SIZE, (HEAP), DYNAMIC_TYPE_WOLF_BIGINT); \
-                if ((VAR_NAME)[idx##VAR_NAME] == NULL) { \
-                    for (inner_idx_##VAR_NAME = 0; inner_idx_##VAR_NAME < idx##VAR_NAME; inner_idx_##VAR_NAME++) { \
-                        XFREE((VAR_NAME)[inner_idx_##VAR_NAME], (HEAP), DYNAMIC_TYPE_WOLF_BIGINT); \
-                        (VAR_NAME)[inner_idx_##VAR_NAME] = NULL; \
-                    } \
-                    for (inner_idx_##VAR_NAME = idx##VAR_NAME + 1; inner_idx_##VAR_NAME < (VAR_ITEMS); inner_idx_##VAR_NAME++) { \
-                        (VAR_NAME)[inner_idx_##VAR_NAME] = NULL; \
-                    } \
-                    break; \
-                } \
-            }
+            VAR_TYPE* VAR_NAME = NULL
+        #define WC_ALLOC_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP)        \
+            do {                                                        \
+                (VAR_NAME) = (VAR_TYPE*)XMALLOC(sizeof(VAR_TYPE) * (VAR_SIZE), (HEAP), DYNAMIC_TYPE_WOLF_BIGINT); \
+                if ((VAR_NAME) == NULL) {                               \
+                    WC_ALLOC_DO_ON_FAILURE();                           \
+                }                                                       \
+            } while (0)
+        #define WC_CALLOC_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP)        \
+            do { \
+                WC_ALLOC_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP); \
+                XMEMSET(VAR_NAME, 0, sizeof(VAR_TYPE) * (VAR_SIZE)); \
+            } while (0)
         #define WC_FREE_VAR(VAR_NAME, HEAP) \
             XFREE(VAR_NAME, (HEAP), DYNAMIC_TYPE_WOLF_BIGINT)
+        #define WC_DECLARE_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+            WC_DECLARE_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP)
+        #define WC_ARRAY_ARG(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE) \
+            WC_HEAP_ARRAY_ARG(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE)
+        #define WC_ALLOC_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+            WC_ALLOC_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP)
+        #define WC_CALLOC_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+            WC_CALLOC_HEAP_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP)
+        #define WC_ARRAY_OK(VAR_NAME) WC_HEAP_ARRAY_OK(VAR_NAME)
         #define WC_FREE_ARRAY(VAR_NAME, VAR_ITEMS, HEAP) \
-            for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
-                XFREE((VAR_NAME)[idx##VAR_NAME], (HEAP), DYNAMIC_TYPE_WOLF_BIGINT); \
-            }
-
-        #define WC_DECLARE_ARRAY_DYNAMIC_DEC(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            WC_DECLARE_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP)
-        #define WC_DECLARE_ARRAY_DYNAMIC_EXE(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            WC_INIT_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP)
-        #define WC_FREE_ARRAY_DYNAMIC(VAR_NAME, VAR_ITEMS, HEAP) \
-            WC_FREE_ARRAY(VAR_NAME, VAR_ITEMS, HEAP)
+            WC_FREE_HEAP_ARRAY(VAR_NAME, VAR_ITEMS, HEAP)
     #else
         #undef WC_DECLARE_VAR_IS_HEAP_ALLOC
         #define WC_DECLARE_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP) \
             VAR_TYPE VAR_NAME[VAR_SIZE]
-        #define WC_DECLARE_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            VAR_TYPE VAR_NAME[VAR_ITEMS][VAR_SIZE]
-        #define WC_INIT_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) WC_DO_NOTHING
+        #define WC_ALLOC_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP) WC_DO_NOTHING
+        #define WC_CALLOC_VAR(VAR_NAME, VAR_TYPE, VAR_SIZE, HEAP)        \
+            XMEMSET(VAR_NAME, 0, sizeof(var))
         #define WC_FREE_VAR(VAR_NAME, HEAP) WC_DO_NOTHING /* nothing to free, its stack */
+        #define WC_DECLARE_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
+            VAR_TYPE VAR_NAME[VAR_ITEMS][(VAR_SIZE) / sizeof(VAR_TYPE)] /* // NOLINT(bugprone-sizeof-expression) */
+        #define WC_ARRAY_ARG(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE) \
+            VAR_TYPE VAR_NAME[VAR_ITEMS][(VAR_SIZE) / sizeof(VAR_TYPE)] /* // NOLINT(bugprone-sizeof-expression) */
+        #define WC_ALLOC_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) WC_DO_NOTHING
+        #define WC_CALLOC_ARRAY(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) XMEMSET(VAR_NAME, 0, sizeof(VAR_NAME))
+        #define WC_ARRAY_OK(VAR_NAME) 1
         #define WC_FREE_ARRAY(VAR_NAME, VAR_ITEMS, HEAP) WC_DO_NOTHING /* nothing to free, its stack */
-
-        #define WC_DECLARE_ARRAY_DYNAMIC_DEC(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            VAR_TYPE* VAR_NAME[VAR_ITEMS]; \
-            int idx##VAR_NAME, inner_idx_##VAR_NAME
-        #define WC_DECLARE_ARRAY_DYNAMIC_EXE(VAR_NAME, VAR_TYPE, VAR_ITEMS, VAR_SIZE, HEAP) \
-            for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
-                (VAR_NAME)[idx##VAR_NAME] = (VAR_TYPE*)XMALLOC(VAR_SIZE, (HEAP), DYNAMIC_TYPE_TMP_BUFFER); \
-                if ((VAR_NAME)[idx##VAR_NAME] == NULL) { \
-                    for (inner_idx_##VAR_NAME = 0; inner_idx_##VAR_NAME < idx##VAR_NAME; inner_idx_##VAR_NAME++) { \
-                        XFREE((VAR_NAME)[inner_idx_##VAR_NAME], HEAP, DYNAMIC_TYPE_TMP_BUFFER); \
-                        (VAR_NAME)[inner_idx_##VAR_NAME] = NULL; \
-                    } \
-                    for (inner_idx_##VAR_NAME = idx##VAR_NAME + 1; inner_idx_##VAR_NAME < (VAR_ITEMS); inner_idx_##VAR_NAME++) { \
-                        (VAR_NAME)[inner_idx_##VAR_NAME] = NULL; \
-                    } \
-                    break; \
-                } \
-            }
-        #define WC_FREE_ARRAY_DYNAMIC(VAR_NAME, VAR_ITEMS, HEAP) \
-            for (idx##VAR_NAME=0; idx##VAR_NAME<(VAR_ITEMS); idx##VAR_NAME++) { \
-                XFREE((VAR_NAME)[idx##VAR_NAME], (HEAP), DYNAMIC_TYPE_TMP_BUFFER); \
-            }
     #endif
 
     #if defined(HAVE_FIPS) || defined(HAVE_SELFTEST)
@@ -651,9 +680,9 @@ typedef struct w64wrapper {
         #define DECLARE_ARRAY               WC_DECLARE_ARRAY
         #define FREE_VAR                    WC_FREE_VAR
         #define FREE_ARRAY                  WC_FREE_ARRAY
-        #define DECLARE_ARRAY_DYNAMIC_DEC   WC_DECLARE_ARRAY_DYNAMIC_DEC
-        #define DECLARE_ARRAY_DYNAMIC_EXE   WC_DECLARE_ARRAY_DYNAMIC_EXE
-        #define FREE_ARRAY_DYNAMIC          WC_FREE_ARRAY_DYNAMIC
+        #define DECLARE_ARRAY_DYNAMIC_DEC   WC_DECLARE_HEAP_ARRAY
+        #define DECLARE_ARRAY_DYNAMIC_EXE   WC_ALLOC_HEAP_ARRAY
+        #define FREE_ARRAY_DYNAMIC          WC_FREE_HEAP_ARRAY
     #endif /* HAVE_FIPS */
 
     #if !defined(USE_WOLF_STRTOK) && \
@@ -700,11 +729,11 @@ typedef struct w64wrapper {
         #endif
 
         #ifndef XSTRCASECMP
-        #if defined(MICROCHIP_PIC32) && (__XC32_VERSION >= 1000)
-            /* XC32 supports str[n]casecmp in version >= 1.0. */
+        #if defined(MICROCHIP_PIC32) && (__XC32_VERSION >= 1000) && (__XC32_VERSION < 4000)
+            /* XC32 supports str[n]casecmp in version >= 1.0 through 4.0. */
             #define XSTRCASECMP(s1,s2) strcasecmp((s1),(s2))
         #elif defined(MICROCHIP_PIC32) || defined(WOLFSSL_TIRTOS) || \
-                defined(WOLFSSL_ZEPHYR)
+                defined(WOLFSSL_ZEPHYR) || defined(MICROCHIP_PIC24)
             /* XC32 version < 1.0 does not support strcasecmp. */
             #define USE_WOLF_STRCASECMP
             #define XSTRCASECMP(s1,s2) wc_strcasecmp(s1,s2)
@@ -734,7 +763,7 @@ typedef struct w64wrapper {
             /* XC32 supports str[n]casecmp in version >= 1.0. */
             #define XSTRNCASECMP(s1,s2,n) strncasecmp((s1),(s2),(n))
         #elif defined(MICROCHIP_PIC32) || defined(WOLFSSL_TIRTOS) || \
-                defined(WOLFSSL_ZEPHYR)
+                defined(WOLFSSL_ZEPHYR) || defined(MICROCHIP_PIC24)
             /* XC32 version < 1.0 does not support strncasecmp. */
             #define USE_WOLF_STRNCASECMP
             #define XSTRNCASECMP(s1,s2) wc_strncasecmp(s1,s2)
@@ -882,8 +911,12 @@ typedef struct w64wrapper {
 
     #if !defined(NO_FILESYSTEM) && !defined(NO_STDIO_FILESYSTEM)
         #ifndef XGETENV
-            #include <stdlib.h>
-            #define XGETENV getenv
+            #ifdef NO_GETENV
+                #define XGETENV(x) (NULL)
+            #else
+                #include <stdlib.h>
+                #define XGETENV getenv
+            #endif
         #endif
     #endif /* !NO_FILESYSTEM && !NO_STDIO_FILESYSTEM */
 
@@ -898,7 +931,11 @@ typedef struct w64wrapper {
         #endif
         #if defined(OPENSSL_ALL) || defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
         #define XISALNUM(c)     isalnum((c))
-        #define XISASCII(c)     isascii((c))
+        #ifdef NO_STDLIB_ISASCII
+            #define XISASCII(c) (((c) >= 0 && (c) <= 127) ? 1 : 0)
+        #else
+            #define XISASCII(c) isascii((c))
+        #endif
         #define XISSPACE(c)     isspace((c))
         #endif
         /* needed by wolfSSL_check_domain_name() */
