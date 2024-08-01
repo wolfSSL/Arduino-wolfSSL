@@ -1,0 +1,24 @@
+{
+  "name": "Arduino-wolfSSL",
+  "version": "5.7.2",
+  "description": "5.7.2 (Arduino-wolfSSL for PlatformIO) A lightweight SSL/TLS library written in ANSI C and targeted for embedded, RTOS, and resource-constrained environments.",
+  "keywords": "FIPS, DO-178, TLS, DTLS, DSA, PSK, X.509, RSA, ECC, AES, GCM, PQ, SHA, SHA256, 3DES, SHA512, MD5, ASN, CMAC, Blake, camellia, ChaCha, ChaCha20, DH, OCSP, ALPN, SNI, CRL, dilithium, ed25519, ed448, kdf, pkcs7, pkcs12, poly1305, Curve25519, sakke, SM, SM2, SM3, SM4, TFM, PKI, SRP, wolfcrypt, wolfssl, Post-quantum cryptography, Certificate management, SSL-TLS handshake, Session caching, Hash, Secure hashing, Public key infrastructure, Cryptanalysis, Lightweight cryptography, Hardware-based security",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wolfSSL/Arduino-wolfSSL.git"
+  },
+  "authors": [
+    {
+      "name": "wolfSSL Inc.",
+      "email": "support@wolfssl.com",
+      "url": "https://www.wolfssl.com/contact/",
+      "maintainer": true
+    }
+  ],
+  "license": "GPL-2.0-only",
+  "homepage": "https://www.wolfssl.com/",
+  "dependencies": {
+  },
+  "frameworks": "*",
+  "platforms": "*"
+}

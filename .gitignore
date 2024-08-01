@@ -3,3 +3,9 @@
 ################################################################################
 
 /.vs
+/src/wolfcrypt/src/fips.c
+/src/wolfcrypt/src/fips_test.c
+/src/wolfcrypt/src/selftest.c
+/src/wolfcrypt/src/wolfcrypt_first.c
+/src/wolfcrypt/src/wolfcrypt_last.c
+/src/wolfssl/wolfcrypt/fips.h

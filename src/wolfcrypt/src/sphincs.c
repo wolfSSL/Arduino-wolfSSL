@@ -431,7 +431,8 @@ static int parse_private_key(const byte* priv, word32 privSz,
 
     /* At this point, it is still a PKCS8 private key. */
     if ((ret = ToTraditionalInline(priv, &idx, privSz)) < 0) {
-        return ret;
+        /* ignore error, did not have PKCS8 header */
+        (void)ret;
     }
 
     /* Now it is a octet_string(concat(priv,pub)) */
@@ -952,7 +953,7 @@ int wc_Sphincs_PublicKeyToDer(sphincs_key* key, byte* output, word32 inLen,
     word32 pubKeyLen = (word32)sizeof(pubKey);
     int    keytype = 0;
 
-    if (key == NULL || output == NULL) {
+    if (key == NULL) {
         return BAD_FUNC_ARG;
     }
 

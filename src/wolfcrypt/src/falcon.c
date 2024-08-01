@@ -75,7 +75,7 @@ int wc_falcon_sign_msg(const byte* in, word32 inLen,
     {
         ret = wc_CryptoCb_PqcSign(in, inLen, out, outLen, rng,
                                   WC_PQC_SIG_TYPE_FALCON, key);
-        if (ret != CRYPTOCB_UNAVAILABLE)
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
             return ret;
         /* fall-through when unavailable */
         ret = 0;
@@ -173,7 +173,7 @@ int wc_falcon_verify_msg(const byte* sig, word32 sigLen, const byte* msg,
     {
         ret = wc_CryptoCb_PqcVerify(sig, sigLen, msg, msgLen, res,
                                     WC_PQC_SIG_TYPE_FALCON, key);
-        if (ret != CRYPTOCB_UNAVAILABLE)
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
             return ret;
         /* fall-through when unavailable */
         ret = 0;
@@ -282,7 +282,7 @@ int wc_falcon_init_id(falcon_key* key, const unsigned char* id, int len,
         key->idLen = len;
     }
 
-    /* Set the maxiumum level here */
+    /* Set the maximum level here */
     wc_falcon_set_level(key, 5);
 
     return ret;
@@ -309,7 +309,7 @@ int wc_falcon_init_label(falcon_key* key, const char* label, void* heap,
         key->labelLen = labelLen;
     }
 
-    /* Set the maxiumum level here */
+    /* Set the maximum level here */
     wc_falcon_set_level(key, 5);
 
     return ret;
@@ -469,7 +469,8 @@ static int parse_private_key(const byte* priv, word32 privSz,
 
     /* At this point, it is still a PKCS8 private key. */
     if ((ret = ToTraditionalInline(priv, &idx, privSz)) < 0) {
-        return ret;
+        /* ignore error, did not have PKCS8 header */
+        (void)ret;
     }
 
     /* Now it is a octet_string(concat(priv,pub)) */
@@ -846,11 +847,11 @@ int wc_Falcon_PrivateKeyDecode(const byte* input, word32* inOutIdx,
                         pubKey, &pubKeyLen, keytype);
     if (ret == 0) {
         if (pubKeyLen == 0) {
-            ret = wc_falcon_import_private_only(input, inSz, key);
+            ret = wc_falcon_import_private_key(input, inSz, NULL, 0, key);
         }
         else {
-            ret = wc_falcon_import_private_key(privKey, privKeyLen,
-                                               pubKey, pubKeyLen, key);
+            ret = wc_falcon_import_private_key(input, inSz, pubKey,
+                                               pubKeyLen, key);
         }
     }
     return ret;
@@ -912,7 +913,7 @@ int wc_Falcon_PublicKeyToDer(falcon_key* key, byte* output, word32 inLen,
     word32 pubKeyLen = (word32)sizeof(pubKey);
     int    keytype = 0;
 
-    if (key == NULL || output == NULL) {
+    if (key == NULL) {
         return BAD_FUNC_ARG;
     }
 
