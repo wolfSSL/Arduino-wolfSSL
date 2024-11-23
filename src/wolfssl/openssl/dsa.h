@@ -1,6 +1,6 @@
 /* dsa.h
  *
- * Copyright (C) 2006-2023 wolfSSL Inc.
+ * Copyright (C) 2006-2024 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -26,6 +26,7 @@
 #define WOLFSSL_DSA_H_
 
 #include <wolfssl/openssl/bn.h>
+#include <wolfssl/openssl/compat_types.h>
 
 #ifdef __cplusplus
     extern "C" {
@@ -118,6 +119,8 @@ WOLFSSL_API WOLFSSL_DSA* wolfSSL_d2i_DSAparams(
 #if defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
 
 typedef WOLFSSL_DSA                   DSA;
+
+#define OPENSSL_DSA_MAX_MODULUS_BITS 3072
 
 #define WOLFSSL_DSA_LOAD_PRIVATE 1
 #define WOLFSSL_DSA_LOAD_PUBLIC  2

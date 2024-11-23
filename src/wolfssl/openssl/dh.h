@@ -1,6 +1,6 @@
 /* dh.h
  *
- * Copyright (C) 2006-2023 wolfSSL Inc.
+ * Copyright (C) 2006-2024 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -26,6 +26,7 @@
 #define WOLFSSL_DH_H_
 
 #include <wolfssl/openssl/bn.h>
+#include <wolfssl/openssl/ssl.h>
 #include <wolfssl/openssl/opensslv.h>
 
 #ifdef __cplusplus
@@ -67,6 +68,9 @@ WOLFSSL_API int wolfSSL_DH_size(WOLFSSL_DH* dh);
 WOLFSSL_API int wolfSSL_DH_generate_key(WOLFSSL_DH* dh);
 WOLFSSL_API int wolfSSL_DH_compute_key(unsigned char* key, const WOLFSSL_BIGNUM* pub,
                                      WOLFSSL_DH* dh);
+WOLFSSL_API int wolfSSL_DH_compute_key_padded(unsigned char* key,
+                                const WOLFSSL_BIGNUM* otherPub, WOLFSSL_DH* dh);
+
 WOLFSSL_API int wolfSSL_DH_LoadDer(WOLFSSL_DH* dh, const unsigned char* derBuf,
                                    int derSz);
 WOLFSSL_API int wolfSSL_DH_set_length(WOLFSSL_DH* dh, long len);
@@ -91,12 +95,15 @@ typedef WOLFSSL_DH                   DH;
 #define DH_size         wolfSSL_DH_size
 #define DH_generate_key wolfSSL_DH_generate_key
 #define DH_compute_key  wolfSSL_DH_compute_key
+#define DH_compute_key_padded wolfSSL_DH_compute_key_padded
 #define DH_set_length   wolfSSL_DH_set_length
 #define DH_set0_pqg     wolfSSL_DH_set0_pqg
 #define DH_get0_pqg     wolfSSL_DH_get0_pqg
 #define DH_get0_key     wolfSSL_DH_get0_key
 #define DH_set0_key     wolfSSL_DH_set0_key
 #define DH_bits(x)      (BN_num_bits((x)->p))
+
+#define OPENSSL_DH_MAX_MODULUS_BITS     DH_MAX_SIZE
 
 #define DH_GENERATOR_2                  2
 #define DH_CHECK_P_NOT_PRIME            0x01

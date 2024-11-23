@@ -1,6 +1,6 @@
 /* rsa.h
  *
- * Copyright (C) 2006-2023 wolfSSL Inc.
+ * Copyright (C) 2006-2024 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -103,7 +103,11 @@ RSA keys can be used to encrypt, decrypt, sign and verify data.
 #endif
 
 #ifndef RSA_MIN_SIZE
-#define RSA_MIN_SIZE 512
+    #if defined(HAVE_WOLFENGINE) || defined(HAVE_WOLFPROVIDER)
+        #define RSA_MIN_SIZE 1024
+    #else
+        #define RSA_MIN_SIZE 2048
+    #endif
 #endif
 
 #ifndef RSA_MAX_SIZE
@@ -274,9 +278,28 @@ struct RsaKey {
 
 #endif /* HAVE_FIPS */
 
+#if defined(WOLF_CRYPTO_CB) && defined(WOLF_CRYPTO_CB_RSA_PAD)
+struct RsaPadding {
+    byte pad_value;
+    int pad_type;
+    enum wc_HashType hash;
+    int mgf;
+    byte* label;
+    word32 labelSz;
+    int saltLen;
+    int unpadded;
+};
+typedef struct RsaPadding RsaPadding;
+#endif
+
 WOLFSSL_API int  wc_InitRsaKey(RsaKey* key, void* heap);
 WOLFSSL_API int  wc_InitRsaKey_ex(RsaKey* key, void* heap, int devId);
 WOLFSSL_API int  wc_FreeRsaKey(RsaKey* key);
+#ifndef WC_NO_CONSTRUCTORS
+WOLFSSL_API RsaKey* wc_NewRsaKey(void* heap, int devId, int *result_code);
+WOLFSSL_API int  wc_DeleteRsaKey(RsaKey* key, RsaKey** key_p);
+#endif
+
 #ifdef WOLF_PRIVATE_KEY_ID
 WOLFSSL_API int wc_InitRsaKey_Id(RsaKey* key, unsigned char* id, int len,
                                  void* heap, int devId);
