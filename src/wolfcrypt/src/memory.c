@@ -1,6 +1,6 @@
 /* memory.c
  *
- * Copyright (C) 2006-2023 wolfSSL Inc.
+ * Copyright (C) 2006-2024 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -32,6 +32,7 @@
 #endif
 
 #include <wolfssl/wolfcrypt/types.h>
+#include <wolfssl/wolfcrypt/error-crypt.h>
 
 /*
 Possible memory options:
@@ -793,9 +794,13 @@ int wc_LoadStaticMemory(WOLFSSL_HEAP_HINT** pHint,
 void wc_UnloadStaticMemory(WOLFSSL_HEAP_HINT* heap)
 {
     WOLFSSL_ENTER("wc_UnloadStaticMemory");
+#ifndef SINGLE_THREADED
     if (heap != NULL && heap->memory != NULL) {
         wc_FreeMutex(&heap->memory->memory_mutex);
     }
+#else
+    (void)heap;
+#endif
 }
 
 #ifndef WOLFSSL_STATIC_MEMORY_LEAN
@@ -1206,6 +1211,9 @@ void wolfSSL_Free(void *ptr, void* heap, int type)
                 OS_HEAP_free(ptr);
             #else
                 free(ptr);
+            #endif
+            #ifdef WOLFSSL_DEBUG_MEMORY
+            fprintf(stderr, "Free: %p at %s:%d\n", ptr, func, line);
             #endif
         #else
             WOLFSSL_MSG("Error trying to call free when turned off");

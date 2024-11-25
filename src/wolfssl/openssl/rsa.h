@@ -1,6 +1,6 @@
 /* rsa.h
  *
- * Copyright (C) 2006-2023 wolfSSL Inc.
+ * Copyright (C) 2006-2024 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -27,7 +27,9 @@
 
 #include <wolfssl/openssl/bn.h>
 #include <wolfssl/openssl/err.h>
+#include <wolfssl/openssl/compat_types.h>
 #include <wolfssl/wolfcrypt/types.h>
+#include <wolfssl/wolfcrypt/rsa.h>
 
 #ifdef __cplusplus
     extern "C" {
@@ -189,6 +191,8 @@ WOLFSSL_API int wolfSSL_RSA_set_ex_data_with_cleanup(
 #endif
 
 #if defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
+#define OPENSSL_RSA_MAX_MODULUS_BITS RSA_MAX_SIZE
+
 #define WOLFSSL_RSA_LOAD_PRIVATE 1
 #define WOLFSSL_RSA_LOAD_PUBLIC  2
 #define WOLFSSL_RSA_F4           0x10001L
@@ -239,6 +243,9 @@ WOLFSSL_API int wolfSSL_RSA_set_ex_data_with_cleanup(
 #define RSA_get0_key       wolfSSL_RSA_get0_key
 
 #define RSA_F4             WOLFSSL_RSA_F4
+
+#define OPENSSL_RSA_MAX_MODULUS_BITS RSA_MAX_SIZE
+#define OPENSSL_RSA_MAX_PUBEXP_BITS  RSA_MAX_SIZE
 
 #endif /* OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL */
 

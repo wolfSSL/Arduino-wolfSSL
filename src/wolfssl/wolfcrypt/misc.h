@@ -1,6 +1,6 @@
 /* misc.h
  *
- * Copyright (C) 2006-2023 wolfSSL Inc.
+ * Copyright (C) 2006-2024 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -76,6 +76,14 @@ int ConstantCompare(const byte* a, const byte* b, int length);
 
 #ifdef WORD64_AVAILABLE
 WOLFSSL_LOCAL
+word64 readUnalignedWord64(const byte *in);
+WOLFSSL_LOCAL
+word64 writeUnalignedWord64(void *out, word64 in);
+WOLFSSL_LOCAL
+void readUnalignedWords64(word64 *out, const byte *in, size_t count);
+WOLFSSL_LOCAL
+void writeUnalignedWords64(byte *out, const word64 *in, size_t count);
+WOLFSSL_LOCAL
 word64 rotlFixed64(word64 x, word64 y);
 WOLFSSL_LOCAL
 word64 rotrFixed64(word64 x, word64 y);
@@ -145,6 +153,7 @@ WOLFSSL_LOCAL word32 w64GetLow32(w64wrapper n);
 WOLFSSL_LOCAL word32 w64GetHigh32(w64wrapper n);
 WOLFSSL_LOCAL void w64SetLow32(w64wrapper *n, word32 low);
 WOLFSSL_LOCAL w64wrapper w64Add32(w64wrapper a, word32 b, byte *wrap);
+WOLFSSL_LOCAL w64wrapper w64Add(w64wrapper a, w64wrapper b, byte *wrap);
 WOLFSSL_LOCAL w64wrapper w64Sub32(w64wrapper a, word32 b, byte *wrap);
 WOLFSSL_LOCAL byte w64GT(w64wrapper a, w64wrapper b);
 WOLFSSL_LOCAL byte w64IsZero(w64wrapper a);
@@ -157,6 +166,7 @@ WOLFSSL_LOCAL w64wrapper w64Sub(w64wrapper a, w64wrapper b);
 WOLFSSL_LOCAL void w64Zero(w64wrapper *a);
 WOLFSSL_LOCAL w64wrapper w64ShiftRight(w64wrapper a, int shift);
 WOLFSSL_LOCAL w64wrapper w64ShiftLeft(w64wrapper a, int shift);
+WOLFSSL_LOCAL w64wrapper w64Mul(word32 a, word32 b);
 
 #else /* !NO_INLINE */
 
