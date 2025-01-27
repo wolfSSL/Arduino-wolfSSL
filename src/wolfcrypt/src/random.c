@@ -111,6 +111,8 @@ This library contains implementation for the random number generator.
     #include <random.h>
 #elif defined(WOLFSSL_XILINX_CRYPT_VERSAL)
     #include "wolfssl/wolfcrypt/port/xilinx/xil-versal-trng.h"
+#elif defined(WOLFSSL_RPIPICO)
+    #include "wolfssl/wolfcrypt/port/rpi_pico/pico.h"
 #elif defined(NO_DEV_RANDOM)
 #elif defined(CUSTOM_RAND_GENERATE)
 #elif defined(CUSTOM_RAND_GENERATE_BLOCK)
@@ -596,14 +598,14 @@ static WC_INLINE void array_add(byte* d, word32 dLen, const byte* s, word32 sLen
 
         dIdx = (int)dLen - 1;
         for (sIdx = (int)sLen - 1; sIdx >= 0; sIdx--) {
-            carry += (word16)((word16)d[dIdx] + (word16)s[sIdx]);
+            carry = (word16)(carry + d[dIdx] + s[sIdx]);
             d[dIdx] = (byte)carry;
             carry >>= 8;
             dIdx--;
         }
 
         for (; dIdx >= 0; dIdx--) {
-            carry += (word16)d[dIdx];
+            carry = (word16)(carry + d[dIdx]);
             d[dIdx] = (byte)carry;
             carry >>= 8;
         }
@@ -1702,7 +1704,7 @@ static int _InitRng(WC_RNG* rng, byte* nonce, word32 nonceSz,
 
         if (ret != 0) {
 #if defined(DEBUG_WOLFSSL)
-            WOLFSSL_MSG_EX("_InitRng failed. err = ", ret);
+            WOLFSSL_MSG_EX("_InitRng failed. err = %d", ret);
 #endif
         }
         else {
@@ -2968,7 +2970,6 @@ int wc_GenerateSeed(OS_Seed* os, byte* output, word32 sz)
         }
         return RAN_BLOCK_E;
     }
-
 #elif !defined(WOLFSSL_CAAM) && \
     (defined(FREESCALE_MQX) || defined(FREESCALE_KSDK_MQX) || \
      defined(FREESCALE_KSDK_BM) || defined(FREESCALE_FREE_RTOS))

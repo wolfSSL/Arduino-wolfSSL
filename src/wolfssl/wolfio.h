@@ -416,7 +416,7 @@
         #endif
     #endif
     #ifndef XSOCKOPT_TYPE_OPTVAL_TYPE
-        #ifdef USE_WINDOWS_API
+        #ifndef USE_WINDOWS_API
             #define XSOCKOPT_TYPE_OPTVAL_TYPE void*
         #else
             #define XSOCKOPT_TYPE_OPTVAL_TYPE char*
@@ -520,13 +520,19 @@ WOLFSSL_API  int wolfIO_RecvFrom(SOCKET_T sd, WOLFSSL_BIO_ADDR *addr, char *buf,
 #endif
 #endif /* WOLFSSL_NO_SOCK */
 
+WOLFSSL_API int wolfSSL_BioSend(WOLFSSL* ssl, char *buf, int sz, void *ctx);
+WOLFSSL_API int wolfSSL_BioReceive(WOLFSSL* ssl, char* buf, int sz, void* ctx);
+#ifndef OPENSSL_COEXIST
 /* Preserve API previously exposed */
-WOLFSSL_API int BioSend(WOLFSSL* ssl, char *buf, int sz, void *ctx);
-WOLFSSL_API int BioReceive(WOLFSSL* ssl, char* buf, int sz, void* ctx);
+#define BioSend wolfSSL_BioSend
+#define BioReceive wolfSSL_BioReceive
+#endif
 
 WOLFSSL_LOCAL int SslBioSend(WOLFSSL* ssl, char *buf, int sz, void *ctx);
+#if defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
 WOLFSSL_LOCAL int BioReceiveInternal(WOLFSSL_BIO* biord, WOLFSSL_BIO* biowr,
                                      char* buf, int sz);
+#endif
 WOLFSSL_LOCAL int SslBioReceive(WOLFSSL* ssl, char* buf, int sz, void* ctx);
 #if defined(USE_WOLFSSL_IO)
     /* default IO callbacks */
@@ -605,6 +611,8 @@ WOLFSSL_API void wolfSSL_CTX_SetIORecv(WOLFSSL_CTX *ctx, CallbackIORecv CBIORecv
 WOLFSSL_API void wolfSSL_CTX_SetIOSend(WOLFSSL_CTX *ctx, CallbackIOSend CBIOSend);
 WOLFSSL_API void wolfSSL_SSLSetIORecv(WOLFSSL *ssl, CallbackIORecv CBIORecv);
 WOLFSSL_API void wolfSSL_SSLSetIOSend(WOLFSSL *ssl, CallbackIOSend CBIOSend);
+WOLFSSL_API void wolfSSL_SSLDisableRead(WOLFSSL *ssl);
+WOLFSSL_API void wolfSSL_SSLEnableRead(WOLFSSL *ssl);
 /* deprecated old name */
 #define wolfSSL_SetIORecv wolfSSL_CTX_SetIORecv
 #define wolfSSL_SetIOSend wolfSSL_CTX_SetIOSend
