@@ -260,7 +260,8 @@ static int Dtls13GetRnMask(WOLFSSL* ssl, const byte* ciphertext, byte* mask,
         if (c->aes == NULL)
             return BAD_STATE_E;
 #if !defined(HAVE_SELFTEST) && \
-    (!defined(HAVE_FIPS) || (defined(FIPS_VERSION_GE) && FIPS_VERSION_GE(5,3)))
+    (!defined(HAVE_FIPS) || (defined(FIPS_VERSION_GE) && FIPS_VERSION_GE(5,3)) \
+    || defined(WOLFSSL_LINUXKM))
         return wc_AesEncryptDirect(c->aes, mask, ciphertext);
 #else
         wc_AesEncryptDirect(c->aes, mask, ciphertext);
@@ -1148,6 +1149,11 @@ static int Dtls13UnifiedHeaderParseCID(WOLFSSL* ssl, byte flags,
     }
 
     return 0;
+}
+
+int Dtls13UnifiedHeaderCIDPresent(byte flags)
+{
+    return Dtls13IsUnifiedHeader(flags) && (flags & DTLS13_CID_BIT);
 }
 
 #else

@@ -44,6 +44,9 @@ const char* wc_GetErrorString(int error)
 {
     switch ((enum wolfCrypt_ErrorCodes)error) {
 
+    case WC_FAILURE:
+        return "wolfCrypt generic failure";
+
     case MP_MEM :
         return "MP integer dynamic memory allocation failed";
 
@@ -642,11 +645,14 @@ const char* wc_GetErrorString(int error)
     case PBKDF2_KAT_FIPS_E:
         return "wolfCrypt FIPS PBKDF2 Known Answer Test Failure";
 
+    case DEADLOCK_AVERTED_E:
+        return "Deadlock averted -- retry the call";
+
     case MAX_CODE_E:
+    case WC_SPAN1_MIN_CODE_E:
     case MIN_CODE_E:
     default:
         return "unknown error number";
-
     }
 }
 
@@ -660,4 +666,3 @@ void wc_ErrorString(int error, char* buffer)
     buffer[WOLFSSL_MAX_ERROR_SZ-1] = 0;
 }
 #endif /* !NO_ERROR_STRINGS */
-

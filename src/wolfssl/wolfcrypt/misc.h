@@ -46,12 +46,10 @@ word32 rotlFixed(word32 x, word32 y);
 WOLFSSL_LOCAL
 word32 rotrFixed(word32 x, word32 y);
 
-#ifdef WC_RC2
 WOLFSSL_LOCAL
 word16 rotlFixed16(word16 x, word16 y);
 WOLFSSL_LOCAL
 word16 rotrFixed16(word16 x, word16 y);
-#endif
 
 WOLFSSL_LOCAL
 word32 ByteReverseWord32(word32 value);
@@ -73,6 +71,15 @@ void ForceZero(void* mem, word32 len);
 
 WOLFSSL_LOCAL
 int ConstantCompare(const byte* a, const byte* b, int length);
+
+WOLFSSL_LOCAL
+word32 readUnalignedWord32(const byte *in);
+WOLFSSL_LOCAL
+word32 writeUnalignedWord32(void *out, word32 in);
+WOLFSSL_LOCAL
+void readUnalignedWords32(word32 *out, const byte *in, size_t count);
+WOLFSSL_LOCAL
+void writeUnalignedWords32(byte *out, const word32 *in, size_t count);
 
 #ifdef WORD64_AVAILABLE
 WOLFSSL_LOCAL

@@ -33,6 +33,12 @@
  * WOLFSSL_WC_KYBER                                           Default: OFF
  *   Enables this code, wolfSSL implementation, to be built.
  *
+ * WOLFSSL_WC_ML_KEM_512                                      Default: OFF
+ *   Enables the ML-KEM 512 parameter implementations.
+ * WOLFSSL_WC_ML_KEM_768                                      Default: OFF
+ *   Enables the ML-KEM 768 parameter implementations.
+ * WOLFSSL_WC_ML_KEM_1024                                     Default: OFF
+ *   Enables the ML-KEM 1024 parameter implementations.
  * WOLFSSL_KYBER512                                           Default: OFF
  *   Enables the KYBER512 parameter implementations.
  * WOLFSSL_KYBER768                                           Default: OFF
@@ -49,7 +55,7 @@
  * WOLFSSL_SMALL_STACK                                        Default: OFF
  *   Use less stack by dynamically allocating local variables.
  *
- * WOLFSSL_KYBER_NTT_UNROLL                                   Defualt: OFF
+ * WOLFSSL_KYBER_NTT_UNROLL                                   Default: OFF
  *   Enable an alternative NTT implementation that may be faster on some
  *   platforms and is smaller in code size.
  * WOLFSSL_KYBER_INVNTT_UNROLL                                Default: OFF
@@ -61,6 +67,7 @@
     #include <config.h>
 #endif
 
+#include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/wolfcrypt/wc_kyber.h>
 #include <wolfssl/wolfcrypt/cpuid.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
@@ -1133,7 +1140,7 @@ void kyber_keygen(sword16* priv, sword16* pub, sword16* e, const sword16* a,
     }
 }
 
-/* Encapsuluate message.
+/* Encapsulate message.
  *
  * @param  [in]   pub  Public key vector of polynomials.
  * @param  [out]  bp   Vector of polynomials.
@@ -1266,7 +1273,7 @@ void kyber_keygen(sword16* priv, sword16* pub, sword16* e, const sword16* a,
     }
 }
 
-/* Encapsuluate message.
+/* Encapsulate message.
  *
  * @param  [in]   pub  Public key vector of polynomials.
  * @param  [out]  bp   Vector of polynomials.
@@ -1402,7 +1409,7 @@ void kyber_decapsulate(const sword16* priv, sword16* mp, sword16* bp,
 /******************************************************************************/
 
 #ifdef USE_INTEL_SPEEDUP
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
 /* Deterministically generate a matrix (or transpose) of uniform integers mod q.
  *
  * Seed used with XOF to generate random bytes.
@@ -1492,7 +1499,7 @@ static int kyber_gen_matrix_k2_avx2(sword16* a, byte* seed, int transposed)
 }
 #endif
 
-#ifdef WOLFSSL_KYBER768
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Deterministically generate a matrix (or transpose) of uniform integers mod q.
  *
  * Seed used with XOF to generate random bytes.
@@ -1617,7 +1624,7 @@ static int kyber_gen_matrix_k3_avx2(sword16* a, byte* seed, int transposed)
     return 0;
 }
 #endif
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Deterministically generate a matrix (or transpose) of uniform integers mod q.
  *
  * Seed used with XOF to generate random bytes.
@@ -1706,9 +1713,9 @@ static int kyber_gen_matrix_k4_avx2(sword16* a, byte* seed, int transposed)
 
     return 0;
 }
-#endif /* KYBER1024 */
+#endif /* WOLFSSL_KYBER1024 || WOLFSSL_WC_ML_KEM_1024 */
 #elif defined(WOLFSSL_ARMASM) && defined(__aarch64__)
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
 /* Deterministically generate a matrix (or transpose) of uniform integers mod q.
  *
  * Seed used with XOF to generate random bytes.
@@ -1782,7 +1789,7 @@ static int kyber_gen_matrix_k2_aarch64(sword16* a, byte* seed, int transposed)
 }
 #endif
 
-#ifdef WOLFSSL_KYBER768
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Deterministically generate a matrix (or transpose) of uniform integers mod q.
  *
  * Seed used with XOF to generate random bytes.
@@ -1848,7 +1855,7 @@ static int kyber_gen_matrix_k3_aarch64(sword16* a, byte* seed, int transposed)
 }
 #endif
 
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Deterministically generate a matrix (or transpose) of uniform integers mod q.
  *
  * Seed used with XOF to generate random bytes.
@@ -2067,17 +2074,24 @@ static int kyber_prf(wc_Shake* shake256, byte* out, unsigned int outLen,
         (25 - KYBER_SYM_SZ / 8 - 1) * sizeof(word64));
     state[WC_SHA3_256_COUNT - 1] = W64LIT(0x8000000000000000);
 
-    if (IS_INTEL_BMI2(cpuid_flags)) {
-        sha3_block_bmi2(state);
+    while (outLen > 0) {
+        unsigned int len = min(outLen, WC_SHA3_256_BLOCK_SIZE);
+
+        if (IS_INTEL_BMI2(cpuid_flags)) {
+            sha3_block_bmi2(state);
+        }
+        else if (IS_INTEL_AVX2(cpuid_flags) &&
+                 (SAVE_VECTOR_REGISTERS2() == 0)) {
+            sha3_block_avx2(state);
+            RESTORE_VECTOR_REGISTERS();
+        }
+        else {
+            BlockSha3(state);
+        }
+        XMEMCPY(out, state, len);
+        out += len;
+        outLen -= len;
     }
-    else if (IS_INTEL_AVX2(cpuid_flags) && (SAVE_VECTOR_REGISTERS2() == 0)) {
-        sha3_block_avx2(state);
-        RESTORE_VECTOR_REGISTERS();
-    }
-    else {
-        BlockSha3(state);
-    }
-    XMEMCPY(out, state, outLen);
 
     return 0;
 #else
@@ -2381,7 +2395,7 @@ int kyber_gen_matrix(KYBER_PRF_T* prf, sword16* a, int kp, byte* seed,
 {
     int ret;
 
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
     if (kp == KYBER512_K) {
 #if defined(WOLFSSL_ARMASM) && defined(__aarch64__)
         ret = kyber_gen_matrix_k2_aarch64(a, seed, transposed);
@@ -2400,7 +2414,7 @@ int kyber_gen_matrix(KYBER_PRF_T* prf, sword16* a, int kp, byte* seed,
     }
     else
 #endif
-#ifdef WOLFSSL_KYBER768
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
     if (kp == KYBER768_K) {
 #if defined(WOLFSSL_ARMASM) && defined(__aarch64__)
         ret = kyber_gen_matrix_k3_aarch64(a, seed, transposed);
@@ -2419,7 +2433,7 @@ int kyber_gen_matrix(KYBER_PRF_T* prf, sword16* a, int kp, byte* seed,
     }
     else
 #endif
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
     if (kp == KYBER1024_K) {
 #if defined(WOLFSSL_ARMASM) && defined(__aarch64__)
         ret = kyber_gen_matrix_k4_aarch64(a, seed, transposed);
@@ -2556,7 +2570,7 @@ static void kyber_cbd_eta2(sword16* p, const byte* r)
 #endif
 }
 
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
 /* Subtract one 3 bit value from another out of a larger number.
  *
  * @param  [in]  d  Value containing sequential 3 bit values.
@@ -2713,7 +2727,7 @@ static void kyber_cbd_eta3(sword16* p, const byte* r)
 /* Get noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [out]      p     Polynomial.
  * @param  [in]       seed  Seed to use when calculating random.
  * @param  [in]       eta1  Size of noise/error integers.
@@ -2726,7 +2740,7 @@ static int kyber_get_noise_eta1_c(KYBER_PRF_T* prf, sword16* p,
 
     (void)eta1;
 
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
     if (eta1 == KYBER_CBD_ETA3) {
         byte rand[ETA3_RAND_SIZE];
 
@@ -2756,7 +2770,7 @@ static int kyber_get_noise_eta1_c(KYBER_PRF_T* prf, sword16* p,
 /* Get noise/error by calculating random bytes and sampling to a binomial
  * distribution. Values -2..2
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [out]      p     Polynomial.
  * @param  [in]       seed  Seed to use when calculating random.
  * @return  0 on success.
@@ -2781,7 +2795,8 @@ static int kyber_get_noise_eta2_c(KYBER_PRF_T* prf, sword16* p,
 #ifdef USE_INTEL_SPEEDUP
 #define PRF_RAND_SZ   (2 * SHA3_256_BYTES)
 
-#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_KYBER1024)
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768) || \
+    defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Get the noise/error by calculating random bytes.
  *
  * @param  [out]  rand  Random number byte array.
@@ -2804,7 +2819,7 @@ static void kyber_get_noise_x4_eta2_avx2(byte* rand, byte* seed, byte o)
 }
 #endif
 
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
 /* Get the noise/error by calculating random bytes.
  *
  * @param  [out]  rand  Random number byte array.
@@ -2835,7 +2850,7 @@ static void kyber_get_noise_x4_eta3_avx2(byte* rand, byte* seed)
 /* Get noise/error by calculating random bytes and sampling to a binomial
  * distribution. Values -2..2
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [out]      p     Polynomial.
  * @param  [in]       seed  Seed to use when calculating random.
  * @return  0 on success.
@@ -2858,7 +2873,7 @@ static int kyber_get_noise_eta2_avx2(KYBER_PRF_T* prf, sword16* p,
 /* Get the noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [out]      vec1  First Vector of polynomials.
  * @param  [out]      vec2  Second Vector of polynomials.
  * @param  [out]      poly  Polynomial.
@@ -2890,7 +2905,7 @@ static int kyber_get_noise_k2_avx2(KYBER_PRF_T* prf, sword16* vec1,
 }
 #endif
 
-#ifdef WOLFSSL_KYBER768
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Get the noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
@@ -2921,11 +2936,11 @@ static int kyber_get_noise_k3_avx2(sword16* vec1, sword16* vec2, sword16* poly,
 }
 #endif
 
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Get the noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [out]      vec1  First Vector of polynomials.
  * @param  [out]      vec2  Second Vector of polynomials.
  * @param  [out]      poly  Polynomial.
@@ -2981,7 +2996,7 @@ static void kyber_get_noise_x3_eta2_aarch64(byte* rand, byte* seed, byte o)
     kyber_shake256_blocksx3_seed_neon(state, seed);
 }
 
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
 /* Get the noise/error by calculating random bytes.
  *
  * @param  [out]  rand  Random number byte array.
@@ -3068,7 +3083,7 @@ static int kyber_get_noise_k2_aarch64(sword16* vec1, sword16* vec2,
 }
 #endif
 
-#ifdef WOLFSSL_KYBER768
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Get the noise/error by calculating random bytes.
  *
  * @param  [out]  rand  Random number byte array.
@@ -3122,7 +3137,7 @@ static int kyber_get_noise_k3_aarch64(sword16* vec1, sword16* vec2,
 }
 #endif
 
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Get the noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
@@ -3163,7 +3178,7 @@ static int kyber_get_noise_k4_aarch64(sword16* vec1, sword16* vec2,
 /* Get the noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [in]       kp    Number of polynomials in vector.
  * @param  [out]      vec1  First Vector of polynomials.
  * @param  [in]       eta1  Size of noise/error integers with first vector.
@@ -3208,7 +3223,7 @@ static int kyber_get_noise_c(KYBER_PRF_T* prf, int kp, sword16* vec1, int eta1,
 /* Get the noise/error by calculating random bytes and sampling to a binomial
  * distribution.
  *
- * @param  [in, out]  prf   Psuedo-random function object.
+ * @param  [in, out]  prf   Pseudo-random function object.
  * @param  [in]       kp    Number of polynomials in vector.
  * @param  [out]      vec1  First Vector of polynomials.
  * @param  [out]      vec2  Second Vector of polynomials.
@@ -3221,7 +3236,7 @@ int kyber_get_noise(KYBER_PRF_T* prf, int kp, sword16* vec1,
 {
     int ret;
 
-#ifdef WOLFSSL_KYBER512
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512)
     if (kp == KYBER512_K) {
 #if defined(WOLFSSL_ARMASM) && defined(__aarch64__)
         ret = kyber_get_noise_k2_aarch64(vec1, vec2, poly, seed);
@@ -3245,7 +3260,7 @@ int kyber_get_noise(KYBER_PRF_T* prf, int kp, sword16* vec1,
     }
     else
 #endif
-#ifdef WOLFSSL_KYBER768
+#if defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
     if (kp == KYBER768_K) {
 #if defined(WOLFSSL_ARMASM) && defined(__aarch64__)
         ret = kyber_get_noise_k3_aarch64(vec1, vec2, poly, seed);
@@ -3265,7 +3280,7 @@ int kyber_get_noise(KYBER_PRF_T* prf, int kp, sword16* vec1,
     }
     else
 #endif
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
     if (kp == KYBER1024_K) {
 #if defined(WOLFSSL_ARMASM) && defined(__aarch64__)
         ret = kyber_get_noise_k4_aarch64(vec1, vec2, poly, seed);
@@ -3475,7 +3490,8 @@ static KYBER_NOINLINE void kyber_csubq_c(sword16* p)
 
 #endif /* CONV_WITH_DIV */
 
-#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_KYBER768)
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512) || \
+    defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Compress the vector of polynomials into a byte array with 10 bits each.
  *
  * @param  [out]  b       Array of bytes.
@@ -3593,7 +3609,7 @@ void kyber_vec_compress_10(byte* r, sword16* v, unsigned int kp)
 }
 #endif
 
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Compress the vector of polynomials into a byte array with 11 bits each.
  *
  * @param  [out]  b       Array of bytes.
@@ -3713,7 +3729,8 @@ void kyber_vec_compress_11(byte* r, sword16* v)
     v[(i) * KYBER_N + 8 * (j) + (k)] = \
         (word16)((((word32)((t) & 0x7ff) * KYBER_Q) + 1024) >> 11)
 
-#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_KYBER768)
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512) || \
+    defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Decompress the byte array of packed 10 bits into vector of polynomials.
  *
  * @param  [out]  v       Vector of polynomials.
@@ -3785,7 +3802,7 @@ void kyber_vec_decompress_10(sword16* v, const unsigned char* b,
     }
 }
 #endif
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Decompress the byte array of packed 11 bits into vector of polynomials.
  *
  * @param  [out]  v       Vector of polynomials.
@@ -3948,7 +3965,8 @@ void kyber_vec_decompress_11(sword16* v, const unsigned char* b)
 
 #endif /* CONV_WITH_DIV */
 
-#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_KYBER768)
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512) || \
+    defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Compress a polynomial into byte array - on coefficients into 4 bits.
  *
  * @param  [out]  b       Array of bytes.
@@ -4020,7 +4038,7 @@ void kyber_compress_4(byte* b, sword16* p)
     }
 }
 #endif
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Compress a polynomial into byte array - on coefficients into 5 bits.
  *
  * @param  [out]  b       Array of bytes.
@@ -4117,7 +4135,8 @@ void kyber_compress_5(byte* b, sword16* p)
 #define DECOMP_5(p, i, j, t) \
     p[(i) + (j)] = (((word32)((t) & 0x1f) * KYBER_Q) + 16) >> 5
 
-#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_KYBER768)
+#if defined(WOLFSSL_KYBER512) || defined(WOLFSSL_WC_ML_KEM_512) || \
+    defined(WOLFSSL_KYBER768) || defined(WOLFSSL_WC_ML_KEM_768)
 /* Decompress the byte array of packed 4 bits into polynomial.
  *
  * @param  [out]  p       Polynomial.
@@ -4155,7 +4174,7 @@ void kyber_decompress_4(sword16* p, const unsigned char* b)
     }
 }
 #endif
-#ifdef WOLFSSL_KYBER1024
+#if defined(WOLFSSL_KYBER1024) || defined(WOLFSSL_WC_ML_KEM_1024)
 /* Decompress the byte array of packed 5 bits into polynomial.
  *
  * @param  [out]  p       Polynomial.

@@ -1397,7 +1397,7 @@ static int ProcessBufferPrivateKey(WOLFSSL_CTX* ctx, WOLFSSL* ssl,
     #ifdef OPENSSL_EXTRA
         /* Decryption password is probably wrong. */
         if (info->passwd_cb) {
-            EVPerr(0, EVP_R_BAD_DECRYPT);
+            WOLFSSL_EVPerr(0, -WOLFSSL_EVP_R_BAD_DECRYPT_E);
         }
     #endif
         WOLFSSL_ERROR(WOLFSSL_BAD_FILE);
@@ -2201,9 +2201,9 @@ static int ProcessBufferResetSuites(WOLFSSL_CTX* ctx, WOLFSSL* ssl, int type)
                 InitSuites(ssl->suites, ssl->version, ssl->buffers.keySz,
                     WOLFSSL_HAVE_RSA, SSL_HAVE_PSK(ssl), ssl->options.haveDH,
                     ssl->options.haveECDSAsig, ssl->options.haveECC, TRUE,
-                    ssl->options.haveStaticECC, ssl->options.haveFalconSig,
-                    ssl->options.haveDilithiumSig, ssl->options.useAnon, TRUE,
-                    ssl->options.side);
+                    ssl->options.haveStaticECC,
+                    ssl->options.useAnon, TRUE,
+                    TRUE, TRUE, TRUE, ssl->options.side);
             }
         }
     }
@@ -2218,8 +2218,8 @@ static int ProcessBufferResetSuites(WOLFSSL_CTX* ctx, WOLFSSL* ssl, int type)
             InitSuites(ctx->suites, ctx->method->version, ctx->privateKeySz,
                 WOLFSSL_HAVE_RSA, CTX_HAVE_PSK(ctx), ctx->haveDH,
                 ctx->haveECDSAsig, ctx->haveECC, TRUE, ctx->haveStaticECC,
-                ctx->haveFalconSig, ctx->haveDilithiumSig, CTX_USE_ANON(ctx),
-                TRUE, ctx->method->side);
+                CTX_USE_ANON(ctx),
+                TRUE, TRUE, TRUE, TRUE, ctx->method->side);
         }
     }
 
@@ -2332,7 +2332,7 @@ int ProcessBuffer(WOLFSSL_CTX* ctx, const unsigned char* buff, long sz,
     #endif
     }
     else if (ret == 0) {
-        /* Processing a cerificate. */
+        /* Processing a certificate. */
         if (userChain) {
             /* Take original buffer and add to user chain to send in TLS
              * handshake. */
@@ -2707,7 +2707,7 @@ static int wolfssl_ctx_load_path(WOLFSSL_CTX* ctx, const char* path,
             /* Load file. */
             ret = wolfssl_ctx_load_path_file(ctx, name, verify, (int)flags,
                 &failCount, &successCount);
-            /* Get next filenmae. */
+            /* Get next filename. */
             fileRet = wc_ReadDirNext(readCtx, path, &name);
         }
         /* Cleanup directory reading context. */
@@ -4146,6 +4146,77 @@ int wolfSSL_CTX_use_AltPrivateKey_Label(WOLFSSL_CTX* ctx, const char* label,
 #endif /* WOLFSSL_DUAL_ALG_CERTS */
 #endif /* WOLF_PRIVATE_KEY_ID */
 
+#if defined(WOLF_CRYPTO_CB) && !defined(NO_CERTS)
+
+static int wolfSSL_CTX_use_certificate_ex(WOLFSSL_CTX* ctx,
+    const char *label, const unsigned char *id, int idLen, int devId)
+{
+    int ret;
+    byte *certData = NULL;
+    word32 certDataLen = 0;
+    word32 labelLen = 0;
+    int certFormat = 0;
+
+    WOLFSSL_ENTER("wolfSSL_CTX_use_certificate_ex");
+
+    if (label != NULL) {
+        labelLen = (word32)XSTRLEN(label);
+    }
+
+    ret = wc_CryptoCb_GetCert(devId, label, labelLen, id, idLen,
+        &certData, &certDataLen, &certFormat, ctx->heap);
+    if (ret != 0) {
+        ret = WOLFSSL_FAILURE;
+        goto exit;
+    }
+
+    ret = ProcessBuffer(ctx, certData, certDataLen, certFormat,
+        CERT_TYPE, NULL, NULL, 0, GET_VERIFY_SETTING_CTX(ctx));
+
+exit:
+    XFREE(certData, ctx->heap, DYNAMIC_TYPE_CERT);
+    return ret;
+}
+
+/* Load the label name of a certificate into the SSL context.
+ *
+ * @param [in, out] ctx    SSL context object.
+ * @param [in]      label  Buffer holding label.
+ * @param [in]      devId  Device identifier.
+ * @return  1 on success.
+ * @return  0 on failure.
+ */
+int wolfSSL_CTX_use_certificate_label(WOLFSSL_CTX* ctx,
+    const char *label, int devId)
+{
+    if ((ctx == NULL) || (label == NULL)) {
+        return WOLFSSL_FAILURE;
+    }
+
+    return wolfSSL_CTX_use_certificate_ex(ctx, label, NULL, 0, devId);
+}
+
+/* Load the id of a certificate into SSL context.
+ *
+ * @param [in, out] ctx    SSL context object.
+ * @param [in]      id     Buffer holding id.
+ * @param [in]      idLen  Size of data in bytes.
+ * @param [in]      devId  Device identifier.
+ * @return  1 on success.
+ * @return  0 on failure.
+ */
+int wolfSSL_CTX_use_certificate_id(WOLFSSL_CTX* ctx,
+    const unsigned char *id, int idLen, int devId)
+{
+    if ((ctx == NULL) || (id == NULL) || (idLen <= 0)) {
+        return WOLFSSL_FAILURE;
+    }
+
+    return wolfSSL_CTX_use_certificate_ex(ctx, NULL, id, idLen, devId);
+}
+
+#endif /* if defined(WOLF_CRYPTO_CB) && !defined(NO_CERTS) */
+
 /* Load a certificate chain in a buffer into SSL context.
  *
  * @param [in, out] ctx     SSL context object.
@@ -4791,7 +4862,7 @@ int wolfSSL_CTX_add1_chain_cert(WOLFSSL_CTX* ctx, WOLFSSL_X509* x509)
         /* Use the certificate. */
         ret = wolfSSL_CTX_use_certificate(ctx, x509);
     }
-    /* Increate reference count as we will store it. */
+    /* Increase reference count as we will store it. */
     else if ((ret == 1) && ((ret = wolfSSL_X509_up_ref(x509)) == 1)) {
         /* Load the DER encoding. */
         ret = wolfSSL_CTX_load_verify_buffer(ctx, x509->derCert->buffer,
@@ -4946,19 +5017,19 @@ int wolfSSL_CTX_use_PrivateKey(WOLFSSL_CTX *ctx, WOLFSSL_EVP_PKEY *pkey)
     if (ret == 1) {
         switch (pkey->type) {
     #if defined(WOLFSSL_KEY_GEN) && !defined(NO_RSA)
-        case EVP_PKEY_RSA:
+        case WC_EVP_PKEY_RSA:
             WOLFSSL_MSG("populating RSA key");
             ret = PopulateRSAEvpPkeyDer(pkey);
             break;
     #endif /* (WOLFSSL_KEY_GEN || OPENSSL_EXTRA) && !NO_RSA */
     #if !defined(HAVE_SELFTEST) && (defined(WOLFSSL_KEY_GEN) || \
             defined(WOLFSSL_CERT_GEN)) && !defined(NO_DSA)
-        case EVP_PKEY_DSA:
+        case WC_EVP_PKEY_DSA:
             break;
     #endif /* !HAVE_SELFTEST && (WOLFSSL_KEY_GEN || WOLFSSL_CERT_GEN) &&
             * !NO_DSA */
     #ifdef HAVE_ECC
-        case EVP_PKEY_EC:
+        case WC_EVP_PKEY_EC:
             WOLFSSL_MSG("populating ECC key");
             ret = ECC_populate_EVP_PKEY(pkey, pkey->ecc);
             break;
@@ -4972,7 +5043,7 @@ int wolfSSL_CTX_use_PrivateKey(WOLFSSL_CTX *ctx, WOLFSSL_EVP_PKEY *pkey)
         /* ptr for WOLFSSL_EVP_PKEY struct is expected to be DER format */
         ret = wolfSSL_CTX_use_PrivateKey_buffer(ctx,
             (const unsigned char*)pkey->pkey.ptr, pkey->pkey_sz,
-            SSL_FILETYPE_ASN1);
+            WOLFSSL_FILETYPE_ASN1);
     }
 
     return ret;
@@ -5001,7 +5072,7 @@ int wolfSSL_CTX_use_certificate_ASN1(WOLFSSL_CTX *ctx, int derSz,
     if ((ctx == NULL) || (der == NULL)) {
         ret = 0;
     }
-    /* Load DER encoded cerificate into SSL context. */
+    /* Load DER encoded certificate into SSL context. */
     if ((ret == 1) && (wolfSSL_CTX_use_certificate_buffer(ctx, der, derSz,
             WOLFSSL_FILETYPE_ASN1) != 1)) {
         ret = 0;
@@ -5023,7 +5094,7 @@ int wolfSSL_CTX_use_certificate_ASN1(WOLFSSL_CTX *ctx, int derSz,
 int wolfSSL_CTX_use_RSAPrivateKey(WOLFSSL_CTX* ctx, WOLFSSL_RSA* rsa)
 {
     int ret = 1;
-    int derSize;
+    int derSize = 0;
     unsigned char* der = NULL;
     unsigned char* p;
 
@@ -5060,7 +5131,7 @@ int wolfSSL_CTX_use_RSAPrivateKey(WOLFSSL_CTX* ctx, WOLFSSL_RSA* rsa)
     }
 
     if (ret == 1) {
-        /* Load DER encoded cerificate into SSL context. */
+        /* Load DER encoded certificate into SSL context. */
         ret = wolfSSL_CTX_use_PrivateKey_buffer(ctx, der, derSize,
             SSL_FILETYPE_ASN1);
         if (ret != WOLFSSL_SUCCESS) {
@@ -5238,9 +5309,9 @@ static int wolfssl_set_tmp_dh(WOLFSSL* ssl, unsigned char* p, int pSz,
         InitSuites(ssl->suites, ssl->version, SSL_KEY_SZ(ssl),
             WOLFSSL_HAVE_RSA, SSL_HAVE_PSK(ssl), ssl->options.haveDH,
             ssl->options.haveECDSAsig, ssl->options.haveECC, TRUE,
-            ssl->options.haveStaticECC, ssl->options.haveFalconSig,
-            ssl->options.haveDilithiumSig, ssl->options.useAnon, TRUE,
-            ssl->options.side);
+            ssl->options.haveStaticECC,
+            ssl->options.useAnon, TRUE,
+            TRUE, TRUE, TRUE, ssl->options.side);
     }
 
     return ret;

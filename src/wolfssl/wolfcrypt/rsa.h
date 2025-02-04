@@ -169,8 +169,12 @@ enum {
     RSA_PSS_SALT_MAX_SZ = 62,
 
 #ifdef OPENSSL_EXTRA
-    RSA_PKCS1_PADDING_SIZE = 11,
-    RSA_PKCS1_OAEP_PADDING_SIZE = 42, /* (2 * hashlen(SHA-1)) + 2 */
+    WC_RSA_PKCS1_PADDING_SIZE = 11,
+    WC_RSA_PKCS1_OAEP_PADDING_SIZE = 42, /* (2 * hashlen(SHA-1)) + 2 */
+    #ifndef OPENSSL_COEXIST
+        #define RSA_PKCS1_PADDING_SIZE WC_RSA_PKCS1_PADDING_SIZE
+        #define RSA_PKCS1_OAEP_PADDING_SIZE WC_RSA_PKCS1_OAEP_PADDING_SIZE
+    #endif
 #endif
 #ifdef WC_RSA_PSS
     RSA_PSS_PAD_TERM = 0xBC,
@@ -436,7 +440,7 @@ WOLFSSL_API int  wc_RsaPrivateDecrypt_ex(const byte* in, word32 inLen,
 WOLFSSL_API int  wc_RsaPrivateDecryptInline_ex(byte* in, word32 inLen,
                       byte** out, RsaKey* key, int type, enum wc_HashType hash,
                       int mgf, byte* label, word32 labelSz);
-#if defined(WC_RSA_DIRECT) || defined(WC_RSA_NO_PADDING)
+#if defined(WC_RSA_DIRECT) || defined(WC_RSA_NO_PADDING) || defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
 WOLFSSL_API int wc_RsaDirect(byte* in, word32 inLen, byte* out, word32* outSz,
                    RsaKey* key, int type, WC_RNG* rng);
 #endif

@@ -69,14 +69,14 @@
  * @param [in] a  Little-endian byte array.
  * @return 64-bit number.
  */
-#define GET_U64(a)      (*(word64*)(a))
+#define GET_U64(a)      readUnalignedWord64(a)
 /**
  * Decode little-endian byte array to 32-bit number.
  *
  * @param [in] a  Little-endian byte array.
  * @return 32-bit number.
  */
-#define GET_U32(a)      (*(word32*)(a))
+#define GET_U32(a)      readUnalignedWord32(a)
 /**
  * Decode little-endian byte array to 16-bit number.
  *
@@ -90,7 +90,7 @@
  * @param [out] a  Byte array to write into.
  * @param [in]  n  Number to encode.
  */
-#define SET_U64(a, n)   ((*(word64*)(a)) = (n))
+#define SET_U64(a, n)   writeUnalignedWord64(a, n)
 #else
 /**
  * Decode little-endian byte array to 64-bit number.
@@ -112,7 +112,7 @@
  * @param [in] a  Little-endian byte array.
  * @return 32-bit number.
  */
-#define GET_U32(a)      (((word64)((a)[3]) << 24) |     \
+#define GET_U32(a)      (((word32)((a)[3]) << 24) |     \
                          ((word32)((a)[2]) << 16) |     \
                          ((word32)((a)[1]) <<  8) |     \
                          ((word32)((a)[0])      ))
@@ -256,14 +256,14 @@ int wc_SipHashUpdate(SipHash* sipHash, const unsigned char* in, word32 inSz)
     if ((ret == 0) && (inSz > 0)) {
         /* Add to cache if already started. */
         if (sipHash->cacheCnt > 0) {
-            byte len = SIPHASH_BLOCK_SIZE - sipHash->cacheCnt;
+            byte len = (byte)(SIPHASH_BLOCK_SIZE - sipHash->cacheCnt);
             if (len > inSz) {
                 len = (byte)inSz;
             }
             XMEMCPY(sipHash->cache + sipHash->cacheCnt, in, len);
             in += len;
             inSz -= len;
-            sipHash->cacheCnt += len;
+            sipHash->cacheCnt = (byte)(sipHash->cacheCnt + len);
 
             if (sipHash->cacheCnt == SIPHASH_BLOCK_SIZE) {
                 /* Compress the block from the cache. */
@@ -331,7 +331,7 @@ int wc_SipHashFinal(SipHash* sipHash, unsigned char* out, unsigned char outSz)
 
     if (ret == 0) {
         /* Put in remaining cached message bytes. */
-        XMEMSET(sipHash->cache + sipHash->cacheCnt, 0, 7 - sipHash->cacheCnt);
+        XMEMSET(sipHash->cache + sipHash->cacheCnt, 0, 7U - sipHash->cacheCnt);
         sipHash->cache[7] = (byte)(sipHash->inCnt + sipHash->cacheCnt);
 
         SipHashCompress(sipHash, sipHash->cache);
