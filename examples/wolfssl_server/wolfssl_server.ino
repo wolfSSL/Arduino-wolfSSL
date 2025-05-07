@@ -1,6 +1,6 @@
 /* wolfssl_server.ino
  *
- * Copyright (C) 2006-2024 wolfSSL Inc.
+ * Copyright (C) 2006-2025 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -37,7 +37,7 @@ Tested with:
  */
 
 /* If you have a private include, define it here, otherwise edit WiFi params */
-#define MY_PRIVATE_CONFIG "/workspace/my_private_config.h"
+/* #define MY_PRIVATE_CONFIG "/workspace/my_private_config.h" */
 
 /* set REPEAT_CONNECTION to a non-zero value to continually run the example. */
 #define REPEAT_CONNECTION 1
@@ -68,12 +68,12 @@ Tested with:
     /* the /workspace directory may contain a private config
      * excluded from GitHub with items such as WiFi passwords */
     #include MY_PRIVATE_CONFIG
-    static const char* ssid PROGMEM = MY_ARDUINO_WIFI_SSID;
-    static const char* password PROGMEM = MY_ARDUINO_WIFI_PASSWORD;
+    static const char ssid[]     PROGMEM  = MY_ARDUINO_WIFI_SSID;
+    static const char password[] PROGMEM  = MY_ARDUINO_WIFI_PASSWORD;
 #else
     /* when using WiFi capable boards: */
-    static const char* ssid PROGMEM  = "your_SSID";
-    static const char* password PROGMEM = "your_PASSWORD";
+    static const char ssid[]     PROGMEM  = "your_SSID";
+    static const char password[] PROGMEM  = "your_PASSWORD";
 #endif
 
 #define BROADCAST_ADDRESS "255.255.255.255"
@@ -166,6 +166,8 @@ Tested with:
 #elif defined(OTHER_BOARD)
 */
 #else
+    /* assume all other boards using WiFi library. Edit as needed: */
+    #include <WiFi.h>
     #define USING_WIFI
     WiFiClient client;
     WiFiServer server(WOLFSSL_PORT);
