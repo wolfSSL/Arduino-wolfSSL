@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -3554,6 +3554,13 @@ int SetKeysSide(WOLFSSL* ssl, enum encrypt_side side)
     ret = PROTOCOLCB_UNAVAILABLE;
     if (ssl->ctx->EncryptKeysCb) {
         void* ctx = wolfSSL_GetEncryptKeysCtx(ssl);
+        #if defined(WOLFSSL_RENESAS_FSPSM_TLS)
+            FSPSM_ST* cbInfo = (FSPSM_ST*)ctx;
+            cbInfo->side = side;
+        #elif defined(WOLFSSL_RENESAS_TSIP_TLS)
+            TsipUserCtx* cbInfo = (TsipUserCtx*)ctx;
+            cbInfo->key_side = side;
+        #endif
         ret = ssl->ctx->EncryptKeysCb(ssl, ctx);
     }
     if (!ssl->ctx->EncryptKeysCb ||

@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -30,6 +30,11 @@
 #if defined(WOLFSSL_ESPIDF) /* Entire file is only for Espressif EDP-IDF */
 #include "sdkconfig.h" /* programmatically generated from sdkconfig */
 #include <wolfssl/wolfcrypt/port/Espressif/esp32-crypt.h>
+
+#if HAVE_LIBWOLFSSL_OUTPUT_HEADER
+    /* see wolfssl component CMakeLists.txt that may have generated this: */
+    #include "libwolfssl_output.h"
+#endif
 
 /* Espressif */
 #include <esp_log.h>
@@ -645,6 +650,16 @@ int ShowExtendedSystemInfo(void)
 #if defined(LIBWOLFSSL_VERSION_HEX)
     WOLFSSL_VERSION_PRINTF("LIBWOLFSSL_VERSION_HEX = %x",
                             LIBWOLFSSL_VERSION_HEX);
+#endif
+
+#if defined(LIBWOLFSSL_CMAKE_OUTPUT)
+    /* For some environments such as PlatformIO that may hide CMake output,
+     * we can have important messages propagated to the app:                 */
+    ESP_LOGI(TAG, "----------------------------------------------------------");
+    ESP_LOGI(TAG, "LIBWOLFSSL_CMAKE_OUTPUT:%s", LIBWOLFSSL_CMAKE_OUTPUT);
+    ESP_LOGI(TAG, "----------------------------------------------------------");
+#else
+    ESP_LOGW(TAG, "LIBWOLFSSL_CMAKE_OUTPUT: No cmake messages detected");
 #endif
 
     /* some interesting settings are target specific (ESP32, -C3, -S3, etc */

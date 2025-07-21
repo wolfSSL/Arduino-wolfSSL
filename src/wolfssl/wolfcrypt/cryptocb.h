@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -176,6 +176,7 @@ typedef struct wc_CryptoInfo {
             } rsa_get_size;
         #endif
         #ifdef HAVE_ECC
+            #ifdef HAVE_ECC_DHE
             struct {
                 WC_RNG*  rng;
                 int      size;
@@ -188,6 +189,8 @@ typedef struct wc_CryptoInfo {
                 byte*    out;
                 word32*  outlen;
             } ecdh;
+            #endif
+            #ifdef HAVE_ECC_SIGN
             struct {
                 const byte* in;
                 word32      inlen;
@@ -196,6 +199,8 @@ typedef struct wc_CryptoInfo {
                 WC_RNG*     rng;
                 ecc_key*    key;
             } eccsign;
+            #endif
+            #ifdef HAVE_ECC_VERIFY
             struct {
                 const byte* sig;
                 word32      siglen;
@@ -204,12 +209,15 @@ typedef struct wc_CryptoInfo {
                 int*        res;
                 ecc_key*    key;
             } eccverify;
+            #endif
+            #ifdef HAVE_ECC_CHECK_KEY
             struct {
                 ecc_key*    key;
                 const byte* pubKey;
                 word32      pubKeySz;
             } ecc_check;
-        #endif
+            #endif
+        #endif /* HAVE_ECC */
         #ifdef HAVE_CURVE25519
             struct {
                 WC_RNG*  rng;
@@ -466,7 +474,7 @@ typedef struct wc_CryptoInfo {
 } wc_CryptoInfo;
 
 
-typedef int (*CryptoDevCallbackFunc)(int devId, wc_CryptoInfo* info, void* ctx);
+typedef int (*CryptoDevCallbackFunc)(int devId, struct wc_CryptoInfo* info, void* ctx);
 
 WOLFSSL_LOCAL void wc_CryptoCb_Init(void);
 WOLFSSL_LOCAL void wc_CryptoCb_Cleanup(void);

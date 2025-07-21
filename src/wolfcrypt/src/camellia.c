@@ -33,7 +33,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -1022,7 +1022,7 @@ static int camellia_setup256(const unsigned char *key, u32 *subkey)
 static int camellia_setup192(const unsigned char *key, u32 *subkey)
 {
     unsigned char kk[32];
-    u32 krll, krlr, krrl,krrr;
+    u32 krll = 0, krlr = 0, krrl = 0, krrr = 0;
 
     XMEMCPY(kk, key, 24);
     XMEMCPY((unsigned char *)&krll, key+16,4);

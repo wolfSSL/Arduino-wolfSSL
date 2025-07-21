@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -136,6 +136,15 @@
 #else
     #define WC_INLINE WC_MAYBE_UNUSED
 #endif
+#endif
+
+#ifndef WC_OMIT_FRAME_POINTER
+    #if defined(__GNUC__)
+        #define WC_OMIT_FRAME_POINTER  \
+            __attribute__((optimize("-fomit-frame-pointer")))
+    #else
+        #define WC_OMIT_FRAME_POINTER
+    #endif
 #endif
 
 /* THREADING/MUTEX SECTION */
@@ -268,6 +277,9 @@
         #if !defined(CONFIG_PTHREAD_IPC) && !defined(CONFIG_POSIX_THREADS)
             #error "Threading needs CONFIG_PTHREAD_IPC / CONFIG_POSIX_THREADS"
         #endif
+    #ifdef max
+    #undef max
+    #endif
     #if KERNEL_VERSION_NUMBER >= 0x30100
         #include <zephyr/kernel.h>
         #include <zephyr/posix/posix_types.h>
@@ -277,6 +289,7 @@
         #include <posix/posix_types.h>
         #include <posix/pthread.h>
     #endif
+    #define max MAX
     #endif
 #elif defined(WOLFSSL_TELIT_M2MB)
 
@@ -1520,7 +1533,8 @@ WOLFSSL_ABI WOLFSSL_API int wolfCrypt_Cleanup(void);
 #ifndef WOLFSSL_NO_FENCE
     #ifdef XFENCE
         /* use user-supplied XFENCE definition. */
-    #elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+    #elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && \
+          !defined(__STDC_NO_ATOMICS__)
         #include <stdatomic.h>
         #define XFENCE() atomic_thread_fence(memory_order_seq_cst)
     #elif defined(__GNUC__) && (__GNUC__ == 4) && \
@@ -1532,8 +1546,24 @@ WOLFSSL_ABI WOLFSSL_API int wolfCrypt_Cleanup(void);
         #define XFENCE() WC_DO_NOTHING
     #elif defined (__i386__) || defined(__x86_64__)
         #define XFENCE() XASM_VOLATILE("lfence")
-    #elif (defined (__arm__) && (__ARM_ARCH > 6)) || defined(__aarch64__)
+    #elif defined (__arm__) && (__ARM_ARCH > 6)
         #define XFENCE() XASM_VOLATILE("isb")
+    #elif defined(__aarch64__)
+        /* Change ".inst 0xd50330ff" to "sb" when compilers support it. */
+        #ifdef WOLFSSL_ARMASM_BARRIER_SB
+            #define XFENCE() XASM_VOLATILE(".inst 0xd50330ff")
+        #elif defined(WOLFSSL_ARMASM_BARRIER_DETECT)
+            extern int aarch64_use_sb;
+            #define XFENCE()                                \
+                do {                                        \
+                    if (aarch64_use_sb)                     \
+                        XASM_VOLATILE(".inst 0xd50330ff");  \
+                    else                                    \
+                        XASM_VOLATILE("isb");               \
+                } while (0)
+        #else
+            #define XFENCE() XASM_VOLATILE("isb")
+        #endif
     #elif defined(__riscv)
         #define XFENCE() XASM_VOLATILE("fence")
     #elif defined(__PPC__) || defined(__POWERPC__)

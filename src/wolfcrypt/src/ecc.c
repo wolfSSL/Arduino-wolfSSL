@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -2054,7 +2054,7 @@ static int _ecc_projective_add_point(ecc_point* P, ecc_point* Q, ecc_point* R,
    }
    if (err == MP_OKAY) {
       if ( (mp_cmp(P->x, Q->x) == MP_EQ) &&
-           (get_digit_count(Q->z) && mp_cmp(P->z, Q->z) == MP_EQ) &&
+           (mp_get_digit_count(Q->z) && mp_cmp(P->z, Q->z) == MP_EQ) &&
            (mp_cmp(P->y, Q->y) == MP_EQ || mp_cmp(P->y, t1) == MP_EQ)) {
           mp_clear(t1);
           mp_clear(t2);
@@ -2990,7 +2990,7 @@ static int ecc_mulmod(const mp_int* k, ecc_point* tG, ecc_point* R,
        mode   = 0;
        bitcnt = 1;
        buf    = 0;
-       digidx = get_digit_count(k) - 1;
+       digidx = mp_get_digit_count(k) - 1;
        bitcpy = bitbuf = 0;
        first  = 1;
 
@@ -3001,7 +3001,7 @@ static int ecc_mulmod(const mp_int* k, ecc_point* tG, ecc_point* R,
                if (digidx == -1) {
                    break;
                }
-               buf    = get_digit(k, digidx);
+               buf    = mp_get_digit(k, digidx);
                bitcnt = (int) DIGIT_BIT;
                --digidx;
            }
@@ -3250,10 +3250,8 @@ static int ecc_mulmod(const mp_int* k, ecc_point* P, ecc_point* Q,
 #else
         /* Swap R[0] and R[1] if other index is needed. */
         swap ^= (int)b;
-        if (err == MP_OKAY) {
-            err = mp_cond_swap_ct_ex(R[0]->x, R[1]->x, (int)modulus->used, swap,
-                tmp);
-        }
+        err = mp_cond_swap_ct_ex(R[0]->x, R[1]->x, (int)modulus->used, swap,
+            tmp);
         if (err == MP_OKAY) {
             err = mp_cond_swap_ct_ex(R[0]->y, R[1]->y, (int)modulus->used, swap,
                 tmp);
@@ -3917,7 +3915,7 @@ int wc_ecc_mulmod_ex2(const mp_int* k, ecc_point* G, ecc_point* R, mp_int* a,
 #endif
    int           i, err;
 #ifdef WOLFSSL_SMALL_STACK_CACHE
-   ecc_key       key;
+   ecc_key       *key = NULL;
 #endif
    mp_digit      mp;
 
@@ -3944,10 +3942,13 @@ int wc_ecc_mulmod_ex2(const mp_int* k, ecc_point* G, ecc_point* R, mp_int* a,
    XMEMSET(M, 0, sizeof(M));
 
 #ifdef WOLFSSL_SMALL_STACK_CACHE
-   err = ecc_key_tmp_init(&key, heap);
+   key = (ecc_key *)XMALLOC(sizeof(*key), heap, DYNAMIC_TYPE_ECC);
+   if (key == NULL)
+       return MEMORY_E;
+   err = ecc_key_tmp_init(key, heap);
    if (err != MP_OKAY)
       goto exit;
-   R->key = &key;
+   R->key = key;
 #endif /* WOLFSSL_SMALL_STACK_CACHE */
 
    /* alloc ram for window temps */
@@ -3960,7 +3961,7 @@ int wc_ecc_mulmod_ex2(const mp_int* k, ecc_point* G, ecc_point* R, mp_int* a,
          goto exit;
       }
 #ifdef WOLFSSL_SMALL_STACK_CACHE
-      M[i]->key = &key;
+      M[i]->key = key;
 #endif
   }
 
@@ -4002,7 +4003,8 @@ exit:
    }
 #ifdef WOLFSSL_SMALL_STACK_CACHE
    R->key = NULL;
-   ecc_key_tmp_final(&key, heap);
+   ecc_key_tmp_final(key, heap);
+   XFREE(key, heap, DYNAMIC_TYPE_ECC);
 #endif /* WOLFSSL_SMALL_STACK_CACHE */
 
    return err;
@@ -5393,6 +5395,7 @@ static WC_INLINE void wc_ecc_reset(ecc_key* key)
     key->state = ECC_STATE_NONE;
 }
 
+
 /* create the public ECC key from a private key
  *
  * key     an initialized private key to generate public part from
@@ -5678,7 +5681,7 @@ static int _ecc_make_key_ex(WC_RNG* rng, int keysize, ecc_key* key,
     #endif
     key->flags = (byte)flags;
 
-#ifdef WOLF_CRYPTO_CB
+#if defined(WOLF_CRYPTO_CB) && defined(HAVE_ECC_DHE)
     #ifndef WOLF_CRYPTO_CB_FIND
     if (key->devId != INVALID_DEVID)
     #endif
@@ -7645,8 +7648,12 @@ int wc_ecc_gen_deterministic_k(const byte* hash, word32 hashSz,
     /* 3.2 c. Set K = 0x00 0x00 ... */
     XMEMSET(K, 0x00, KSz);
 
-    mp_init(z1); /* always init z1 and free z1 */
-    ret = mp_to_unsigned_bin_len(priv, x, (int)qLen);
+    if (ret == 0) {
+        ret = mp_init(z1); /* always init z1 and free z1 */
+    }
+    if (ret == 0) {
+        ret = mp_to_unsigned_bin_len(priv, x, (int)qLen);
+    }
     if (ret == 0) {
     #ifdef WOLFSSL_CHECK_MEM_ZERO
         wc_MemZero_Add("wc_ecc_gen_deterministic_k x", x, qLen);
@@ -7690,7 +7697,7 @@ int wc_ecc_gen_deterministic_k(const byte* hash, word32 hashSz,
     #endif
         {
             /* use original hash and keep leading 0's */
-            mp_to_unsigned_bin_len(z1, h1, (int)h1len);
+            ret = mp_to_unsigned_bin_len(z1, h1, (int)h1len);
         }
     }
     mp_free(z1);
@@ -10257,7 +10264,7 @@ static int ecc_check_privkey_gen(ecc_key* key, mp_int* a, mp_int* prime)
         * (!WOLFSSL_SP_MATH && WOLFSSL_VALIDATE_ECC_IMPORT) */
 
 #if (FIPS_VERSION_GE(5,0) || defined(WOLFSSL_VALIDATE_ECC_KEYGEN)) && \
-    !defined(WOLFSSL_KCAPI_ECC)
+    !defined(WOLFSSL_KCAPI_ECC) && defined(HAVE_ECC_DHE)
 
 /* check privkey generator helper, creates prime needed */
 static int ecc_check_privkey_gen_helper(ecc_key* key)
@@ -10372,7 +10379,7 @@ static int _ecc_pairwise_consistency_test(ecc_key* key, WC_RNG* rng)
     return err;
 }
 #endif /* (FIPS v5 or later || WOLFSSL_VALIDATE_ECC_KEYGEN) && \
-          !WOLFSSL_KCAPI_ECC */
+          !WOLFSSL_KCAPI_ECC && HAVE_ECC_DHE */
 
 #ifndef WOLFSSL_SP_MATH
 /* validate order * pubkey = point at infinity, 0 on success */

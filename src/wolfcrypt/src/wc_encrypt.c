@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -512,8 +512,10 @@ int wc_CryptKey(const char* password, int passwordSz, byte* salt,
         switch (version) {
     #ifndef NO_HMAC
             case PKCS5v2:
+                PRIVATE_KEY_UNLOCK();
                 ret = wc_PBKDF2(key, (byte*)password, passwordSz,
                                 salt, saltSz, iterations, (int)derivedLen, typeH);
+                PRIVATE_KEY_LOCK();
                 break;
     #endif
     #ifndef NO_SHA
@@ -636,10 +638,14 @@ int wc_CryptKey(const char* password, int passwordSz, byte* salt,
                 break;
             }
     #endif
-    #if !defined(NO_AES) && defined(HAVE_AES_CBC)
+    #if !defined(NO_AES) && defined(HAVE_AES_CBC) && \
+        (defined(WOLFSSL_AES_256) || defined(WOLFSSL_AES_128))
         #ifdef WOLFSSL_AES_256
             case PBE_AES256_CBC:
+        #endif /* WOLFSSL_AES_256 */
+        #ifdef WOLFSSL_AES_128
             case PBE_AES128_CBC:
+        #endif /* WOLFSSL_AES_128 */
             {
                 int free_aes;
 
@@ -686,8 +692,7 @@ int wc_CryptKey(const char* password, int passwordSz, byte* salt,
             #endif
                 break;
             }
-        #endif /* WOLFSSL_AES_256 */
-    #endif /* !NO_AES && HAVE_AES_CBC */
+    #endif /* !NO_AES && HAVE_AES_CBC && (WOLFSSL_AES_256 || WOLFSSL_AES_128) */
     #ifdef WC_RC2
             case PBE_SHA1_40RC2_CBC:
             {

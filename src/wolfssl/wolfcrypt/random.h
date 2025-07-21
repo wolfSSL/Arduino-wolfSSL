@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -133,6 +133,12 @@
     #else
         typedef unsigned long ProviderHandle;
     #endif
+
+    #ifdef WIN_REUSE_CRYPT_HANDLE
+        /* called from wolfCrypt_Init() and wolfCrypt_Cleanup() */
+        WOLFSSL_LOCAL int  wc_WinCryptHandleInit(void);
+        WOLFSSL_LOCAL void wc_WinCryptHandleCleanup(void);
+    #endif
 #endif
 
 #ifndef WC_RNG_TYPE_DEFINED /* guard on redeclaration */
@@ -158,7 +164,11 @@ struct OS_Seed {
 
 #ifdef HAVE_HASHDRBG
 struct DRBG_internal {
+    #ifdef WORD64_AVAILABLE
+    word64 reseedCtr;
+    #else
     word32 reseedCtr;
+    #endif
     byte V[DRBG_SEED_LEN];
     byte C[DRBG_SEED_LEN];
     void* heap;
@@ -182,6 +192,9 @@ struct WC_RNG {
     struct DRBG_internal drbg_data;
 #endif
     byte status;
+#endif
+#if defined(HAVE_GETPID) && !defined(WOLFSSL_NO_GETPID)
+    pid_t pid;
 #endif
 #ifdef WOLFSSL_ASYNC_CRYPT
     WC_ASYNC_DEV asyncDev;

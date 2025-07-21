@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -64,6 +64,12 @@
  */
 
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
+
+#ifdef WC_MLKEM_NO_ASM
+    #undef USE_INTEL_SPEEDUP
+    #undef WOLFSSL_ARMASM
+    #undef WOLFSSL_RISCV_ASM
+#endif
 
 #include <wolfssl/wolfcrypt/mlkem.h>
 #include <wolfssl/wolfcrypt/wc_mlkem.h>
@@ -668,8 +674,8 @@ static int mlkemkey_encapsulate(MlKemKey* key, const byte* m, byte* r, byte* c)
     sword16 y[3 * WC_ML_KEM_MAX_K * MLKEM_N];
 #endif
 #endif
-    sword16* u;
-    sword16* v;
+    sword16* u = 0;
+    sword16* v = 0;
 
     /* Establish parameters based on key type. */
     switch (key->type) {
@@ -1144,7 +1150,8 @@ static MLKEM_NOINLINE int mlkemkey_decapsulate(MlKemKey* key, byte* m,
     sword16* w;
     unsigned int k = 0;
     unsigned int compVecSz;
-#if !defined(USE_INTEL_SPEEDUP) && !defined(WOLFSSL_NO_MALLOC)
+#if defined(WOLFSSL_SMALL_STACK) || \
+    (!defined(USE_INTEL_SPEEDUP) && !defined(WOLFSSL_NO_MALLOC))
     sword16* u = NULL;
 #else
     sword16 u[(WC_ML_KEM_MAX_K + 1) * MLKEM_N];
@@ -1198,7 +1205,8 @@ static MLKEM_NOINLINE int mlkemkey_decapsulate(MlKemKey* key, byte* m,
         break;
     }
 
-#if !defined(USE_INTEL_SPEEDUP) && !defined(WOLFSSL_NO_MALLOC)
+#if defined(WOLFSSL_SMALL_STACK) || \
+    (!defined(USE_INTEL_SPEEDUP) && !defined(WOLFSSL_NO_MALLOC))
     if (ret == 0) {
         /* Allocate dynamic memory for a vector and a polynomial. */
         u = (sword16*)XMALLOC((k + 1) * MLKEM_N * sizeof(sword16), key->heap,
@@ -1254,7 +1262,8 @@ static MLKEM_NOINLINE int mlkemkey_decapsulate(MlKemKey* key, byte* m,
         /* Step 8: return m */
     }
 
-#if !defined(USE_INTEL_SPEEDUP) && !defined(WOLFSSL_NO_MALLOC)
+#if defined(WOLFSSL_SMALL_STACK) || \
+    (!defined(USE_INTEL_SPEEDUP) && !defined(WOLFSSL_NO_MALLOC))
     /* Dispose of dynamically memory allocated in function. */
     XFREE(u, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
 #endif

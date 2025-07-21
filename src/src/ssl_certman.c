@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -1525,7 +1525,7 @@ int CM_MemRestoreCertCache(WOLFSSL_CERT_MANAGER* cm, const void* mem, int sz)
     WOLFSSL_ENTER("CM_MemRestoreCertCache");
 
     /* Check memory available is bigger than cache header. */
-    if (current > end) {
+    if ((sz < (int)sizeof(CertCacheHeader)) || (current > end)) {
         WOLFSSL_MSG("Cert Cache Memory buffer too small");
         ret = BUFFER_E;
     }

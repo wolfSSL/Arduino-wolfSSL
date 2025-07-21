@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -535,7 +535,7 @@ static int Pkcs11Slot_FindByTokenName(Pkcs11Dev* dev,
     CK_RV         rv;
     CK_ULONG      slotCnt = 0;
     CK_TOKEN_INFO tinfo;
-    int           index = -1;
+    int           idx = -1;
     CK_SLOT_ID*   slot = NULL;
 
     rv = dev->func->C_GetSlotList(CK_TRUE, NULL, &slotCnt);
@@ -547,12 +547,12 @@ static int Pkcs11Slot_FindByTokenName(Pkcs11Dev* dev,
         rv = dev->func->C_GetSlotList(CK_TRUE, slot, &slotCnt);
         if (rv != CKR_OK)
             goto out;
-        for (index = 0; index < (int)slotCnt; index++) {
-            rv = dev->func->C_GetTokenInfo(slot[index], &tinfo);
+        for (idx = 0; idx < (int)slotCnt; idx++) {
+            rv = dev->func->C_GetTokenInfo(slot[idx], &tinfo);
             PKCS11_RV("C_GetTokenInfo", rv);
             if (rv == CKR_OK &&
                 XMEMCMP(tinfo.label, tokenName, tokenNameSz) == 0) {
-                ret =  (int)slot[index];
+                ret =  (int)slot[idx];
                 break;
             }
         }

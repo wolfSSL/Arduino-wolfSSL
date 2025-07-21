@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -2551,7 +2551,7 @@ static int RsaFunctionPrivate(mp_int* tmp, RsaKey* key, WC_RNG* rng)
 
     if (ret == 0) {
         /* blind */
-        ret = mp_rand(rnd, get_digit_count(&key->n), rng);
+        ret = mp_rand(rnd, mp_get_digit_count(&key->n), rng);
     }
     if (ret == 0) {
         /* rndi = 1/rnd mod n */
@@ -2924,7 +2924,8 @@ static int wc_RsaFunctionAsync(const byte* in, word32 inLen, byte* out,
 }
 #endif /* WOLFSSL_ASYNC_CRYPT && WC_ASYNC_ENABLE_RSA */
 
-#if defined(WC_RSA_DIRECT) || defined(WC_RSA_NO_PADDING) || defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
+#if defined(WC_RSA_DIRECT) || defined(WC_RSA_NO_PADDING) || \
+    defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL)
 /* Performs direct RSA computation without padding. The input and output must
  * match the key size (ex: 2048-bits = 256 bytes). Returns the size of the
  * output on success or negative value on failure. */
@@ -3010,7 +3011,8 @@ int wc_RsaDirect(byte* in, word32 inLen, byte* out, word32* outSz,
 
     return ret;
 }
-#endif /* WC_RSA_DIRECT || WC_RSA_NO_PADDING || OPENSSL_EXTRA || OPENSSL_EXTRA_X509_SMALL */
+#endif /* WC_RSA_DIRECT || WC_RSA_NO_PADDING || OPENSSL_EXTRA || \
+        * OPENSSL_EXTRA_X509_SMALL */
 
 #if defined(WOLFSSL_CRYPTOCELL)
 static int cc310_RsaPublicEncrypt(const byte* in, word32 inLen, byte* out,
@@ -3761,6 +3763,9 @@ int wc_RsaPrivateDecryptInline(byte* in, word32 inLen, byte** out, RsaKey* key)
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -3782,6 +3787,9 @@ int wc_RsaPrivateDecryptInline_ex(byte* in, word32 inLen, byte** out,
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -3802,6 +3810,9 @@ int wc_RsaPrivateDecrypt(const byte* in, word32 inLen, byte* out,
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -3823,6 +3834,9 @@ int wc_RsaPrivateDecrypt_ex(const byte* in, word32 inLen, byte* out,
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -3843,6 +3857,9 @@ int wc_RsaSSL_VerifyInline(byte* in, word32 inLen, byte** out, RsaKey* key)
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -3856,7 +3873,7 @@ int wc_RsaSSL_VerifyInline(byte* in, word32 inLen, byte** out, RsaKey* key)
 }
 #endif
 
-#ifndef WOLFSSL_RSA_VERIFY_ONLY
+#ifndef WOLFSSL_RSA_VERIFY_INLINE
 int wc_RsaSSL_Verify(const byte* in, word32 inLen, byte* out, word32 outLen,
                                                                  RsaKey* key)
 {
@@ -3951,6 +3968,9 @@ int wc_RsaPSS_VerifyInline_ex(byte* in, word32 inLen, byte** out,
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -4006,6 +4026,9 @@ int wc_RsaPSS_Verify_ex(byte* in, word32 inLen, byte* out, word32 outLen,
     WC_RNG* rng;
     int ret;
 #ifdef WC_RSA_BLINDING
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
     rng = key->rng;
 #else
     rng = NULL;
@@ -4192,6 +4215,9 @@ int wc_RsaPSS_VerifyCheckInline(byte* in, word32 inLen, byte** out,
 
     saltLen = hLen;
     #ifdef WOLFSSL_SHA512
+        if (key == NULL) {
+            return BAD_FUNC_ARG;
+        }
         /* See FIPS 186-4 section 5.5 item (e). */
         bits = mp_count_bits(&key->n);
         if (bits == 1024 && hLen == WC_SHA512_DIGEST_SIZE)
@@ -4238,6 +4264,9 @@ int wc_RsaPSS_VerifyCheck(byte* in, word32 inLen, byte* out, word32 outLen,
 
     saltLen = hLen;
     #ifdef WOLFSSL_SHA512
+        if (key == NULL) {
+            return BAD_FUNC_ARG;
+        }
         /* See FIPS 186-4 section 5.5 item (e). */
         bits = mp_count_bits(&key->n);
         if (bits == 1024 && hLen == WC_SHA512_DIGEST_SIZE)
@@ -5063,7 +5092,7 @@ int wc_MakeRsaKey(RsaKey* key, int size, long e, WC_RNG* rng)
     /* Blind the inverse operation with a value that is invertable */
     if (err == MP_OKAY) {
         do {
-            err = mp_rand(&key->p, get_digit_count(tmp3), rng);
+            err = mp_rand(&key->p, mp_get_digit_count(tmp3), rng);
             if (err == MP_OKAY)
                 err = mp_set_bit(&key->p, 0);
             if (err == MP_OKAY)
