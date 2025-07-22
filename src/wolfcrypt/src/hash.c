@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -36,27 +36,6 @@
     #include <wolfcrypt/src/misc.c>
 #endif
 
-
-#ifdef NO_ASN
-enum Hash_Sum  {
-    MD2h      = 646,
-    MD5h      = 649,
-    SHAh      =  88,
-    SHA224h   = 417,
-    SHA256h   = 414,
-    SHA384h   = 415,
-    SHA512h   = 416,
-    SHA512_224h = 418,
-    SHA512_256h = 419,
-    SHA3_224h = 420,
-    SHA3_256h = 421,
-    SHA3_384h = 422,
-    SHA3_512h = 423,
-    SHAKE128h = 424,
-    SHAKE256h = 425,
-    SM3h      = 640     /* 0x2A,0x81,0x1C,0xCF,0x55,0x01,0x83,0x11 */
-};
-#endif /* !NO_ASN */
 
 #if !defined(NO_PWDBASED) || !defined(NO_ASN)
 /* function converts int hash type to enum */
@@ -1498,13 +1477,13 @@ int wc_HashGetFlags(wc_HashAlg* hash, enum wc_HashType type, word32* flags)
         void* heap, int devId)
     {
         int ret = 0;
-    #ifdef WOLFSSL_SMALL_STACK
+    #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
         wc_Sha256* sha256;
     #else
         wc_Sha256 sha256[1];
     #endif
 
-    #ifdef WOLFSSL_SMALL_STACK
+    #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
         sha256 = (wc_Sha256*)XMALLOC(sizeof(wc_Sha256), NULL,
             DYNAMIC_TYPE_TMP_BUFFER);
         if (sha256 == NULL)
@@ -1525,7 +1504,7 @@ int wc_HashGetFlags(wc_HashAlg* hash, enum wc_HashType type, word32* flags)
         }
 
 
-    #ifdef WOLFSSL_SMALL_STACK
+    #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
         XFREE(sha256, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     #endif
 

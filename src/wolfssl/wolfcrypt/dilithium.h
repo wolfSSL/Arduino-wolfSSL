@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -144,9 +144,9 @@
 #define DILITHIUM_LEVEL5_PUB_KEY_DER_SIZE 2614
 #define DILITHIUM_LEVEL5_PRV_KEY_DER_SIZE 4924
 #define DILITHIUM_LEVEL5_BOTH_KEY_DER_SIZE 7520
-/* PEM size with the header "-----BEGIN PRIVATE KEY-----" and
- * the footer "-----END PRIVATE KEY-----" */
-#define DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE 10239
+/* PEM size with the header "-----BEGIN ML_DSA_LEVEL5 PRIVATE KEY-----" and
+ * the footer "-----END ML_DSA_LEVEL5 PRIVATE KEY-----" */
+#define DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE 10267
 
 #define ML_DSA_LEVEL2_KEY_SIZE          2560
 #define ML_DSA_LEVEL2_SIG_SIZE          2420
@@ -183,8 +183,8 @@
 #define ML_DSA_LEVEL5_PUB_KEY_DER_SIZE DILITHIUM_LEVEL5_PUB_KEY_DER_SIZE
 #define ML_DSA_LEVEL5_PRV_KEY_DER_SIZE DILITHIUM_LEVEL5_PRV_KEY_DER_SIZE
 #define ML_DSA_LEVEL5_BOTH_KEY_DER_SIZE DILITHIUM_LEVEL5_BOTH_KEY_DER_SIZE
-/* PEM size with the header "-----BEGIN PRIVATE KEY-----" and
- * the footer "-----END PRIVATE KEY-----" */
+/* PEM size with the header "-----BEGIN ML_DSA_LEVEL5 PRIVATE KEY-----" and
+ * the footer "-----END ML_DSA_LEVEL5 PRIVATE KEY-----" */
 #define ML_DSA_LEVEL5_BOTH_KEY_PEM_SIZE DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE
 
 
@@ -574,9 +574,9 @@
 #define DILITHIUM_LEVEL5_PUB_KEY_DER_SIZE 2614
 #define DILITHIUM_LEVEL5_PRV_KEY_DER_SIZE 4924
 #define DILITHIUM_LEVEL5_BOTH_KEY_DER_SIZE 7520
-/* PEM size with the header "-----BEGIN PRIVATE KEY-----" and
- * the footer "-----END PRIVATE KEY-----" */
-#define DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE 10239
+/* PEM size with the header "-----BEGIN ML_DSA_LEVEL5 PRIVATE KEY-----" and
+ * the footer "-----END ML_DSA_LEVEL5 PRIVATE KEY-----" */
+#define DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE 10267
 
 #define ML_DSA_LEVEL2_KEY_SIZE        OQS_SIG_ml_dsa_44_ipd_length_secret_key
 #define ML_DSA_LEVEL2_SIG_SIZE        OQS_SIG_ml_dsa_44_ipd_length_signature
@@ -613,8 +613,8 @@
 #define ML_DSA_LEVEL5_PUB_KEY_DER_SIZE DILITHIUM_LEVEL5_PUB_KEY_DER_SIZE
 #define ML_DSA_LEVEL5_PRV_KEY_DER_SIZE DILITHIUM_LEVEL5_PRV_KEY_DER_SIZE
 #define ML_DSA_LEVEL5_BOTH_KEY_DER_SIZE DILITHIUM_LEVEL5_BOTH_KEY_DER_SIZE
-/* PEM size with the header "-----BEGIN PRIVATE KEY-----" and
- * the footer "-----END PRIVATE KEY-----" */
+/* PEM size with the header "-----BEGIN ML_DSA_LEVEL5 PRIVATE KEY-----" and
+ * the footer "-----END ML_DSA_LEVEL5 PRIVATE KEY-----" */
 #define ML_DSA_LEVEL5_BOTH_KEY_PEM_SIZE DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE
 
 #endif
@@ -627,8 +627,8 @@
 #define DILITHIUM_MAX_PUB_KEY_DER_SIZE DILITHIUM_LEVEL5_PUB_KEY_DER_SIZE
 #define DILITHIUM_MAX_PRV_KEY_DER_SIZE DILITHIUM_LEVEL5_PRV_KEY_DER_SIZE
 #define DILITHIUM_MAX_BOTH_KEY_DER_SIZE DILITHIUM_LEVEL5_BOTH_KEY_DER_SIZE
-/* PEM size with the header "-----BEGIN PRIVATE KEY-----" and
- * the footer "-----END PRIVATE KEY-----" */
+/* PEM size with the header "-----BEGIN ML_DSA_LEVEL5 PRIVATE KEY-----" and
+ * the footer "-----END ML_DSA_LEVEL5 PRIVATE KEY-----" */
 #define DILITHIUM_MAX_BOTH_KEY_PEM_SIZE DILITHIUM_LEVEL5_BOTH_KEY_PEM_SIZE
 
 
@@ -651,7 +651,7 @@ typedef struct wc_dilithium_params {
     byte omega;
     word16 lambda;
     byte gamma1_bits;
-    word32 gamma2;
+    sword32 gamma2;
     word32 w1EncSz;
     word16 aSz;
     word16 s1Sz;

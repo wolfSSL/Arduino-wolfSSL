@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -206,6 +206,8 @@ on the specific device platform.
     #endif
 #elif defined(FREESCALE_MMCAU_SHA)
     #define SHA256_UPDATE_REV_BYTES(ctx)    0 /* reverse not needed on update */
+#elif defined(WOLFSSL_PPC32_ASM)
+    #define SHA256_UPDATE_REV_BYTES(ctx)    0
 #else
     #define SHA256_UPDATE_REV_BYTES(ctx)    SHA256_REV_BYTES(ctx)
 #endif
@@ -1067,6 +1069,35 @@ static int InitSha256(wc_Sha256* sha256)
 #elif defined(WOLFSSL_RENESAS_RX64_HASH)
 
     /* implemented in wolfcrypt/src/port/Renesas/renesas_rx64_hw_sha.c */
+#elif defined(WOLFSSL_PPC32_ASM)
+
+extern void Transform_Sha256_Len(wc_Sha256* sha256, const byte* data,
+    word32 len);
+
+int wc_InitSha256_ex(wc_Sha256* sha256, void* heap, int devId)
+{
+    int ret = 0;
+
+    if (sha256 == NULL)
+        return BAD_FUNC_ARG;
+    ret = InitSha256(sha256);
+    if (ret != 0)
+        return ret;
+
+    sha256->heap = heap;
+    (void)devId;
+
+    return ret;
+}
+
+static int Transform_Sha256(wc_Sha256* sha256, const byte* data)
+{
+    Transform_Sha256_Len(sha256, data, WC_SHA256_BLOCK_SIZE);
+    return 0;
+}
+
+#define XTRANSFORM Transform_Sha256
+#define XTRANSFORM_LEN Transform_Sha256_Len
 
 #else
     #define NEED_SOFT_SHA256
@@ -1171,7 +1202,7 @@ static int InitSha256(wc_Sha256* sha256)
         word32 S[8], t0, t1;
         int i;
 
-    #ifdef WOLFSSL_SMALL_STACK_CACHE
+    #if defined(WOLFSSL_SMALL_STACK_CACHE) && !defined(WOLFSSL_NO_MALLOC)
         word32* W = sha256->W;
         if (W == NULL) {
             W = (word32*)XMALLOC(sizeof(word32) * WC_SHA256_BLOCK_SIZE, NULL,
@@ -1180,7 +1211,7 @@ static int InitSha256(wc_Sha256* sha256)
                 return MEMORY_E;
             sha256->W = W;
         }
-    #elif defined(WOLFSSL_SMALL_STACK)
+    #elif defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
         word32* W;
         W = (word32*)XMALLOC(sizeof(word32) * WC_SHA256_BLOCK_SIZE, NULL,
                                                        DYNAMIC_TYPE_TMP_BUFFER);
@@ -1221,7 +1252,8 @@ static int InitSha256(wc_Sha256* sha256)
             sha256->digest[i] += S[i];
         }
 
-    #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_SMALL_STACK_CACHE)
+    #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_SMALL_STACK_CACHE) &&\
+        !defined(WOLFSSL_NO_MALLOC)
         ForceZero(W, sizeof(word32) * WC_SHA256_BLOCK_SIZE);
         XFREE(W, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     #endif
@@ -1683,6 +1715,7 @@ static int InitSha256(wc_Sha256* sha256)
     {
     #ifdef LITTLE_ENDIAN_ORDER
         word32 digest[WC_SHA256_DIGEST_SIZE / sizeof(word32)];
+        XMEMSET(digest, 0, sizeof(digest));
     #endif
 
         if (sha256 == NULL || hash == NULL) {

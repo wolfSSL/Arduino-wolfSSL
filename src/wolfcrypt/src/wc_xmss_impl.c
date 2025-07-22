@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -2590,7 +2590,7 @@ static void wc_xmss_bds_state_treehash_set_next_idx(BdsState* bds, int i,
 static void wc_xmss_bds_state_treehash_complete(BdsState* bds, int i)
 {
     byte* sk = bds->treeHash + i * 4;
-    sk[3] |= 1 << 7;
+    sk[3] |= 1 << 7; /* // NOLINT(clang-analyzer-core.NullDereference) */
 }
 
 /* Get the tree hash data at specified index for the BDS state.

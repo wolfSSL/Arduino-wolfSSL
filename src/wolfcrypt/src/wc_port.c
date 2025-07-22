@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -25,6 +25,10 @@
     #include <AvailabilityMacros.h>
 #endif
 
+#include <wolfssl/wolfcrypt/cpuid.h>
+#ifdef HAVE_ENTROPY_MEMUSE
+    #include <wolfssl/wolfcrypt/random.h>
+#endif
 #ifdef HAVE_ECC
     #include <wolfssl/wolfcrypt/ecc.h>
 #endif
@@ -66,6 +70,10 @@
 #endif
 #if defined(WOLFSSL_STSAFEA100)
     #include <wolfssl/wolfcrypt/port/st/stsafe.h>
+#endif
+
+#if defined(WOLFSSL_TROPIC01)
+    #include <wolfssl/wolfcrypt/port/tropicsquare/tropic01.h>
 #endif
 
 #if (defined(OPENSSL_EXTRA) || defined(HAVE_WEBSERVER)) \
@@ -145,6 +153,10 @@
 /* prevent multiple mutex initializations */
 static volatile int initRefCount = 0;
 
+#if defined(__aarch64__) && defined(WOLFSSL_ARMASM_BARRIER_DETECT)
+int aarch64_use_sb = 0;
+#endif
+
 /* Used to initialize state for wolfcrypt
    return 0 on success
  */
@@ -154,6 +166,10 @@ int wolfCrypt_Init(void)
     int ret = 0;
     if (initRefCount == 0) {
         WOLFSSL_ENTER("wolfCrypt_Init");
+
+    #if defined(__aarch64__) && defined(WOLFSSL_ARMASM_BARRIER_DETECT)
+        aarch64_use_sb = IS_AARCH64_SB(cpuid_get_flags());
+    #endif
 
     #ifdef WOLFSSL_CHECK_MEM_ZERO
         /* Initialize the mutex for access to the list of memory locations that
@@ -285,7 +301,13 @@ int wolfCrypt_Init(void)
     #if defined(WOLFSSL_STSAFEA100)
         stsafe_interface_init();
     #endif
-
+    #if defined(WOLFSSL_TROPIC01)
+        ret = Tropic01_Init();
+        if (ret != 0) {
+            WOLFSSL_MSG("Tropic01 init failed");
+            return ret;
+        }
+    #endif
     #if defined(WOLFSSL_PSOC6_CRYPTO)
         ret = psoc6_crypto_port_init();
         if (ret != 0) {
@@ -339,13 +361,20 @@ int wolfCrypt_Init(void)
             return ret;
     #endif
 
-#ifdef HAVE_ENTROPY_MEMUSE
-    ret = Entropy_Init();
-    if (ret != 0) {
-        WOLFSSL_MSG("Error initializing entropy");
-        return ret;
-    }
-#endif
+    #if defined(USE_WINDOWS_API) && defined(WIN_REUSE_CRYPT_HANDLE)
+        /* A failure here should not happen, but if it does the actual RNG seed
+         * call will fail. This init is for a shared crypt provider handle for
+         * RNG */
+        (void)wc_WinCryptHandleInit();
+    #endif
+
+    #ifdef HAVE_ENTROPY_MEMUSE
+        ret = Entropy_Init();
+        if (ret != 0) {
+            WOLFSSL_MSG("Error initializing entropy");
+            return ret;
+        }
+    #endif
 
 #ifdef HAVE_ECC
     #ifdef FP_ECC
@@ -498,6 +527,9 @@ int wolfCrypt_Cleanup(void)
     #ifdef WOLFSSL_SILABS_SE_ACCEL
         ret = sl_se_deinit();
     #endif
+    #if defined(WOLFSSL_TROPIC01)
+        Tropic01_Deinit();
+    #endif
     #if defined(WOLFSSL_RENESAS_TSIP)
         tsip_Close();
     #endif
@@ -514,6 +546,10 @@ int wolfCrypt_Cleanup(void)
 
     #ifdef HAVE_ENTROPY_MEMUSE
         Entropy_Final();
+    #endif
+
+    #if defined(USE_WINDOWS_API) && defined(WIN_REUSE_CRYPT_HANDLE)
+        wc_WinCryptHandleCleanup();
     #endif
 
     #ifdef WOLF_CRYPTO_CB
@@ -2177,32 +2213,7 @@ int wolfSSL_HwPkMutexUnLock(void)
     }
 #elif defined(WOLFSSL_LINUXKM)
 
-    /* Linux kernel mutex routines are voids, alas. */
-
-    int wc_InitMutex(wolfSSL_Mutex* m)
-    {
-        mutex_init(m);
-        return 0;
-    }
-
-    int wc_FreeMutex(wolfSSL_Mutex* m)
-    {
-        mutex_destroy(m);
-        return 0;
-    }
-
-    int wc_LockMutex(wolfSSL_Mutex* m)
-    {
-        mutex_lock(m);
-        return 0;
-    }
-
-
-    int wc_UnLockMutex(wolfSSL_Mutex* m)
-    {
-        mutex_unlock(m);
-        return 0;
-    }
+    /* defined as inlines in linuxkm/linuxkm_wc_port.h */
 
 #elif defined(WOLFSSL_VXWORKS)
 
@@ -3929,7 +3940,21 @@ char* mystrnstr(const char* s1, const char* s2, unsigned int n)
     {
         if (cond == NULL)
             return BAD_FUNC_ARG;
-    #if defined(__OS2__)
+    #if defined(__MACH__)
+        cond->cond = dispatch_semaphore_create(0);
+        if (cond->cond == NULL)
+            return MEMORY_E;
+
+        /* dispatch_release() fails hard, with Trace/BPT trap signal, if the
+         * sem's internal count is less than the value passed in with
+         * dispatch_semaphore_create().  work around this by initializing
+         * with 0, then incrementing it afterwards.
+         */
+        if (dispatch_semaphore_signal(s->sem) < 0) {
+            dispatch_release(s->sem);
+            return MEMORY_E;
+        }
+    #elif defined(__OS2__)
         DosCreateMutexSem( NULL, &cond->mutex, 0, FALSE );
         DosCreateEventSem( NULL, &cond->cond, DCE_POSTONE, FALSE );
     #elif defined(__NT__)
@@ -3960,7 +3985,9 @@ char* mystrnstr(const char* s1, const char* s2, unsigned int n)
     {
         if (cond == NULL)
             return BAD_FUNC_ARG;
-    #if defined(__OS2__)
+    #if defined(__MACH__)
+        dispatch_release(cond->cond);
+    #elif defined(__OS2__)
         DosCloseMutexSem(cond->mutex);
         DosCloseEventSem(cond->cond);
     #elif defined(__NT__)
@@ -3980,7 +4007,8 @@ char* mystrnstr(const char* s1, const char* s2, unsigned int n)
     {
         if (cond == NULL)
             return BAD_FUNC_ARG;
-    #if defined(__OS2__)
+    #if defined(__MACH__)
+    #elif defined(__OS2__)
     #elif defined(__NT__)
         if (wc_LockMutex(&cond->mutex) != 0)
             return BAD_MUTEX_E;
@@ -3995,7 +4023,9 @@ char* mystrnstr(const char* s1, const char* s2, unsigned int n)
     {
         if (cond == NULL)
             return BAD_FUNC_ARG;
-    #if defined(__OS2__)
+    #if defined(__MACH__)
+        dispatch_semaphore_signal(cond->cond);
+    #elif defined(__OS2__)
     #elif defined(__NT__)
         if (wc_UnLockMutex(&cond->mutex) != 0)
             return BAD_MUTEX_E;
@@ -4016,7 +4046,9 @@ char* mystrnstr(const char* s1, const char* s2, unsigned int n)
     {
         if (cond == NULL)
             return BAD_FUNC_ARG;
-    #if defined(__OS2__)
+    #if defined(__MACH__)
+        dispatch_semaphore_wait(cond->cond, DISPATCH_TIME_FOREVER);
+    #elif defined(__OS2__)
     #elif defined(__NT__)
         if (wc_UnLockMutex(&cond->mutex) != 0)
             return BAD_MUTEX_E;
@@ -4598,5 +4630,11 @@ noinstr void my__alt_cb_patch_nops(struct alt_instr *alt, __le32 *origptr,
 {
     return (wolfssl_linuxkm_get_pie_redirect_table()->
             alt_cb_patch_nops)(alt, origptr, updptr, nr_inst);
+}
+
+void my__queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+{
+    return (wolfssl_linuxkm_get_pie_redirect_table()->
+            queued_spin_lock_slowpath)(lock, val);
 }
 #endif

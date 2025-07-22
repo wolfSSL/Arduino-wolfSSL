@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -249,8 +249,8 @@
     #endif
 #endif
 
-#if !defined(CHAR_BIT) || (defined(OPENSSL_EXTRA) && !defined(INT_MAX))
-    /* Needed for DTLS without big math and INT_MAX */
+#if !defined(WOLFCRYPT_ONLY) && !defined(INT_MAX)
+    /* Needed for TLS/DTLS limit checking (Added in 91aad90c59 Jan 24, 2025) */
     #include <limits.h>
 #endif
 
@@ -299,6 +299,10 @@
 #if defined(WOLFSSL_SNIFFER) && defined(WOLFSSL_SNIFFER_KEYLOGFILE)
 #include <wolfssl/sniffer.h>
 #endif /* WOLFSSL_SNIFFER && WOLFSSL_SNIFFER_KEYLOGFILE */
+
+#ifdef WOLFSSL_TEST_APPLE_NATIVE_CERT_VALIDATION
+    #include <CoreFoundation/CoreFoundation.h>
+#endif /* WOLFSSL_TEST_APPLE_NATIVE_CERT_VALIDATION */
 
 #ifdef __cplusplus
     extern "C" {
@@ -532,12 +536,13 @@
     #endif
 
     #if defined(HAVE_ANON) && !defined(NO_TLS) && !defined(NO_DH) && \
-        !defined(NO_AES) && !defined(NO_SHA) && defined(WOLFSSL_AES_128)
-        #ifdef HAVE_AES_CBC
+        !defined(NO_AES)
+        #if !defined(NO_SHA) && defined(HAVE_AES_CBC) && \
+                defined(WOLFSSL_AES_128)
             #define BUILD_TLS_DH_anon_WITH_AES_128_CBC_SHA
         #endif
-
-        #if defined(WOLFSSL_SHA384) && defined(HAVE_AESGCM)
+        #if defined(WOLFSSL_SHA384) && defined(HAVE_AESGCM) && \
+                defined(WOLFSSL_AES_256)
             #define BUILD_TLS_DH_anon_WITH_AES_256_GCM_SHA384
         #endif
     #endif
@@ -1085,12 +1090,16 @@
 
 #undef WSSL_HARDEN_TLS
 
-#if defined(OPENSSL_EXTRA) || defined(WOLFSSL_EXTRA) || defined(HAVE_LIGHTY)
-#define SSL_CA_NAMES(ssl) ((ssl)->client_ca_names != NULL ? (ssl)->client_ca_names : \
+/* Client CA Names feature */
+#if !defined(WOLFSSL_NO_CA_NAMES) && defined(OPENSSL_EXTRA)
+    #define SSL_CA_NAMES(ssl) ((ssl)->client_ca_names != NULL ? \
+        (ssl)->client_ca_names : \
         (ssl)->ctx->client_ca_names)
 #else
-#define WOLFSSL_NO_CA_NAMES
+    #undef  WOLFSSL_NO_CA_NAMES
+    #define WOLFSSL_NO_CA_NAMES
 #endif
+
 
 /* actual cipher values, 2nd byte */
 enum {
@@ -2547,6 +2556,8 @@ typedef struct CRL_Entry CRL_Entry;
         #error CRL_MAX_REVOKED_CERTS too big, max is 22000
     #endif
 #endif
+
+#ifdef HAVE_CRL
 /* Complete CRL */
 struct CRL_Entry {
     byte*   toBeSigned;
@@ -2559,6 +2570,7 @@ struct CRL_Entry {
     /* DupCRL_Entry copies data after the `verifyMutex` member. Using the mutex
      * as the marker because clang-tidy doesn't like taking the sizeof a
      * pointer. */
+    byte    crlNumber[CRL_MAX_NUM_SZ];    /* CRL number extension */
     byte    issuerHash[CRL_DIGEST_SIZE];  /* issuer hash                 */
     /* byte    crlHash[CRL_DIGEST_SIZE];      raw crl data hash           */
     /* restore the hash here if needed for optimized comparisons */
@@ -2586,10 +2598,10 @@ struct CRL_Entry {
     byte*   sigParams;   /* buffer with signature parameters */
 #endif
 #if !defined(NO_SKID) && !defined(NO_ASN)
-    byte    extAuthKeyIdSet;
     byte    extAuthKeyId[KEYID_SIZE];
+    byte    extAuthKeyIdSet:1;  /* Auth key identifier set indicator */
 #endif
-    int                   crlNumber;  /* CRL number extension */
+    byte    crlNumberSet:1;     /* CRL number set indicator */
 };
 
 
@@ -2642,6 +2654,7 @@ struct WOLFSSL_CRL {
 #endif
     void*                 heap;          /* heap hint for dynamic memory */
 };
+#endif
 
 
 #ifdef NO_ASN
@@ -4233,6 +4246,10 @@ struct WOLFSSL_CTX {
 #if defined(WOLFSSL_SYS_CRYPTO_POLICY)
     int secLevel; /* The security level of system-wide crypto policy. */
 #endif /* WOLFSSL_SYS_CRYPTO_POLICY */
+
+#ifdef WOLFSSL_TEST_APPLE_NATIVE_CERT_VALIDATION
+    CFMutableArrayRef testTrustedCAs;
+#endif /* WOLFSSL_TEST_APPLE_NATIVE_CERT_VALIDATION */
 };
 
 WOLFSSL_LOCAL
@@ -4268,6 +4285,13 @@ int ProcessOldClientHello(WOLFSSL* ssl, const byte* input, word32* inOutIdx,
     int AlreadyTrustedPeer(WOLFSSL_CERT_MANAGER* cm, DecodedCert* cert);
 #endif
 #endif
+
+#ifdef WOLFSSL_TEST_APPLE_NATIVE_CERT_VALIDATION
+    WOLFSSL_API
+    int wolfSSL_TestAppleNativeCertValidation_AppendCA(WOLFSSL_CTX* ctx,
+                                                    const byte* derCert,
+                                                    int derLen);
+#endif /* WOLFSSL_TEST_APPLE_NATIVE_CERT_VALIDATION */
 
 /* All cipher suite related info
  * Keep as a constant size (no ifdefs) for session export */
@@ -6389,7 +6413,8 @@ WOLFSSL_TEST_VIS   void wolfSSL_ResourceFree(WOLFSSL* ssl);   /* Micrium uses */
 
     WOLFSSL_LOCAL int ProcessBuffer(WOLFSSL_CTX* ctx, const unsigned char* buff,
                                     long sz, int format, int type, WOLFSSL* ssl,
-                                    long* used, int userChain, int verify);
+                                    long* used, int userChain, int verify,
+                                    const char *source_name);
     WOLFSSL_LOCAL int ProcessFile(WOLFSSL_CTX* ctx, const char* fname, int format,
                                  int type, WOLFSSL* ssl, int userChain,
                                 WOLFSSL_CRL* crl, int verify);
@@ -6707,6 +6732,8 @@ WOLFSSL_LOCAL  int GrowInputBuffer(WOLFSSL* ssl, int size, int usedLength);
 WOLFSSL_LOCAL  int MsgCheckEncryption(WOLFSSL* ssl, byte type, byte encrypted);
 WOLFSSL_LOCAL  int EarlySanityCheckMsgReceived(WOLFSSL* ssl, byte type,
         word32 msgSz);
+WOLFSSL_LOCAL int GetHandshakeHeader(WOLFSSL* ssl, const byte* input,
+        word32* inOutIdx, byte* type, word32* size, word32 totalSz);
 #if !defined(NO_WOLFSSL_CLIENT) || !defined(WOLFSSL_NO_CLIENT_AUTH)
 WOLFSSL_LOCAL void DoCertFatalAlert(WOLFSSL* ssl, int ret);
 #endif
@@ -7122,8 +7149,9 @@ WOLFSSL_LOCAL WC_RNG* wolfssl_make_global_rng(void);
 
 #if !defined(WOLFCRYPT_ONLY) && defined(OPENSSL_EXTRA)
 #if defined(WOLFSSL_KEY_GEN) && defined(WOLFSSL_PEM_TO_DER)
-WOLFSSL_LOCAL int EncryptDerKey(byte *der, int *derSz, const WOLFSSL_EVP_CIPHER* cipher,
-    unsigned char* passwd, int passwdSz, byte **cipherInfo, int maxDerSz);
+WOLFSSL_LOCAL int EncryptDerKey(byte *der, int *derSz,
+    const WOLFSSL_EVP_CIPHER* cipher, unsigned char* passwd, int passwdSz,
+    byte **cipherInfo, int maxDerSz, int hashType);
 #endif
 #endif
 

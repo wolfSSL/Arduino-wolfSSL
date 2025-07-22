@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -454,6 +454,10 @@
         #error "WOLFSSL_HARDEN_TLS must be defined either to 112 or 128 bits of security."
     #endif
 #endif
+
+/* Important build-time configuration messages may be saved.
+ * Enable DEBUG_WOLFSSL and see wolfSSL_Init() for display. */
+#define LIBWOLFSSL_CMAKE_OUTPUT ""
 
 /* ---------------------------------------------------------------------------
  * Dual Algorithm Certificate Required Features.
@@ -1270,11 +1274,11 @@
         #define TIME_OVERRIDES
         #ifndef XTIME
             #error "Must define XTIME externally see porting guide"
-            #error "https://www.wolfssl.com/docs/porting-guide/"
+            /* https://www.wolfssl.com/docs/porting-guide/ */
         #endif
         #ifndef XGMTIME
             #error "Must define XGMTIME externally see porting guide"
-            #error "https://www.wolfssl.com/docs/porting-guide/"
+            /* https://www.wolfssl.com/docs/porting-guide/ */
         #endif
     #endif
 
@@ -1897,21 +1901,6 @@ extern void uITRON4_free(void *p) ;
     #define TFM_TIMING_RESISTANT
     #define ECC_TIMING_RESISTANT
 
-    #undef  HAVE_ECC
-    #ifndef WOLFCRYPT_FIPS_RAND
-    #define HAVE_ECC
-    #endif
-    #ifndef NO_AES
-        #undef  HAVE_AESCCM
-        #define HAVE_AESCCM
-        #undef  HAVE_AESGCM
-        #define HAVE_AESGCM
-        #undef  WOLFSSL_AES_COUNTER
-        #define WOLFSSL_AES_COUNTER
-        #undef  WOLFSSL_AES_DIRECT
-        #define WOLFSSL_AES_DIRECT
-    #endif
-
     #ifdef FREESCALE_KSDK_1_3
         #include "fsl_device_registers.h"
     #elif !defined(FREESCALE_MQX)
@@ -2106,7 +2095,8 @@ extern void uITRON4_free(void *p) ;
     defined(WOLFSSL_STM32G0)  || defined(WOLFSSL_STM32U5)   || \
     defined(WOLFSSL_STM32H5)  || defined(WOLFSSL_STM32WL)   || \
     defined(WOLFSSL_STM32G4)  || defined(WOLFSSL_STM32MP13) || \
-    defined(WOLFSSL_STM32H7S) || defined(WOLFSSL_STM32WBA)
+    defined(WOLFSSL_STM32H7S) || defined(WOLFSSL_STM32WBA)  || \
+    defined(WOLFSSL_STM32N6)
 
     #define SIZEOF_LONG_LONG 8
     #ifndef CHAR_BIT
@@ -2170,6 +2160,8 @@ extern void uITRON4_free(void *p) ;
             #include "stm32u5xx_hal.h"
         #elif defined(WOLFSSL_STM32H5)
             #include "stm32h5xx_hal.h"
+        #elif defined(WOLFSSL_STM32N6)
+            #include "stm32n6xx_hal.h"
         #elif defined(WOLFSSL_STM32MP13)
             /* HAL headers error on our ASM files */
             #ifndef __ASSEMBLER__
@@ -2795,14 +2787,15 @@ extern void uITRON4_free(void *p) ;
 #endif
 
 #if defined(__mips) || defined(__mips64) || \
-    defined(WOLFSSL_SP_MIPS64) || defined(WOLFSSL_SP_MIPS)
+    defined(WOLFSSL_SP_MIPS64) || defined(WOLFSSL_SP_MIPS) || \
+    defined(__sparc) || defined(__arm__) || defined(__aarch64__)
+    /* This setting currently only affects big endian targets, currently
+     * only in sp_read_unsigned_bin().
+     */
     #undef WOLFSSL_SP_INT_DIGIT_ALIGN
     #define WOLFSSL_SP_INT_DIGIT_ALIGN
 #endif
-#if defined(__sparc)
-    #undef WOLFSSL_SP_INT_DIGIT_ALIGN
-    #define WOLFSSL_SP_INT_DIGIT_ALIGN
-#endif
+
 #if defined(__APPLE__) || defined(WOLF_C89)
     #define WOLFSSL_SP_NO_DYN_STACK
 #endif
@@ -2896,7 +2889,7 @@ extern void uITRON4_free(void *p) ;
 /* Determine when mp_read_radix with a radix of 10 is required. */
 #if (defined(WOLFSSL_SP_MATH_ALL) && !defined(NO_RSA) && \
     !defined(WOLFSSL_RSA_VERIFY_ONLY)) || defined(HAVE_ECC) || \
-    !defined(NO_DSA) || defined(OPENSSL_EXTRA)
+    !defined(NO_DSA) || defined(OPENSSL_EXTRA) || defined(WOLFSSL_PUBLIC_MP)
     #define WOLFSSL_SP_READ_RADIX_16
 #endif
 
@@ -2909,7 +2902,7 @@ extern void uITRON4_free(void *p) ;
 /* Determine when mp_invmod is required. */
 #if defined(HAVE_ECC) || !defined(NO_DSA) || defined(OPENSSL_EXTRA) || \
     (!defined(NO_RSA) && !defined(WOLFSSL_RSA_VERIFY_ONLY) && \
-     !defined(WOLFSSL_RSA_PUBLIC_ONLY))
+     !defined(WOLFSSL_RSA_PUBLIC_ONLY)) || defined(OPENSSL_EXTRA)
     #define WOLFSSL_SP_INVMOD
 #endif
 
@@ -3118,6 +3111,29 @@ extern void uITRON4_free(void *p) ;
         #define HAVE_ED448_KEY_IMPORT
     #endif
 #endif /* HAVE_ED448 */
+
+
+/* RFC 5958 (Asymmetric Key Packages) */
+#if !defined(WC_ENABLE_ASYM_KEY_EXPORT) && \
+    ((defined(HAVE_ED25519)    && defined(HAVE_ED25519_KEY_EXPORT)) || \
+     (defined(HAVE_CURVE25519) && defined(HAVE_CURVE25519_KEY_EXPORT)) || \
+     (defined(HAVE_ED448)      && defined(HAVE_ED448_KEY_EXPORT)) || \
+     (defined(HAVE_CURVE448)   && defined(HAVE_CURVE448_KEY_EXPORT)) || \
+      defined(HAVE_FALCON) || defined(HAVE_DILITHIUM) || \
+      defined(HAVE_SPHINCS) || defined(HAVE_LIBOQS))
+    #define WC_ENABLE_ASYM_KEY_EXPORT
+#endif
+
+#if !defined(WC_ENABLE_ASYM_KEY_IMPORT) && \
+    ((defined(HAVE_ED25519)    && defined(HAVE_ED25519_KEY_IMPORT)) || \
+     (defined(HAVE_CURVE25519) && defined(HAVE_CURVE25519_KEY_IMPORT)) || \
+     (defined(HAVE_ED448)      && defined(HAVE_ED448_KEY_IMPORT)) || \
+     (defined(HAVE_CURVE448)   && defined(HAVE_CURVE448_KEY_IMPORT)) || \
+      defined(HAVE_FALCON) || defined(HAVE_DILITHIUM) || \
+      defined(HAVE_SPHINCS) || defined(HAVE_LIBOQS))
+    #define WC_ENABLE_ASYM_KEY_IMPORT
+#endif
+
 
 /* FIPS does not support CFB1 or CFB8 */
 #if !defined(WOLFSSL_NO_AES_CFB_1_8) && \
@@ -3584,6 +3600,13 @@ extern void uITRON4_free(void *p) ;
     #endif
 #endif
 
+#ifdef WOLFSSL_PYTHON
+    /* Need to use old OID sum algorithm until OSP patches, in particular to
+     * tests, for all versions reflect the new OID sum value. */
+    #undef WOLFSSL_OLD_OID_SUM
+    #define WOLFSSL_OLD_OID_SUM
+#endif
+
 
 /* Linux Kernel Module */
 #ifdef WOLFSSL_LINUXKM
@@ -3640,6 +3663,9 @@ extern void uITRON4_free(void *p) ;
     #undef WOLFSSL_HAVE_MAX
     #undef WOLFSSL_HAVE_ASSERT_H
     #define WOLFSSL_NO_ASSERT_H
+    #ifndef WOLFSSL_NO_GETPID
+        #define WOLFSSL_NO_GETPID
+    #endif /* WOLFSSL_NO_GETPID */
     #ifndef SIZEOF_LONG
         #define SIZEOF_LONG         8
     #endif
@@ -3653,8 +3679,13 @@ extern void uITRON4_free(void *p) ;
     #ifndef WOLFSSL_SP_DIV_WORD_HALF
         #define WOLFSSL_SP_DIV_WORD_HALF
     #endif
-    #ifdef __PIE__
+
+    #ifdef HAVE_LINUXKM_PIE_SUPPORT
         #define WC_NO_INTERNAL_FUNCTION_POINTERS
+        #define WOLFSSL_ECC_CURVE_STATIC
+        #define WOLFSSL_NAMES_STATIC
+        #define WOLFSSL_NO_PUBLIC_FFDHE
+        #undef HAVE_PUBLIC_FFDHE
     #endif
 
     #ifndef NO_OLD_WC_NAMES
@@ -3677,7 +3708,7 @@ extern void uITRON4_free(void *p) ;
 
     #if defined(LINUXKM_LKCAPI_REGISTER) && !defined(WOLFSSL_ASN_INT_LEAD_0_ANY)
         /* kernel 5.10 crypto manager tests key(s) that fail unless leading
-         * bytes are tolerated in GetASN_Integer().
+         * zero bytes are tolerated in GetASN_Integer().
          */
         #define WOLFSSL_ASN_INT_LEAD_0_ANY
     #endif
@@ -3689,6 +3720,14 @@ extern void uITRON4_free(void *p) ;
         #ifndef WC_SANITIZE_ENABLE
             #define WC_SANITIZE_ENABLE() kasan_enable_current()
         #endif
+    #endif
+
+    #if !defined(WC_RESEED_INTERVAL) && defined(LINUXKM_LKCAPI_REGISTER)
+        /* If installing handlers, use the maximum reseed interval allowed by
+         * NIST SP 800-90A Rev. 1, to avoid unnecessary delays in DRBG
+         * generation.
+         */
+        #define WC_RESEED_INTERVAL (((word64)1UL)<<48UL)
     #endif
 #endif
 
@@ -3793,6 +3832,14 @@ extern void uITRON4_free(void *p) ;
     #define WOLFSSL_ALERT_COUNT_MAX 5
 #endif
 
+/* Enable blinding by default for C-only, non-small curve25519 implementation */
+#if defined(HAVE_CURVE25519) && !defined(CURVE25519_SMALL) && \
+    !defined(FREESCALE_LTC_ECC) && !defined(WOLFSSL_ARMASM) && \
+    (!defined(USE_INTEL_SPEEDUP) || defined(NO_CURVED25519_X64)) && \
+    !defined(WOLFSSL_CURVE25519_BLINDING) && !defined(NO_CURVE25519_BLINDING)
+    #define WOLFSSL_CURVE25519_BLINDING
+#endif
+
 /* warning for not using harden build options (default with ./configure) */
 /* do not warn if big integer support is disabled */
 #if !defined(WC_NO_HARDEN) && !defined(NO_BIG_INT)
@@ -3867,7 +3914,7 @@ extern void uITRON4_free(void *p) ;
 /* Parts of the openssl compatibility layer require peer certs */
 #if (defined(OPENSSL_EXTRA) || defined(OPENSSL_ALL) || \
      defined(WOLFSSL_NGINX) || defined(WOLFSSL_HAPROXY) || \
-     defined(HAVE_LIGHTY)) && !defined(NO_CERTS)
+     defined(HAVE_LIGHTY)) && !defined(NO_CERTS) && !defined(NO_KEEP_PEER_CERT)
     #undef  KEEP_PEER_CERT
     #define KEEP_PEER_CERT
 #endif
@@ -3938,12 +3985,6 @@ extern void uITRON4_free(void *p) ;
 #if defined(HAVE_XCHACHA) && !defined(HAVE_CHACHA)
     /* XChacha requires ChaCha */
     #undef HAVE_XCHACHA
-#endif
-
-#if !defined(WOLFSSL_SHA384) && !defined(WOLFSSL_SHA512) && defined(NO_AES) && \
-                                                          !defined(WOLFSSL_SHA3)
-    #undef  WOLFSSL_NO_WORD64_OPS
-    #define WOLFSSL_NO_WORD64_OPS
 #endif
 
 #if !defined(WOLFCRYPT_ONLY) && \
@@ -4038,7 +4079,6 @@ extern void uITRON4_free(void *p) ;
 #if defined(__IAR_SYSTEMS_ICC__) && defined(__ROPI__)
     #define WOLFSSL_ECC_CURVE_STATIC
     #define WOLFSSL_NAMES_STATIC
-    #define WOLFSSL_NO_CONSTCHARCONST
 #endif
 
 /* FIPS v1 does not support TLS v1.3 (requires RSA PSS and HKDF) */
@@ -4087,6 +4127,32 @@ extern void uITRON4_free(void *p) ;
 /* DH Extra is not supported on FIPS v1 or v2 (is missing DhKey .pub/.priv) */
 #if defined(WOLFSSL_DH_EXTRA) && defined(HAVE_FIPS) && FIPS_VERSION_LE(2,0)
     #undef WOLFSSL_DH_EXTRA
+#endif
+
+/* FIPS 140-3 does not have this definition in wolfCrypt dh.h, but OpenSSL dh.h depends on it.
+ * Define it here as well if needed, as we want to avoid modifying dh.h in FIPS. */
+#ifndef DH_MAX_SIZE
+    #ifdef USE_FAST_MATH
+        /* FP implementation support numbers up to FP_MAX_BITS / 2 bits. */
+        #define DH_MAX_SIZE    (FP_MAX_BITS / 2)
+        #if defined(WOLFSSL_MYSQL_COMPATIBLE) && DH_MAX_SIZE < 8192
+            #error "MySQL needs FP_MAX_BITS at least at 16384"
+        #endif
+    #elif defined(WOLFSSL_SP_MATH_ALL) || defined(WOLFSSL_SP_MATH)
+        /* SP implementation supports numbers of SP_INT_BITS bits. */
+        #define DH_MAX_SIZE    (((SP_INT_BITS + 7) / 8) * 8)
+        #if defined(WOLFSSL_MYSQL_COMPATIBLE) && DH_MAX_SIZE < 8192
+            #error "MySQL needs SP_INT_BITS at least at 8192"
+        #endif
+    #else
+        #ifdef WOLFSSL_MYSQL_COMPATIBLE
+            /* Integer maths is dynamic but we only go up to 8192 bits. */
+            #define DH_MAX_SIZE 8192
+        #else
+            /* Integer maths is dynamic but we only go up to 4096 bits. */
+            #define DH_MAX_SIZE 4096
+        #endif
+    #endif
 #endif
 
 /* wc_Sha512.devId isn't available before FIPS 5.1 */
@@ -4184,6 +4250,12 @@ extern void uITRON4_free(void *p) ;
 
 #if defined(HAVE_PQC) && !defined(HAVE_LIBOQS) && !defined(WOLFSSL_HAVE_MLKEM)
 #error Please do not define HAVE_PQC yourself.
+#endif
+
+/* If no malloc then make sure the valid Dilithium settings are used */
+#if defined(HAVE_DILITHIUM) && defined(WOLFSSL_NO_MALLOC)
+    #undef  WOLFSSL_DILITHIUM_VERIFY_NO_MALLOC
+    #define WOLFSSL_DILITHIUM_VERIFY_NO_MALLOC
 #endif
 
 #if defined(HAVE_PQC) && defined(WOLFSSL_DTLS13) && \
@@ -4339,14 +4411,17 @@ extern void uITRON4_free(void *p) ;
 
 #ifdef WOLFSSL_HARDEN_TLS
     #if defined(HAVE_TRUNCATED_HMAC) && !defined(WOLFSSL_HARDEN_TLS_ALLOW_TRUNCATED_HMAC)
-        #error "Truncated HMAC Extension not allowed https://www.rfc-editor.org/rfc/rfc9325#section-4.6"
+        #error "Truncated HMAC Extension not allowed"
+        /* https://www.rfc-editor.org/rfc/rfc9325#section-4.6 */
     #endif
     #if !defined(NO_OLD_TLS) && !defined(WOLFSSL_HARDEN_TLS_ALLOW_OLD_TLS)
-        #error "TLS < 1.2 protocol versions not allowed https://www.rfc-editor.org/rfc/rfc9325#section-3.1.1"
+        #error "TLS < 1.2 protocol versions not allowed"
+        /* https://www.rfc-editor.org/rfc/rfc9325#section-3.1.1 */
     #endif
     #if !defined(WOLFSSL_NO_TLS12) && !defined(HAVE_SECURE_RENEGOTIATION) && \
         !defined(HAVE_SERVER_RENEGOTIATION_INFO) && !defined(WOLFSSL_HARDEN_TLS_NO_SCR_CHECK)
-        #error "TLS 1.2 requires at least HAVE_SERVER_RENEGOTIATION_INFO to send the secure renegotiation extension https://www.rfc-editor.org/rfc/rfc9325#section-3.5"
+        #error "TLS 1.2 requires at least HAVE_SERVER_RENEGOTIATION_INFO to send the secure renegotiation extension"
+        /* https://www.rfc-editor.org/rfc/rfc9325#section-3.5 */
     #endif
     #if !defined(WOLFSSL_EXTRA_ALERTS) || !defined(WOLFSSL_CHECK_ALERT_ON_ERR)
         #error "RFC9325 requires some additional alerts to be sent"

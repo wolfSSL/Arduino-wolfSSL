@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -80,22 +80,6 @@
 #define WOLFSSL_CONTENT_TYPE_ATTRIBUTE 0x2
 #define WOLFSSL_SIGNING_TIME_ATTRIBUTE 0x4
 #define WOLFSSL_MESSAGE_DIGEST_ATTRIBUTE 0x8
-
-/* PKCS#7 content types, ref RFC 2315 (Section 14) */
-enum PKCS7_TYPES {
-    PKCS7_MSG                 = 650,  /* 1.2.840.113549.1.7   */
-    DATA                      = 651,  /* 1.2.840.113549.1.7.1 */
-    SIGNED_DATA               = 652,  /* 1.2.840.113549.1.7.2 */
-    ENVELOPED_DATA            = 653,  /* 1.2.840.113549.1.7.3 */
-    SIGNED_AND_ENVELOPED_DATA = 654,  /* 1.2.840.113549.1.7.4 */
-    DIGESTED_DATA             = 655,  /* 1.2.840.113549.1.7.5 */
-    ENCRYPTED_DATA            = 656,  /* 1.2.840.113549.1.7.6 */
-#if defined(HAVE_LIBZ) && !defined(NO_PKCS7_COMPRESSED_DATA)
-    COMPRESSED_DATA           = 678,  /* 1.2.840.113549.1.9.16.1.9,  RFC 3274 */
-#endif
-    FIRMWARE_PKG_DATA         = 685,  /* 1.2.840.113549.1.9.16.1.16, RFC 4108 */
-    AUTH_ENVELOPED_DATA       = 692   /* 1.2.840.113549.1.9.16.1.23, RFC 5083 */
-};
 
 enum PKCS7_STATE {
     WC_PKCS7_START = 0,
@@ -545,6 +529,10 @@ WOLFSSL_API int  wc_PKCS7_SetDecodeEncryptedCb(wc_PKCS7* pkcs7,
         CallbackDecryptContent decryptionCb);
 WOLFSSL_API int  wc_PKCS7_SetDecodeEncryptedCtx(wc_PKCS7* pkcs7, void* ctx);
 #endif /* NO_PKCS7_ENCRYPTED_DATA */
+
+/* CMS/PKCS#7 EncryptedKeyPackage */
+WOLFSSL_API int wc_PKCS7_DecodeEncryptedKeyPackage(wc_PKCS7 * pkcs7,
+        byte * pkiMsg, word32 pkiMsgSz, byte * output, word32 outputSz);
 
 /* stream and certs */
 WOLFSSL_LOCAL int wc_PKCS7_WriteOut(wc_PKCS7* pkcs7, byte* output,
