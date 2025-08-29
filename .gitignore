@@ -1,4 +1,4 @@
-﻿################################################################################
+################################################################################
 # This .gitignore file was automatically created by Microsoft(R) Visual Studio.
 ################################################################################
 
@@ -9,3 +9,4 @@
 /src/wolfcrypt/src/wolfcrypt_first.c
 /src/wolfcrypt/src/wolfcrypt_last.c
 /src/wolfssl/wolfcrypt/fips.h
+/**/*.bak
