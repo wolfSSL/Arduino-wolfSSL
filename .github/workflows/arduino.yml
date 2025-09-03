@@ -237,7 +237,7 @@ jobs:
 
           # Fetch script and board list into WOLFSSL_EXAMPLES_DIRECTORY
           # TODO edit PR branch path:
-          curl -L "https://raw.githubusercontent.com/$REPO_OWNER/wolfssl-examples/examples_dev/Arduino/sketches/board_list_v5.8.2.txt"          -o "$WOLFSSL_EXAMPLES_DIRECTORY/board_list.txt"
+          curl -L "https://raw.githubusercontent.com/$REPO_OWNER/wolfssl-examples/master/Arduino/sketches/board_list_v5.8.2.txt"          -o "$WOLFSSL_EXAMPLES_DIRECTORY/board_list.txt"
 
           # Check if the first line is "404: Not Found" - which would indicate the curl path above is bad.
           FILE="$WOLFSSL_EXAMPLES_DIRECTORY/board_list.txt"
@@ -254,7 +254,7 @@ jobs:
               exit 1
           fi
 
-          curl -L "https://raw.githubusercontent.com/$REPO_OWNER/wolfssl-examples/examples_dev/Arduino/sketches/compile-all-examples.sh" -o "$WOLFSSL_EXAMPLES_DIRECTORY/compile-all-examples.sh"
+          curl -L "https://raw.githubusercontent.com/$REPO_OWNER/wolfssl-examples/master/Arduino/sketches/compile-all-examples.sh" -o "$WOLFSSL_EXAMPLES_DIRECTORY/compile-all-examples.sh"
 
           # Check if the first line is "404: Not Found" - which would indicate the curl path above is bad.
           FILE="$WOLFSSL_EXAMPLES_DIRECTORY/compile-all-examples.sh"
