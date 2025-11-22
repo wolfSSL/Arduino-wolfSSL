@@ -6,7 +6,7 @@
  *
  * wolfSSL is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * wolfSSL is distributed in the hope that it will be useful,
@@ -39,6 +39,18 @@ Tested with:
 /* If you have a private include, define it here, otherwise edit WiFi params */
 /* #define MY_PRIVATE_CONFIG "/workspace/my_private_config.h" */
 
+#if defined(ARDUINO) && defined(ESP8266)
+    #warning "This example is not yet supported on Arduino ESP8266"
+#endif
+
+#if defined(DEBUG_WOLFSSL)
+    /* Optionally enabled verbose wolfSSL debugging */
+    #define DEBUG_WOLFSSL_MESSAGES_ON
+#else
+    /* DEBUG_WOLFSSL needs to be enabled */
+    #undef DEBUG_WOLFSSL_MESSAGES_ON
+#endif
+
 /* set REPEAT_CONNECTION to a non-zero value to continually run the example. */
 #define REPEAT_CONNECTION 1
 
@@ -68,12 +80,12 @@ Tested with:
     /* the /workspace directory may contain a private config
      * excluded from GitHub with items such as WiFi passwords */
     #include MY_PRIVATE_CONFIG
-    static const char ssid[]     PROGMEM  = MY_ARDUINO_WIFI_SSID;
-    static const char password[] PROGMEM  = MY_ARDUINO_WIFI_PASSWORD;
+    static const char ssid[]     PROGMEM = MY_ARDUINO_WIFI_SSID;
+    static const char password[] PROGMEM = MY_ARDUINO_WIFI_PASSWORD;
 #else
     /* when using WiFi capable boards: */
-    static const char ssid[]     PROGMEM  = "your_SSID";
-    static const char password[] PROGMEM  = "your_PASSWORD";
+    static const char ssid[]     PROGMEM = "your_SSID";
+    static const char password[] PROGMEM = "your_PASSWORD";
 #endif
 
 #define BROADCAST_ADDRESS "255.255.255.255"
@@ -132,6 +144,10 @@ Tested with:
 #elif defined(ESP8266)
     #define USING_WIFI
     #include <ESP8266WiFi.h>
+    /* Ensure the F() flash macro is defined */
+    #ifndef F
+        #define F
+    #endif
     WiFiClient client;
     WiFiServer server(WOLFSSL_PORT);
 #elif defined(ARDUINO_SAM_DUE)
@@ -140,7 +156,12 @@ Tested with:
     /* Needs "Ethernet by Various" library to be installed. Tested with V2.0.2 */
     #include <Ethernet.h>
     EthernetClient client;
-    EthernetClient server(WOLFSSL_PORT);
+    EthernetServer server(WOLFSSL_PORT);
+#elif defined(ARDUINO_AVR_ETHERNET) || defined(ARDUINO_AVR_LEONARDO_ETH)
+    /* Boards such as arduino:avr:ethernet and arduino:avr:leonardoeth */
+    #include <Ethernet.h>
+    EthernetClient client;
+    EthernetServer server(WOLFSSL_PORT);
 #elif defined(ARDUINO_SAMD_NANO_33_IOT)
     #define USING_WIFI
     #include <SPI.h>
@@ -153,6 +174,36 @@ Tested with:
     #include <WiFiNINA.h>
     WiFiClient client;
     WiFiServer server(WOLFSSL_PORT);
+#elif defined(ARDUINO_SAMD_TIAN)
+    #include <Bridge.h>
+    #include <HttpClient.h>
+    HttpClient client;
+    /*  Arduino Tian does not support network shields like the standard Ethernet or Wi-Fi shields. */
+    #error "HttpClient cannot be used for this example"
+#elif defined(ARDUINO_PORTENTA_X8)
+    /* The Portenta is a Linux device. See wolfSSL examples:
+     * https://github.com/wolfSSL/wolfssl/tree/master/examples
+     * By default Serial is disabled and mapped to ErrorSerial */
+    #include <SerialRPC.h>
+
+    /* ----No - network placeholders(compile - only) ---- */
+    #include <IPAddress.h>
+    struct X8NoNetClient {
+        int write(const uint8_t*, size_t) { return -1; }
+        int available() { return 0; }
+        int read() { return -1; }
+        void stop() {}
+        bool connected() { return false; }
+        IPAddress remoteIP() { return IPAddress(0, 0, 0, 0); }
+    };
+    struct X8NoNetServer {
+        explicit X8NoNetServer(uint16_t) {}
+        void begin() {}
+        X8NoNetClient available() { return X8NoNetClient(); }
+    };
+
+    X8NoNetClient client;
+    X8NoNetServer server(WOLFSSL_PORT);
 #elif defined(USING_WIFI)
     #define USING_WIFI
     #include <WiFi.h>
@@ -206,7 +257,10 @@ static char errBuf[80];
 static int EthernetSend(WOLFSSL* ssl, char* msg, int sz, void* ctx);
 static int EthernetReceive(WOLFSSL* ssl, char* reply, int sz, void* ctx);
 static int reconnect = RECONNECT_ATTEMPTS;
+#if 0
+/* optional showPeerEx, currently disabled  */
 static int lng_index PROGMEM = 0; /* 0 = English */
+#endif
 
 #if defined(__arm__)
     #include <malloc.h>
@@ -463,7 +517,8 @@ int setup_network(void) {
 /*****************************************************************************/
 /* Arduino setup_wolfssl()                                                   */
 /*****************************************************************************/
-int setup_wolfssl(void) {
+int setup_wolfssl(void)
+{
     int ret = 0;
     WOLFSSL_METHOD* method;
 
@@ -483,8 +538,14 @@ int setup_wolfssl(void) {
 #endif
 
 #if defined(DEBUG_WOLFSSL)
-    wolfSSL_Debugging_ON();
-    Serial.println(F("wolfSSL Debugging is On!"));
+    Serial.println(F("wolfSSL Debugging is available! (DEBUG_WOLFSSL)"));
+    #if defined(DEBUG_WOLFSSL_MESSAGES_ON)
+        Serial.println(F("Enabling verbose messages wolfSSL_Debugging_ON"));
+        wolfSSL_Debugging_ON();
+    #else
+        Serial.println(F("Enable verbose messages with wolfSSL_Debugging_ON"));
+        Serial.println(F("or define DEBUG_WOLFSSL_MESSAGES_ON"));
+    #endif
 #else
     Serial.println(F("wolfSSL Debugging is Off! (enable with DEBUG_WOLFSSL)"));
 #endif
@@ -510,6 +571,7 @@ int setup_wolfssl(void) {
      * It is best on embedded devices to choose a TLS session cache size. */
 #endif
 
+     /* Initialize wolfSSL before assigning ctx */
     ret = wolfSSL_Init();
     if (ret == WOLFSSL_SUCCESS) {
         Serial.println("Successfully called wolfSSL_Init");
@@ -544,7 +606,8 @@ int setup_wolfssl(void) {
 /*****************************************************************************/
 /* Arduino setup_certificates()                                              */
 /*****************************************************************************/
-int setup_certificates(void) {
+int setup_certificates(void)
+{
     int ret = 0;
 
     Serial.println(F("Initializing certificates..."));
@@ -594,7 +657,8 @@ int setup_certificates(void) {
 /* Arduino setup()                                                           */
 /*****************************************************************************/
 /*****************************************************************************/
-void setup(void) {
+void setup(void)
+{
     int i = 0;
     Serial.begin(SERIAL_BAUD);
     while (!Serial && (i < 10)) {
@@ -725,7 +789,7 @@ int error_check_ssl(WOLFSSL* ssl, int this_ret, bool halt_on_error,
     }
 
     return err;
-}
+} /* error_check_ssl */
 
 /*****************************************************************************/
 /*****************************************************************************/

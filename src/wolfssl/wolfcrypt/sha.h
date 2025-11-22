@@ -48,6 +48,15 @@
     #include "fsl_dcp.h"
 #endif
 
+#if defined(WOLFSSL_PSOC6_CRYPTO)
+    #include <wolfssl/wolfcrypt/port/cypress/psoc6_crypto.h>
+
+    #include "cy_crypto_core_sha.h"
+    #include "cy_device_headers.h"
+    #include "cy_crypto_common.h"
+    #include "cy_crypto_core.h"
+#endif
+
 #ifdef __cplusplus
     extern "C" {
 #endif
@@ -113,7 +122,7 @@ enum {
     #include "wolfssl/wolfcrypt/port/Renesas/renesas-rx64-hw-crypt.h"
 #elif defined(WOLFSSL_RENESAS_RSIP) && \
     !defined(NO_WOLFSSL_RENESAS_FSPSM_HASH)
-    #include "wolfssl/wolfcrypt/port/Renesas/renesas-fspsm-crypt.h"
+    #include "wolfssl/wolfcrypt/port/Renesas/renesas_fspsm_internal.h"
 #else
 
 #if defined(WOLFSSL_SE050) && defined(WOLFSSL_SE050_HASH)
@@ -141,6 +150,9 @@ struct wc_Sha {
     dcp_hash_ctx_t ctx;
 #elif defined(WOLFSSL_HAVE_PSA) && !defined(WOLFSSL_PSA_NO_HASH)
     psa_hash_operation_t psa_ctx;
+#elif defined(PSOC6_HASH_SHA1)
+    cy_stc_crypto_sha_state_t hash_state;
+    cy_stc_crypto_v2_sha1_buffers_t sha_buffers;
 #else
     word32  buffLen;   /* in bytes          */
     word32  loLen;     /* length in bytes   */
