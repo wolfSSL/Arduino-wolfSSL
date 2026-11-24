@@ -1,6 +1,6 @@
 /* fe_448.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -26,7 +26,10 @@
 
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
-#if defined(HAVE_CURVE448) || defined(HAVE_ED448)
+/* under WOLF_CRYPTO_CB_ONLY_CURVE448 the callback device does all the field
+ * math, so curve448 does not pull this file in on its own */
+#if (defined(HAVE_CURVE448) && !defined(WOLF_CRYPTO_CB_ONLY_CURVE448)) || \
+    defined(HAVE_ED448)
 
 #include <wolfssl/wolfcrypt/fe_448.h>
 
@@ -66,7 +69,34 @@ void fe448_norm(word8* a)
     for (i = 0; i < 56; i++) {
         if ((i == 0) || (i == 28)) o += c;
         o += a[i];
-        a[i] = (word8)o;
+        a[i] = WC_OCTET(o);
+        o >>= 8;
+    }
+}
+
+/* Reduce the carry out of the top of a field element back in.
+ *
+ * r  [in]  Field element in range 0..2^448-1.
+ * c  [in]  Carry out of the element: multiples of 2^448.
+ */
+static void fe448_fold_carry(word8* r, sword32 c)
+{
+    int i;
+    sword32 o = 0;
+
+    for (i = 0; i < 56; i++) {
+        if ((i == 0) || (i == 28)) o += c;
+        o += r[i];
+        r[i] = WC_OCTET(o);
+        o >>= 8;
+    }
+
+    c = o;
+    o = 0;
+    for (i = 0; i < 56; i++) {
+        if ((i == 0) || (i == 28)) o += c;
+        o += r[i];
+        r[i] = WC_OCTET(o);
         o >>= 8;
     }
 }
@@ -115,21 +145,15 @@ void fe448_add(word8* r, const word8* a, const word8* b)
 {
     int i;
     sword16 c = 0;
-    sword16 o = 0;
 
     for (i = 0; i < 56; i++) {
         c += a[i];
         c += b[i];
-        r[i] = (word8)c;
+        r[i] = WC_OCTET(c);
         c >>= 8;
     }
 
-    for (i = 0; i < 56; i++) {
-        if ((i == 0) || (i == 28)) o += c;
-        o += r[i];
-        r[i] = (word8)o;
-        o >>= 8;
-    }
+    fe448_fold_carry(r, c);
 }
 
 /* Subtract a field element from another. r = (a - b) mod (2^448 - 2^224 - 1)
@@ -142,7 +166,6 @@ void fe448_sub(word8* r, const word8* a, const word8* b)
 {
     int i;
     sword16 c = 0;
-    sword16 o = 0;
 
     for (i = 0; i < 56; i++) {
         if (i == 28)
@@ -151,16 +174,11 @@ void fe448_sub(word8* r, const word8* a, const word8* b)
             c += 0x1fe;
         c += a[i];
         c -= b[i];
-        r[i] = (word8)c;
+        r[i] = WC_OCTET(c);
         c >>= 8;
     }
 
-    for (i = 0; i < 56; i++) {
-        if ((i == 0) || (i == 28)) o += c;
-        o += r[i];
-        r[i] = (word8)o;
-        o >>= 8;
-    }
+    fe448_fold_carry(r, c);
 }
 
 /* Multiply a field element by 39081. r = (39081 * a) mod (2^448 - 2^224 - 1)
@@ -172,20 +190,14 @@ void fe448_mul39081(word8* r, const word8* a)
 {
     int i;
     sword32 c = 0;
-    sword32 o = 0;
 
     for (i = 0; i < 56; i++) {
         c += a[i] * (sword32)39081;
-        r[i] = (word8)c;
+        r[i] = WC_OCTET(c);
         c >>= 8;
     }
 
-    for (i = 0; i < 56; i++) {
-        if ((i == 0) || (i == 28)) o += c;
-        o += r[i];
-        r[i] = (word8)o;
-        o >>= 8;
-    }
+    fe448_fold_carry(r, c);
 }
 
 /* Multiply two field elements. r = (a * b) mod (2^448 - 2^224 - 1)
@@ -198,7 +210,7 @@ void fe448_mul(word8* r, const word8* a, const word8* b)
 {
     int i, k;
     sword32 c = 0;
-    sword16 o = 0, cc = 0;
+    sword16 o = 0;
     word8 t[112];
 
     for (k = 0; k < 56; k++) {
@@ -206,7 +218,7 @@ void fe448_mul(word8* r, const word8* a, const word8* b)
         for (; i <= k; i++) {
             c += (sword32)a[i] * b[k - i];
         }
-        t[k] = (word8)c;
+        t[k] = WC_OCTET(c);
         c >>= 8;
     }
     for (; k < 111; k++) {
@@ -214,16 +226,16 @@ void fe448_mul(word8* r, const word8* a, const word8* b)
         for (; i < 56; i++) {
             c += (sword32)a[i] * b[k - i];
         }
-        t[k] = (word8)c;
+        t[k] = WC_OCTET(c);
         c >>= 8;
     }
-    t[k] = (word8)c;
+    t[k] = WC_OCTET(c);
 
     for (i = 0; i < 28; i++) {
         o += t[i];
         o += t[i + 56];
         o += t[i + 84];
-        r[i] = (word8)o;
+        r[i] = WC_OCTET(o);
         o >>= 8;
     }
     for (i = 28; i < 56; i++) {
@@ -231,15 +243,10 @@ void fe448_mul(word8* r, const word8* a, const word8* b)
         o += t[i + 56];
         o += t[i + 28];
         o += t[i + 56];
-        r[i] = (word8)o;
+        r[i] = WC_OCTET(o);
         o >>= 8;
     }
-    for (i = 0; i < 56; i++) {
-        if ((i == 0) || (i == 28)) cc += o;
-        cc += r[i];
-        r[i] = (word8)cc;
-        cc >>= 8;
-    }
+    fe448_fold_carry(r, o);
 }
 
 /* Square a field element. r = (a * a) mod (2^448 - 2^224 - 1)
@@ -252,7 +259,7 @@ void fe448_sqr(word8* r, const word8* a)
     int i, k;
     sword32 c = 0;
     sword32 p;
-    sword16 o = 0, cc = 0;
+    sword16 o = 0;
     word8 t[112];
 
     for (k = 0; k < 56; k++) {
@@ -265,7 +272,7 @@ void fe448_sqr(word8* r, const word8* a)
                 p *= 2;
             c += p;
         }
-        t[k] = (word8)c;
+        t[k] = WC_OCTET(c);
         c >>= 8;
     }
     for (; k < 111; k++) {
@@ -278,16 +285,16 @@ void fe448_sqr(word8* r, const word8* a)
                 p *= 2;
             c += p;
         }
-        t[k] = (word8)c;
+        t[k] = WC_OCTET(c);
         c >>= 8;
     }
-    t[k] = (word8)c;
+    t[k] = WC_OCTET(c);
 
     for (i = 0; i < 28; i++) {
         o += t[i];
         o += t[i + 56];
         o += t[i + 84];
-        r[i] = (word8)o;
+        r[i] = WC_OCTET(o);
         o >>= 8;
     }
     for (i = 28; i < 56; i++) {
@@ -295,15 +302,10 @@ void fe448_sqr(word8* r, const word8* a)
         o += t[i + 56];
         o += t[i + 28];
         o += t[i + 56];
-        r[i] = (word8)o;
+        r[i] = WC_OCTET(o);
         o >>= 8;
     }
-    for (i = 0; i < 56; i++) {
-        if ((i == 0) || (i == 28)) cc += o;
-        cc += r[i];
-        r[i] = (word8)cc;
-        cc >>= 8;
-    }
+    fe448_fold_carry(r, o);
     fe448_norm(r);
 }
 
@@ -423,7 +425,6 @@ void fe448_neg(word8* r, const word8* a)
 {
     int i;
     sword16 c = 0;
-    sword16 o = 0;
 
     for (i = 0; i < 56; i++) {
         if (i == 28)
@@ -431,16 +432,11 @@ void fe448_neg(word8* r, const word8* a)
         else
             c += 0x1fe;
         c -= a[i];
-        r[i] = (word8)c;
+        r[i] = WC_OCTET(c);
         c >>= 8;
     }
 
-    for (i = 0; i < 56; i++) {
-        if ((i == 0) || (i == 28)) o += c;
-        o += r[i];
-        r[i] = (word8)o;
-        o >>= 8;
-    }
+    fe448_fold_carry(r, c);
 }
 
 /* Raise field element to (p-3) / 4: 2^446 - 2^222 - 1
@@ -1126,6 +1122,7 @@ int curve448(byte* r, const byte* n, const byte* a)
         fe448_reduce(x3);
         fe448_sqr(x3, x3);
         fe448_sub(z3, z3, t1);
+        fe448_reduce(z3);
         fe448_sqr(z3, z3);
         fe448_mul(z3, z3, x1);
         fe448_sub(t1, t0, x2);
@@ -2302,6 +2299,7 @@ int curve448(byte* r, const byte* n, const byte* a)
         fe448_reduce(x3);
         fe448_sqr(x3, x3);
         fe448_sub(z3, z3, t1);
+        fe448_reduce(z3);
         fe448_sqr(z3, z3);
         fe448_mul(z3, z3, x1);
         fe448_sub(t1, t0, x2);
@@ -2508,4 +2506,4 @@ void fe448_cmov(sword32* a, const sword32* b, int c)
 #endif /* HAVE_ED448 */
 #endif
 
-#endif /* HAVE_CURVE448 || HAVE_ED448 */
+#endif /* (HAVE_CURVE448 && !WOLF_CRYPTO_CB_ONLY_CURVE448) || HAVE_ED448 */

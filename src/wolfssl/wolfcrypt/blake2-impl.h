@@ -12,7 +12,7 @@
 */
 /* blake2-impl.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -40,10 +40,11 @@
 
 static WC_INLINE word32 load32( const void *src )
 {
-#if defined(LITTLE_ENDIAN_ORDER)
-  return *( word32 * )( src );
+#if defined(LITTLE_ENDIAN_ORDER) && \
+    (!defined(WOLFSSL_GENERAL_ALIGNMENT) || (WOLFSSL_GENERAL_ALIGNMENT == 0))
+  return *( const word32 * )( src );
 #else
-  const byte *p = ( byte * )src;
+  const byte *p = ( const byte * )src;
   word32 w = *p++;
   w |= ( word32 )( *p++ ) <<  8;
   w |= ( word32 )( *p++ ) << 16;
@@ -54,10 +55,11 @@ static WC_INLINE word32 load32( const void *src )
 
 static WC_INLINE word64 load64( const void *src )
 {
-#if defined(LITTLE_ENDIAN_ORDER)
-  return *( word64 * )( src );
+#if defined(LITTLE_ENDIAN_ORDER) && \
+    (!defined(WOLFSSL_GENERAL_ALIGNMENT) || (WOLFSSL_GENERAL_ALIGNMENT == 0))
+  return *( const word64 * )( src );
 #else
-  const byte *p = ( byte * )src;
+  const byte *p = ( const byte * )src;
   word64 w = *p++;
   w |= ( word64 )( *p++ ) <<  8;
   w |= ( word64 )( *p++ ) << 16;
@@ -72,7 +74,8 @@ static WC_INLINE word64 load64( const void *src )
 
 static WC_INLINE void store32( void *dst, word32 w )
 {
-#if defined(LITTLE_ENDIAN_ORDER)
+#if defined(LITTLE_ENDIAN_ORDER) && \
+    (!defined(WOLFSSL_GENERAL_ALIGNMENT) || (WOLFSSL_GENERAL_ALIGNMENT == 0))
   *( word32 * )( dst ) = w;
 #else
   byte *p = ( byte * )dst;
@@ -85,7 +88,8 @@ static WC_INLINE void store32( void *dst, word32 w )
 
 static WC_INLINE void store64( void *dst, word64 w )
 {
-#if defined(LITTLE_ENDIAN_ORDER) && !defined(WOLFSSL_GENERAL_ALIGNMENT)
+#if defined(LITTLE_ENDIAN_ORDER) && \
+    (!defined(WOLFSSL_GENERAL_ALIGNMENT) || (WOLFSSL_GENERAL_ALIGNMENT == 0))
   *( word64 * )( dst ) = w;
 #else
   byte *p = ( byte * )dst;

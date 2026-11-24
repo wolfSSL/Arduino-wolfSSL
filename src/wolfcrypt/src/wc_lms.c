@@ -1,6 +1,6 @@
 /* wc_lms.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -19,16 +19,42 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
+#define WC_FIPS_LL_CRYPTO
+#define _WC_BUILDING_WC_LMS_C
+
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
-#if defined(WOLFSSL_HAVE_LMS) && defined(WOLFSSL_WC_LMS)
+#if defined(WOLFSSL_HAVE_LMS)
+
+#if FIPS_VERSION3_GE(7,0,0)
+    /* the letter d is skipped, codespell rejects it; do not reuse it */
+    #ifdef USE_WINDOWS_API
+        #pragma code_seg(".fipsA$ne")
+        #pragma const_seg(".fipsB$ne")
+    #endif
+#endif
+
 #include <wolfssl/wolfcrypt/wc_lms.h>
+
+#if FIPS_VERSION3_GE(7,0,0)
+    const unsigned int wolfCrypt_FIPS_lms_ro_sanity[2] =
+                                                     { 0x1a2b3c4d, 0x00000022 };
+    int wolfCrypt_FIPS_LMS_sanity(void)
+    {
+        return 0;
+    }
+#endif
+#include <wolfssl/wolfcrypt/hash.h>
 
 #ifdef NO_INLINE
     #include <wolfssl/wolfcrypt/misc.h>
 #else
     #define WOLFSSL_MISC_INCLUDED
     #include <wolfcrypt/src/misc.c>
+#endif
+
+#ifdef WOLF_CRYPTO_CB
+    #include <wolfssl/wolfcrypt/cryptocb.h>
 #endif
 
 
@@ -88,10 +114,10 @@
  * @param [in] t   LMS type.
  * @param [in] t2  LM-OTS type.
  */
-#define LMS_PARAMS(l, h, w, wb, t, t2, hLen)                \
-    { l, h, w, LMS_LS(w, wb), LMS_P(w, wb, hLen), t, t2,    \
-      LMS_PARAMS_SIG_LEN(l, h, LMS_P(w, wb, hLen), hLen),   \
-      (hLen), LMS_PARAMS_CACHE(h) }
+#define LMS_PARAMS(l, h, w, wb, t, t2, hLen)                        \
+    { l, h, w, LMS_LS(w, wb), LMS_P(w, wb, hLen), t, t2,            \
+      (hLen), LMS_PARAMS_SIG_LEN(l, h, LMS_P(w, wb, hLen), hLen),   \
+      LMS_PARAMS_CACHE(h) }
 
 
 /* Initialize the working state for LMS operations.
@@ -109,12 +135,25 @@ static int wc_lmskey_state_init(LmsState* state, const LmsParams* params)
     /* Keep a reference to the parameters for use in operations. */
     state->params = params;
 
+#ifdef WOLFSSL_LMS_SHAKE256
+    if (LMS_IS_SHAKE(params->lmOtsType)) {
+        ret = wc_InitShake256(LMS_STATE_SHAKE(state), NULL, INVALID_DEVID);
+        if (ret == 0) {
+            ret = wc_InitShake256(LMS_STATE_SHAKE_K(state), NULL, INVALID_DEVID);
+            if (ret != 0) {
+                wc_Shake256_Free(LMS_STATE_SHAKE(state));
+            }
+        }
+        return ret;
+    }
+#endif
+
     /* Initialize the two hash algorithms. */
-    ret = wc_InitSha256(&state->hash);
+    ret = wc_InitSha256(LMS_STATE_HASH(state));
     if (ret == 0) {
-        ret = wc_InitSha256(&state->hash_k);
+        ret = wc_InitSha256(LMS_STATE_HASH_K(state));
         if (ret != 0) {
-            wc_Sha256Free(&state->hash);
+            wc_Sha256Free(LMS_STATE_HASH(state));
         }
     }
 
@@ -127,17 +166,21 @@ static int wc_lmskey_state_init(LmsState* state, const LmsParams* params)
  */
 static void wc_lmskey_state_free(LmsState* state)
 {
-    wc_Sha256Free(&state->hash_k);
-    wc_Sha256Free(&state->hash);
+#ifdef WOLFSSL_LMS_SHAKE256
+    if (LMS_IS_SHAKE(state->params->lmOtsType)) {
+        wc_Shake256_Free(LMS_STATE_SHAKE_K(state));
+        wc_Shake256_Free(LMS_STATE_SHAKE(state));
+        return;
+    }
+#endif
+    wc_Sha256Free(LMS_STATE_HASH_K(state));
+    wc_Sha256Free(LMS_STATE_HASH(state));
 }
 
 /* Supported LMS parameters. */
 static const wc_LmsParamsMap wc_lms_map[] = {
 #ifndef WOLFSSL_NO_LMS_SHA256_256
 #if LMS_MAX_HEIGHT >= 15
-    { WC_LMS_PARM_NONE     , "LMS_NONE"         ,
-      LMS_PARAMS(1, 15, 2, 1, LMS_SHA256_M32_H15, LMOTS_SHA256_N32_W2,
-                 WC_SHA256_DIGEST_SIZE) },
     { WC_LMS_PARM_L1_H15_W2, "LMS/HSS L1_H15_W2",
       LMS_PARAMS(1, 15, 2, 1, LMS_SHA256_M32_H15, LMOTS_SHA256_N32_W2,
                  WC_SHA256_DIGEST_SIZE) },
@@ -276,6 +319,35 @@ static const wc_LmsParamsMap wc_lms_map[] = {
                  WC_SHA256_DIGEST_SIZE) },
 #endif
 #endif
+#if LMS_MAX_HEIGHT >= 25
+    { WC_LMS_PARM_L1_H25_W1 , "LMS/HSS_L1_H25_W1",
+      LMS_PARAMS(1, 25, 1, 1, LMS_SHA256_M32_H25, LMOTS_SHA256_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_L1_H25_W2 , "LMS/HSS_L1_H25_W2",
+      LMS_PARAMS(1, 25, 2, 1, LMS_SHA256_M32_H25, LMOTS_SHA256_N32_W2,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_L1_H25_W4 , "LMS/HSS_L1_H25_W4",
+      LMS_PARAMS(1, 25, 4, 2, LMS_SHA256_M32_H25, LMOTS_SHA256_N32_W4,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_L1_H25_W8 , "LMS/HSS_L1_H25_W8",
+      LMS_PARAMS(1, 25, 8, 3, LMS_SHA256_M32_H25, LMOTS_SHA256_N32_W8,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 10
+    { WC_LMS_PARM_L1_H10_W1 , "LMS/HSS_L1_H10_W1",
+      LMS_PARAMS(1, 10, 1, 1, LMS_SHA256_M32_H10, LMOTS_SHA256_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 15
+    { WC_LMS_PARM_L1_H15_W1 , "LMS/HSS_L1_H15_W1",
+      LMS_PARAMS(1, 15, 1, 1, LMS_SHA256_M32_H15, LMOTS_SHA256_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 20
+    { WC_LMS_PARM_L1_H20_W1 , "LMS/HSS_L1_H20_W1",
+      LMS_PARAMS(1, 20, 1, 1, LMS_SHA256_M32_H20, LMOTS_SHA256_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
 #endif /* !WOLFSSL_NO_LMS_SHA256_256 */
 
 #ifdef WOLFSSL_LMS_SHA256_192
@@ -356,7 +428,191 @@ static const wc_LmsParamsMap wc_lms_map[] = {
       LMS_PARAMS(1, 20, 8, 4, LMS_SHA256_M24_H20, LMOTS_SHA256_N24_W8,
                  WC_SHA256_192_DIGEST_SIZE) },
 #endif
+#if LMS_MAX_HEIGHT >= 25
+    { WC_LMS_PARM_SHA256_192_L1_H25_W1 , "LMS/HSS_SHA256/192_L1_H25_W1",
+      LMS_PARAMS(1, 25, 1, 2, LMS_SHA256_M24_H25, LMOTS_SHA256_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHA256_192_L1_H25_W2 , "LMS/HSS_SHA256/192_L1_H25_W2",
+      LMS_PARAMS(1, 25, 2, 2, LMS_SHA256_M24_H25, LMOTS_SHA256_N24_W2,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHA256_192_L1_H25_W4 , "LMS/HSS_SHA256/192_L1_H25_W4",
+      LMS_PARAMS(1, 25, 4, 3, LMS_SHA256_M24_H25, LMOTS_SHA256_N24_W4,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHA256_192_L1_H25_W8 , "LMS/HSS_SHA256/192_L1_H25_W8",
+      LMS_PARAMS(1, 25, 8, 4, LMS_SHA256_M24_H25, LMOTS_SHA256_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 10
+    { WC_LMS_PARM_SHA256_192_L1_H10_W1 , "LMS/HSS_SHA256/192_L1_H10_W1",
+      LMS_PARAMS(1, 10, 1, 2, LMS_SHA256_M24_H10, LMOTS_SHA256_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 15
+    { WC_LMS_PARM_SHA256_192_L1_H15_W1 , "LMS/HSS_SHA256/192_L1_H15_W1",
+      LMS_PARAMS(1, 15, 1, 2, LMS_SHA256_M24_H15, LMOTS_SHA256_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHA256_192_L1_H15_W8 , "LMS/HSS_SHA256/192_L1_H15_W8",
+      LMS_PARAMS(1, 15, 8, 4, LMS_SHA256_M24_H15, LMOTS_SHA256_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 20
+    { WC_LMS_PARM_SHA256_192_L1_H20_W1 , "LMS/HSS_SHA256/192_L1_H20_W1",
+      LMS_PARAMS(1, 20, 1, 2, LMS_SHA256_M24_H20, LMOTS_SHA256_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
 #endif /* WOLFSSL_LMS_SHA256_192 */
+
+#ifdef WOLFSSL_LMS_SHAKE256
+#ifndef WOLFSSL_NO_LMS_SHAKE256_256
+    /* SHAKE256/256 L1 H5 */
+    { WC_LMS_PARM_SHAKE_L1_H5_W1 , "LMS/HSS_SHAKE256/256_L1_H5_W1",
+      LMS_PARAMS(1,  5, 1, 1, LMS_SHAKE_M32_H5 , LMOTS_SHAKE_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H5_W2 , "LMS/HSS_SHAKE256/256_L1_H5_W2",
+      LMS_PARAMS(1,  5, 2, 1, LMS_SHAKE_M32_H5 , LMOTS_SHAKE_N32_W2,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H5_W4 , "LMS/HSS_SHAKE256/256_L1_H5_W4",
+      LMS_PARAMS(1,  5, 4, 2, LMS_SHAKE_M32_H5 , LMOTS_SHAKE_N32_W4,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H5_W8 , "LMS/HSS_SHAKE256/256_L1_H5_W8",
+      LMS_PARAMS(1,  5, 8, 3, LMS_SHAKE_M32_H5 , LMOTS_SHAKE_N32_W8,
+                 WC_SHA256_DIGEST_SIZE) },
+#if LMS_MAX_HEIGHT >= 10
+    /* SHAKE256/256 L1 H10 */
+    { WC_LMS_PARM_SHAKE_L1_H10_W1 , "LMS/HSS_SHAKE256/256_L1_H10_W1",
+      LMS_PARAMS(1, 10, 1, 1, LMS_SHAKE_M32_H10, LMOTS_SHAKE_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H10_W2 , "LMS/HSS_SHAKE256/256_L1_H10_W2",
+      LMS_PARAMS(1, 10, 2, 1, LMS_SHAKE_M32_H10, LMOTS_SHAKE_N32_W2,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H10_W4 , "LMS/HSS_SHAKE256/256_L1_H10_W4",
+      LMS_PARAMS(1, 10, 4, 2, LMS_SHAKE_M32_H10, LMOTS_SHAKE_N32_W4,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H10_W8 , "LMS/HSS_SHAKE256/256_L1_H10_W8",
+      LMS_PARAMS(1, 10, 8, 3, LMS_SHAKE_M32_H10, LMOTS_SHAKE_N32_W8,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 15
+    /* SHAKE256/256 L1 H15 */
+    { WC_LMS_PARM_SHAKE_L1_H15_W1 , "LMS/HSS_SHAKE256/256_L1_H15_W1",
+      LMS_PARAMS(1, 15, 1, 1, LMS_SHAKE_M32_H15, LMOTS_SHAKE_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H15_W2 , "LMS/HSS_SHAKE256/256_L1_H15_W2",
+      LMS_PARAMS(1, 15, 2, 1, LMS_SHAKE_M32_H15, LMOTS_SHAKE_N32_W2,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H15_W4 , "LMS/HSS_SHAKE256/256_L1_H15_W4",
+      LMS_PARAMS(1, 15, 4, 2, LMS_SHAKE_M32_H15, LMOTS_SHAKE_N32_W4,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H15_W8 , "LMS/HSS_SHAKE256/256_L1_H15_W8",
+      LMS_PARAMS(1, 15, 8, 3, LMS_SHAKE_M32_H15, LMOTS_SHAKE_N32_W8,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 20
+    /* SHAKE256/256 L1 H20 */
+    { WC_LMS_PARM_SHAKE_L1_H20_W1 , "LMS/HSS_SHAKE256/256_L1_H20_W1",
+      LMS_PARAMS(1, 20, 1, 1, LMS_SHAKE_M32_H20, LMOTS_SHAKE_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H20_W2 , "LMS/HSS_SHAKE256/256_L1_H20_W2",
+      LMS_PARAMS(1, 20, 2, 1, LMS_SHAKE_M32_H20, LMOTS_SHAKE_N32_W2,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H20_W4 , "LMS/HSS_SHAKE256/256_L1_H20_W4",
+      LMS_PARAMS(1, 20, 4, 2, LMS_SHAKE_M32_H20, LMOTS_SHAKE_N32_W4,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H20_W8 , "LMS/HSS_SHAKE256/256_L1_H20_W8",
+      LMS_PARAMS(1, 20, 8, 3, LMS_SHAKE_M32_H20, LMOTS_SHAKE_N32_W8,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 25
+    /* SHAKE256/256 L1 H25 */
+    { WC_LMS_PARM_SHAKE_L1_H25_W1 , "LMS/HSS_SHAKE256/256_L1_H25_W1",
+      LMS_PARAMS(1, 25, 1, 1, LMS_SHAKE_M32_H25, LMOTS_SHAKE_N32_W1,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H25_W2 , "LMS/HSS_SHAKE256/256_L1_H25_W2",
+      LMS_PARAMS(1, 25, 2, 1, LMS_SHAKE_M32_H25, LMOTS_SHAKE_N32_W2,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H25_W4 , "LMS/HSS_SHAKE256/256_L1_H25_W4",
+      LMS_PARAMS(1, 25, 4, 2, LMS_SHAKE_M32_H25, LMOTS_SHAKE_N32_W4,
+                 WC_SHA256_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE_L1_H25_W8 , "LMS/HSS_SHAKE256/256_L1_H25_W8",
+      LMS_PARAMS(1, 25, 8, 3, LMS_SHAKE_M32_H25, LMOTS_SHAKE_N32_W8,
+                 WC_SHA256_DIGEST_SIZE) },
+#endif
+#endif /* !WOLFSSL_NO_LMS_SHAKE256_256 */
+
+    /* SHAKE256/192 L1 H5 */
+    { WC_LMS_PARM_SHAKE192_L1_H5_W1 , "LMS/HSS_SHAKE256/192_L1_H5_W1",
+      LMS_PARAMS(1,  5, 1, 2, LMS_SHAKE_M24_H5 , LMOTS_SHAKE_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H5_W2 , "LMS/HSS_SHAKE256/192_L1_H5_W2",
+      LMS_PARAMS(1,  5, 2, 2, LMS_SHAKE_M24_H5 , LMOTS_SHAKE_N24_W2,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H5_W4 , "LMS/HSS_SHAKE256/192_L1_H5_W4",
+      LMS_PARAMS(1,  5, 4, 3, LMS_SHAKE_M24_H5 , LMOTS_SHAKE_N24_W4,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H5_W8 , "LMS/HSS_SHAKE256/192_L1_H5_W8",
+      LMS_PARAMS(1,  5, 8, 4, LMS_SHAKE_M24_H5 , LMOTS_SHAKE_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#if LMS_MAX_HEIGHT >= 10
+    /* SHAKE256/192 L1 H10 */
+    { WC_LMS_PARM_SHAKE192_L1_H10_W1 , "LMS/HSS_SHAKE256/192_L1_H10_W1",
+      LMS_PARAMS(1, 10, 1, 2, LMS_SHAKE_M24_H10, LMOTS_SHAKE_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H10_W2 , "LMS/HSS_SHAKE256/192_L1_H10_W2",
+      LMS_PARAMS(1, 10, 2, 2, LMS_SHAKE_M24_H10, LMOTS_SHAKE_N24_W2,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H10_W4 , "LMS/HSS_SHAKE256/192_L1_H10_W4",
+      LMS_PARAMS(1, 10, 4, 3, LMS_SHAKE_M24_H10, LMOTS_SHAKE_N24_W4,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H10_W8 , "LMS/HSS_SHAKE256/192_L1_H10_W8",
+      LMS_PARAMS(1, 10, 8, 4, LMS_SHAKE_M24_H10, LMOTS_SHAKE_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 15
+    /* SHAKE256/192 L1 H15 */
+    { WC_LMS_PARM_SHAKE192_L1_H15_W1 , "LMS/HSS_SHAKE256/192_L1_H15_W1",
+      LMS_PARAMS(1, 15, 1, 2, LMS_SHAKE_M24_H15, LMOTS_SHAKE_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H15_W2 , "LMS/HSS_SHAKE256/192_L1_H15_W2",
+      LMS_PARAMS(1, 15, 2, 2, LMS_SHAKE_M24_H15, LMOTS_SHAKE_N24_W2,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H15_W4 , "LMS/HSS_SHAKE256/192_L1_H15_W4",
+      LMS_PARAMS(1, 15, 4, 3, LMS_SHAKE_M24_H15, LMOTS_SHAKE_N24_W4,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H15_W8 , "LMS/HSS_SHAKE256/192_L1_H15_W8",
+      LMS_PARAMS(1, 15, 8, 4, LMS_SHAKE_M24_H15, LMOTS_SHAKE_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 20
+    /* SHAKE256/192 L1 H20 */
+    { WC_LMS_PARM_SHAKE192_L1_H20_W1 , "LMS/HSS_SHAKE256/192_L1_H20_W1",
+      LMS_PARAMS(1, 20, 1, 2, LMS_SHAKE_M24_H20, LMOTS_SHAKE_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H20_W2 , "LMS/HSS_SHAKE256/192_L1_H20_W2",
+      LMS_PARAMS(1, 20, 2, 2, LMS_SHAKE_M24_H20, LMOTS_SHAKE_N24_W2,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H20_W4 , "LMS/HSS_SHAKE256/192_L1_H20_W4",
+      LMS_PARAMS(1, 20, 4, 3, LMS_SHAKE_M24_H20, LMOTS_SHAKE_N24_W4,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H20_W8 , "LMS/HSS_SHAKE256/192_L1_H20_W8",
+      LMS_PARAMS(1, 20, 8, 4, LMS_SHAKE_M24_H20, LMOTS_SHAKE_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#if LMS_MAX_HEIGHT >= 25
+    /* SHAKE256/192 L1 H25 */
+    { WC_LMS_PARM_SHAKE192_L1_H25_W1 , "LMS/HSS_SHAKE256/192_L1_H25_W1",
+      LMS_PARAMS(1, 25, 1, 2, LMS_SHAKE_M24_H25, LMOTS_SHAKE_N24_W1,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H25_W2 , "LMS/HSS_SHAKE256/192_L1_H25_W2",
+      LMS_PARAMS(1, 25, 2, 2, LMS_SHAKE_M24_H25, LMOTS_SHAKE_N24_W2,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H25_W4 , "LMS/HSS_SHAKE256/192_L1_H25_W4",
+      LMS_PARAMS(1, 25, 4, 3, LMS_SHAKE_M24_H25, LMOTS_SHAKE_N24_W4,
+                 WC_SHA256_192_DIGEST_SIZE) },
+    { WC_LMS_PARM_SHAKE192_L1_H25_W8 , "LMS/HSS_SHAKE256/192_L1_H25_W8",
+      LMS_PARAMS(1, 25, 8, 4, LMS_SHAKE_M24_H25, LMOTS_SHAKE_N24_W8,
+                 WC_SHA256_192_DIGEST_SIZE) },
+#endif
+#endif /* WOLFSSL_LMS_SHAKE256 */
 };
 /* Number of parameter sets supported. */
 #define WC_LMS_MAP_LEN      ((int)(sizeof(wc_lms_map) / sizeof(*wc_lms_map)))
@@ -364,6 +620,7 @@ static const wc_LmsParamsMap wc_lms_map[] = {
 /* Initialize LMS key.
  *
  * Call this before setting the params of an LMS key.
+ * Must call wc_LmsKey_Free before calling this function again.
  *
  * @param [out] key    LMS key to initialize.
  * @param [in]  heap   Heap hint.
@@ -384,14 +641,11 @@ int wc_LmsKey_Init(LmsKey* key, void* heap, int devId)
         ret = BAD_FUNC_ARG;
     }
     if (ret == 0) {
-        /* Zeroize the key data. */
-        ForceZero(key, sizeof(LmsKey));
+        /* Clear the key data. */
+        XMEMSET(key, 0, sizeof(LmsKey));
 
     #ifndef WOLFSSL_LMS_VERIFY_ONLY
         /* Initialize other fields. */
-        key->write_private_key = NULL;
-        key->read_private_key = NULL;
-        key->context = NULL;
         key->heap = heap;
     #endif
     #ifdef WOLF_CRYPTO_CB
@@ -403,6 +657,78 @@ int wc_LmsKey_Init(LmsKey* key, void* heap, int devId)
 
     return ret;
 }
+
+#ifdef WOLF_PRIVATE_KEY_ID
+/* Initialize an LmsKey and bind it to a device-side key identifier.
+ *
+ * @param [in,out] key    LmsKey to initialize.
+ * @param [in]     id     Identifier bytes (may be NULL when len is 0).
+ * @param [in]     len    Length of id; must be in [0, LMS_MAX_ID_LEN].
+ * @param [in]     heap   Heap hint forwarded to wc_LmsKey_Init.
+ * @param [in]     devId  Device identifier.
+ *
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when key is NULL, or id is NULL and len is not 0.
+ * @return  BUFFER_E when len is negative or exceeds LMS_MAX_ID_LEN.
+ */
+int wc_LmsKey_InitId(LmsKey* key, const unsigned char* id, int len, void* heap,
+    int devId)
+{
+    int ret = 0;
+
+    if ((key == NULL) || ((id == NULL) && (len != 0))) {
+        ret = BAD_FUNC_ARG;
+    }
+    if ((ret == 0) && ((len < 0) || (len > LMS_MAX_ID_LEN))) {
+        ret = BUFFER_E;
+    }
+    if (ret == 0) {
+        ret = wc_LmsKey_Init(key, heap, devId);
+    }
+    if ((ret == 0) && (id != NULL) && (len != 0)) {
+        XMEMCPY(key->id, id, (size_t)len);
+        key->idLen = len;
+    }
+
+    return ret;
+}
+
+/* Initialize an LmsKey and bind it to a device-side key label.
+ *
+ * @param [in,out] key    LmsKey to initialize.
+ * @param [in]     label  NUL-terminated label string (must be non-empty).
+ * @param [in]     heap   Heap hint forwarded to wc_LmsKey_Init.
+ * @param [in]     devId  Device identifier.
+ *
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when key or label is NULL.
+ * @return  BUFFER_E when label is empty or longer than LMS_MAX_LABEL_LEN.
+ */
+int wc_LmsKey_InitLabel(LmsKey* key, const char* label, void* heap, int devId)
+{
+    int ret = 0;
+    size_t labelLen = 0;
+
+    if ((key == NULL) || (label == NULL)) {
+        ret = BAD_FUNC_ARG;
+    }
+    if (ret == 0) {
+        labelLen = XSTRLEN(label);
+        if ((labelLen == 0) || (labelLen > LMS_MAX_LABEL_LEN)) {
+            ret = BUFFER_E;
+        }
+    }
+    if (ret == 0) {
+        ret = wc_LmsKey_Init(key, heap, devId);
+    }
+    if (ret == 0) {
+        XMEMCPY(key->label, label, labelLen);
+        key->labelLen = (int)labelLen;
+    }
+
+    return ret;
+}
+#endif /* WOLF_PRIVATE_KEY_ID */
 
 /* Get the string representation of the LMS parameter set.
  *
@@ -482,10 +808,6 @@ int wc_LmsKey_SetLmsParm(LmsKey* key, enum wc_LmsParm lmsParm)
 
 /* Set the parameters of an LMS key.
  *
- * Use this if you wish to set specific parameters not found in the
- * wc_LmsParm predefined sets. See comments in lms.h for allowed
- * parameters.
- *
  * Key must be inited before calling this.
  *
  * @param [in, out] key         LMS key to set parameters on.
@@ -495,6 +817,7 @@ int wc_LmsKey_SetLmsParm(LmsKey* key, enum wc_LmsParm lmsParm)
  * @return  0 on success.
  * @return  BAD_FUNC_ARG when key is NULL.
  * @return  BAD_FUNC_ARG when parameters not supported.
+ * @return  BAD_STATE_E when key state is not initialized.
  * */
 int wc_LmsKey_SetParameters(LmsKey* key, int levels, int height,
     int winternitz)
@@ -538,6 +861,67 @@ int wc_LmsKey_SetParameters(LmsKey* key, int levels, int height,
     return ret;
 }
 
+/* Set the parameters of an LMS key including hash length.
+ *
+ * Key must be inited before calling this.
+ *
+ * @param [in, out] key         LMS key to set parameters on.
+ * @param [in]      levels      Number of tree levels.
+ * @param [in]      height      Height of each tree.
+ * @param [in]      winternitz  Width or Winternitz coefficient.
+ * @param [in]      hash        Hash algorithm to use. Valid values:
+ *                               - LMS_SHA256
+ *                               - LMS_SHA256_192
+ *                               - LMS_SHAKE256
+ *                               - LMS_SHAKE256_192
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when key is NULL.
+ * @return  BAD_FUNC_ARG when parameters not supported.
+ * @return  BAD_STATE_E when key state is not initialized.
+ * */
+int wc_LmsKey_SetParameters_ex(LmsKey* key, int levels, int height,
+    int winternitz, int hash)
+{
+    int ret = 0;
+
+    /* Validate parameters. */
+    if (key == NULL) {
+        ret = BAD_FUNC_ARG;
+    }
+
+    /* Check state is valid. */
+    if ((ret == 0) && (key->state != WC_LMS_STATE_INITED)) {
+        WOLFSSL_MSG("error: LmsKey needs init");
+        ret = BAD_STATE_E;
+    }
+
+    if (ret == 0) {
+        int i;
+
+        ret = BAD_FUNC_ARG;
+        /* Search through table for matching levels, height and width. */
+        for (i = 0; i < WC_LMS_MAP_LEN; i++) {
+            if ((levels == wc_lms_map[i].params.levels) &&
+                    (height == wc_lms_map[i].params.height) &&
+                    (winternitz == wc_lms_map[i].params.width) &&
+                    (hash == (wc_lms_map[i].params.lmsType & LMS_HASH_MASK))) {
+                /* Set the parameters into the key. */
+                key->params = &wc_lms_map[i].params;
+                ret = 0;
+                break;
+            }
+        }
+    }
+
+    if (ret == 0) {
+        /* Move the state to params set.
+         * Key is ready for MakeKey or Reload. */
+        key->state = WC_LMS_STATE_PARMSET;
+    }
+
+    return ret;
+}
+
 /* Get the parameters of an LMS key.
  *
  * Key must be inited and parameters set before calling this.
@@ -546,8 +930,10 @@ int wc_LmsKey_SetParameters(LmsKey* key, int levels, int height,
  * @param [out] levels      Number of levels of trees.
  * @param [out] height      Height of the trees.
  * @param [out] winternitz  Winternitz width.
- * Returns 0 on success.
- * */
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when key, key->params, levels, height or winternitz is
+ *          NULL.
+ */
 int wc_LmsKey_GetParameters(const LmsKey* key, int* levels, int* height,
     int* winternitz)
 {
@@ -574,6 +960,46 @@ int wc_LmsKey_GetParameters(const LmsKey* key, int* levels, int* height,
     return ret;
 }
 
+/* Get the parameters of an LMS key.
+ *
+ * Key must be inited and parameters set before calling this.
+ *
+ * @param [in]  key         LMS key.
+ * @param [out] levels      Number of levels of trees.
+ * @param [out] height      Height of the trees.
+ * @param [out] winternitz  Winternitz width.
+ * @param [out] hash        Hash algorithm.
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when key, key->params, levels, height, winternitz or
+ *          hash is NULL.
+ */
+int wc_LmsKey_GetParameters_ex(const LmsKey* key, int* levels, int* height,
+    int* winternitz, int* hash)
+{
+    int ret = 0;
+
+    /* Validate parameters. */
+    if ((key == NULL) || (levels == NULL) || (height == NULL) ||
+            (winternitz == NULL) || (hash == NULL)) {
+        ret = BAD_FUNC_ARG;
+    }
+
+    /* Validate the parameters are available. */
+    if ((ret == 0) && (key->params == NULL)) {
+        ret = BAD_FUNC_ARG;
+    }
+
+    if (ret == 0) {
+        /* Set the levels, height and Winternitz width from parameters. */
+        *levels = key->params->levels;
+        *height = key->params->height;
+        *winternitz = key->params->width;
+        *hash = key->params->lmsType & LMS_HASH_MASK;
+    }
+
+    return ret;
+}
+
 /* Frees the LMS key from memory.
  *
  * This does not affect the private key saved to non-volatile storage.
@@ -586,19 +1012,39 @@ void wc_LmsKey_Free(LmsKey* key)
     #ifndef WOLFSSL_LMS_VERIFY_ONLY
         if (key->priv_data != NULL) {
             const LmsParams* params = key->params;
-            int priv_data_len = LMS_PRIV_DATA_LEN(params->levels,
+            word32 priv_data_len = LMS_PRIV_DATA_LEN(params->levels,
                 params->height, params->p, params->rootLevels,
                 params->cacheBits, params->hash_len);
 
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+        #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
             priv_data_len += HSS_PRIVATE_KEY_LEN(key->params->hash_len);
-#endif
+        #endif
             ForceZero(key->priv_data, priv_data_len);
             XFREE(key->priv_data, key->heap, DYNAMIC_TYPE_LMS);
+            key->priv_data = NULL;
         }
-    #endif
 
-        ForceZero(key, sizeof(LmsKey));
+        ForceZero(key->priv_raw, HSS_MAX_PRIVATE_KEY_LEN);
+        ForceZero(&key->priv, sizeof(HssPrivKey));
+
+        key->write_private_key = NULL;
+        key->read_private_key = NULL;
+        key->context = NULL;
+        key->heap = NULL;
+    #endif
+        XMEMSET(key->pub, 0, sizeof(key->pub));
+        key->pubSet = 0;
+        key->params = NULL;
+    #ifdef WOLF_CRYPTO_CB
+        key->devId = INVALID_DEVID;
+        key->devCtx = NULL;
+    #endif
+    #ifdef WOLF_PRIVATE_KEY_ID
+        XMEMSET(key->id, 0, sizeof(key->id));
+        key->idLen = 0;
+        XMEMSET(key->label, 0, sizeof(key->label));
+        key->labelLen = 0;
+    #endif
 
         key->state = WC_LMS_STATE_FREED;
     }
@@ -685,8 +1131,10 @@ int wc_LmsKey_SetContext(LmsKey* key, void* context)
 {
     int ret = 0;
 
-    /* Validate parameters. */
-    if ((key == NULL) || (context == NULL)) {
+    /* Validate parameters. NULL context is allowed: callers with stub
+     * read/write callbacks (e.g. HSM-backed keys whose private state lives
+     * in the device) have no meaningful context to pass. */
+    if (key == NULL) {
         ret = BAD_FUNC_ARG;
     }
     /* Setting context of an already working key is forbidden. */
@@ -720,7 +1168,7 @@ int wc_LmsKey_SetContext(LmsKey* key, void* context)
 int wc_LmsKey_MakeKey(LmsKey* key, WC_RNG* rng)
 {
     int ret = 0;
-    int priv_data_len = 0;
+    word32 priv_data_len = 0;
 
     /* Validate parameters. */
     if ((key == NULL) || (rng == NULL)) {
@@ -731,25 +1179,47 @@ int wc_LmsKey_MakeKey(LmsKey* key, WC_RNG* rng)
         WOLFSSL_MSG("error: LmsKey not ready for generation");
         ret = BAD_STATE_E;
     }
+
+#ifdef WOLF_CRYPTO_CB
+    /* HSM-backed keys skip the software write/context callbacks because the
+     * device owns the private state. On CRYPTOCB_UNAVAILABLE fall-through the
+     * software checks below still run. */
+    if ((ret == 0) && (key->devId != INVALID_DEVID)) {
+        ret = wc_CryptoCb_PqcStatefulSigKeyGen(WC_PQC_STATEFUL_SIG_TYPE_LMS,
+            key, rng);
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE)) {
+            /* This should not happen, but check whether signatures can be
+             * created. */
+            if ((ret == 0) && (wc_LmsKey_SigsLeft(key) == 0)) {
+                WOLFSSL_MSG("error: generated LMS key signatures exhausted");
+                key->state = WC_LMS_STATE_NOSIGS;
+                ret = BAD_STATE_E;
+            }
+            /* On success, mirror the software path's terminal state so
+             * subsequent Sign/Verify calls don't fail with BAD_STATE_E. */
+            if (ret == 0) {
+                key->state = WC_LMS_STATE_OK;
+                key->pubSet = 1;
+            }
+            return ret;
+        }
+        ret = 0; /* fall through to software path */
+    }
+#endif
+
     /* Check write callback set. */
     if ((ret == 0) && (key->write_private_key == NULL)) {
         WOLFSSL_MSG("error: LmsKey write callback is not set");
         ret = BAD_FUNC_ARG;
     }
-    /* Check callback context set. */
-    if ((ret == 0) && (key->context == NULL)) {
-        WOLFSSL_MSG("error: LmsKey context is not set");
-        ret = BAD_FUNC_ARG;
-    }
-
     if (ret == 0) {
         const LmsParams* params = key->params;
         priv_data_len = LMS_PRIV_DATA_LEN(params->levels, params->height,
             params->p, params->rootLevels, params->cacheBits, params->hash_len);
 
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+    #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
         priv_data_len += HSS_PRIVATE_KEY_LEN(key->params->hash_len);
-#endif
+    #endif
     }
     if ((ret == 0) && (key->priv_data == NULL)) {
         /* Allocate memory for the private key data. */
@@ -759,9 +1229,10 @@ int wc_LmsKey_MakeKey(LmsKey* key, WC_RNG* rng)
         if (key->priv_data == NULL) {
             ret = MEMORY_E;
         }
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
-        XMEMSET(key->priv_data, 0, priv_data_len);
-#endif
+        else {
+            /* Loading reads the state before it is computed over. */
+            XMEMSET(key->priv_data, 0, priv_data_len);
+        }
     }
     if (ret == 0) {
         WC_DECLARE_VAR(state, LmsState, 1, 0);
@@ -786,16 +1257,16 @@ int wc_LmsKey_MakeKey(LmsKey* key, WC_RNG* rng)
     if (ret == 0) {
         int rv;
         /* Write private key to storage. */
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+    #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
         XMEMCPY(key->priv_data + priv_data_len -
             HSS_PRIVATE_KEY_LEN(key->params->hash_len), key->priv_raw,
             HSS_PRIVATE_KEY_LEN(key->params->hash_len));
         rv = key->write_private_key(key->priv_data, priv_data_len,
             key->context);
-#else
+    #else
         rv = key->write_private_key(key->priv_raw,
             HSS_PRIVATE_KEY_LEN(key->params->hash_len), key->context);
-#endif
+    #endif
         if (rv != WC_LMS_RC_SAVED_TO_NV_MEMORY) {
             ret = IO_FAILED_E;
         }
@@ -811,16 +1282,25 @@ int wc_LmsKey_MakeKey(LmsKey* key, WC_RNG* rng)
     if (ret == 0) {
         /* Update state. */
         key->state = WC_LMS_STATE_OK;
+        key->pubSet = 1;
     }
 
     return ret;
 }
 
-/* Reload a key that has been prepared with the appropriate params and
- * data. Use this if you wish to resume signing with an existing key.
+/* Reload a key that has been prepared with the appropriate params and data.
+ *
+ * Use this if you wish to resume signing with an existing key.
+ * Call this function after initializing and setting parameters.
  *
  * Write/read callbacks, and context data, must be set prior.
  * Key must have parameters set.
+ *
+ * With a crypto callback device, the read callback and not the devId decides
+ * whether the software reload runs. See wc_LmsKey_Reload below.
+ *
+ * Neither arm populates key->pub, so the reloaded key can sign but cannot
+ * export a public key or verify.
  *
  * @param [in, out] key  LMS key.
  *
@@ -828,7 +1308,7 @@ int wc_LmsKey_MakeKey(LmsKey* key, WC_RNG* rng)
 int wc_LmsKey_Reload(LmsKey* key)
 {
     int ret = 0;
-    int priv_data_len = 0;
+    word32 priv_data_len = 0;
 
     /* Validate parameter. */
     if (key == NULL) {
@@ -839,14 +1319,23 @@ int wc_LmsKey_Reload(LmsKey* key)
         WOLFSSL_MSG("error: LmsKey not ready for reload");
         ret = BAD_STATE_E;
     }
+
+#ifdef WOLF_CRYPTO_CB
+    /* State for HSM-backed keys lives in the device; no software reload.
+     * A devId alone does not mean the device owns the key, as it may be set
+     * only to route other algorithms to an accelerator. A read callback says
+     * the caller holds the state, so only skip the reload without one. */
+    if ((ret == 0) && (key->devId != INVALID_DEVID) &&
+            (key->read_private_key == NULL)) {
+        WOLFSSL_MSG("wc_LmsKey_Reload is a no-op for HSM-backed keys");
+        key->state = WC_LMS_STATE_OK;
+        return 0;
+    }
+#endif
+
     /* Check read callback present. */
     if ((ret == 0) && (key->read_private_key == NULL)) {
         WOLFSSL_MSG("error: LmsKey read callback is not set");
-        ret = BAD_FUNC_ARG;
-    }
-    /* Check context for callback set */
-    if ((ret == 0) && (key->context == NULL)) {
-        WOLFSSL_MSG("error: LmsKey context is not set");
         ret = BAD_FUNC_ARG;
     }
 
@@ -855,9 +1344,9 @@ int wc_LmsKey_Reload(LmsKey* key)
         priv_data_len = LMS_PRIV_DATA_LEN(params->levels, params->height,
             params->p, params->rootLevels, params->cacheBits, params->hash_len);
 
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+    #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
         priv_data_len += HSS_PRIVATE_KEY_LEN(params->hash_len);
-#endif
+    #endif
     }
     if ((ret == 0) && (key->priv_data == NULL)) {
         /* Allocate memory for the private key data. */
@@ -867,29 +1356,33 @@ int wc_LmsKey_Reload(LmsKey* key)
         if (key->priv_data == NULL) {
             ret = MEMORY_E;
         }
+        else {
+            /* Loading reads the state before it is computed over. */
+            XMEMSET(key->priv_data, 0, priv_data_len);
+        }
     }
     if (ret == 0) {
         int rv;
 
         /* Load private key. */
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+    #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
         const LmsParams* params = key->params;
 
         rv = key->read_private_key(key->priv_data, priv_data_len, key->context);
-#else
+    #else
         rv = key->read_private_key(key->priv_raw,
             HSS_PRIVATE_KEY_LEN(key->params->hash_len), key->context);
-#endif
+    #endif
         if (rv != WC_LMS_RC_READ_TO_MEMORY) {
             ret = IO_FAILED_E;
         }
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+    #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
         if (ret == 0) {
             XMEMCPY(key->priv_raw, key->priv_data + priv_data_len -
                 HSS_PRIVATE_KEY_LEN(params->hash_len),
                 HSS_PRIVATE_KEY_LEN(params->hash_len));
         }
-#endif
+    #endif
     }
 
     /* Double check the key actually has signatures left. */
@@ -913,6 +1406,7 @@ int wc_LmsKey_Reload(LmsKey* key)
                 /* Reload the key ready for signing. */
                 ret = wc_hss_reload_key(state, key->priv_raw, &key->priv,
                     key->priv_data, NULL);
+                wc_lmskey_state_free(state);
             }
             ForceZero(state, sizeof(LmsState));
             WC_FREE_VAR_EX(state, NULL, DYNAMIC_TYPE_TMP_BUFFER);
@@ -927,7 +1421,7 @@ int wc_LmsKey_Reload(LmsKey* key)
     return ret;
 }
 
-/* Get the private key length based on parameter set of key.
+/* Get the raw private key length based on parameter set of key.
  *
  * @param [in]  key  LMS key.
  * @param [out] len  Length of private key.
@@ -953,6 +1447,10 @@ int wc_LmsKey_GetPrivLen(const LmsKey* key, word32* len)
 
 /* Sign a message.
  *
+ * The one-time key at the current leaf is consumed before the advanced private
+ * key is written to storage. If either step fails then the key state is left
+ * bad and no further signatures can be created with this key.
+ *
  * @param [in, out] key    LMS key to sign with.
  * @param [out]     sig    Signature data. Buffer must be big enough to hold
  *                         signature data.
@@ -961,30 +1459,81 @@ int wc_LmsKey_GetPrivLen(const LmsKey* key, word32* len)
  * @param [in]      msgSz  Length of message in bytes.
  * @return  0 on success.
  * @return  BAD_FUNC_ARG when key, sig, sigSz or msg is NULL.
- * @return  BAD_FUNC_ARG when msgSz is not greater than 0.
+ * @return  BAD_FUNC_ARG when msgSz is less than 0.
+ * @return  BAD_FUNC_ARG when a write private key is not set.
+ * @return  BAD_FUNC_ARG when a read/write private key context is not set.
+ * @return  BUFFER_E when sigSz is too small.
+ * @return  BAD_STATE_E when wrong state for operation.
+ * @return  KEY_EXHAUSTED_E when no signatures are left in the key.
+ * @return  IO_FAILED_E when reading or writing private key failed.
  */
 int wc_LmsKey_Sign(LmsKey* key, byte* sig, word32* sigSz, const byte* msg,
     int msgSz)
 {
     int ret = 0;
 
-    /* Validate parameters. */
-    if ((key == NULL) || (sig == NULL) || (sigSz == NULL) || (msg == NULL)) {
+    /* Validate parameters.  A NULL msg is valid for the empty message
+     * (msgSz == 0), per RFC 8554 which permits empty messages. */
+    if ((key == NULL) || (key->params == NULL) || (sig == NULL) ||
+            (sigSz == NULL) || ((msg == NULL) && (msgSz != 0))) {
         ret = BAD_FUNC_ARG;
     }
-    if ((ret == 0) && (msgSz <= 0)) {
+    if ((ret == 0) && (msgSz < 0)) {
         ret = BAD_FUNC_ARG;
+    }
+    /* An empty message may be passed as (NULL, 0); canonicalize it to a
+     * readable stand-in so that downstream consumers -- hash updates and
+     * crypto callbacks -- never see a NULL pointer. */
+    if ((ret == 0) && (msg == NULL)) {
+        static const byte lms_empty_msg = 0;
+        msg = &lms_empty_msg;
     }
     /* Check state. */
-    if ((ret == 0) && (key->state == WC_LMS_STATE_NOSIGS)) {
-        WOLFSSL_MSG("error: LMS signatures exhausted");
+    if ((ret == 0) && (key->state != WC_LMS_STATE_OK)) {
+        if (key->state == WC_LMS_STATE_NOSIGS) {
+            WOLFSSL_MSG("error: LMS signatures exhausted");
+        }
+        else {
+            /* The key state is not ready for signing. */
+            WOLFSSL_MSG("error: can't sign, LMS key not in good state");
+        }
         ret = BAD_STATE_E;
     }
-    if ((ret == 0) && (key->state != WC_LMS_STATE_OK)) {
-       /* The key had an error the last time it was used, and we
-        * can't guarantee its state. */
-        WOLFSSL_MSG("error: can't sign, LMS key not in good state");
-        ret = BAD_STATE_E;
+    /* Check signature buffer size. */
+    if ((ret == 0) && (*sigSz < key->params->sig_len)) {
+        /* Signature buffer too small. */
+        WOLFSSL_MSG("error: LMS sig buffer too small");
+        ret = BUFFER_E;
+    }
+
+#ifdef WOLF_CRYPTO_CB
+    /* HSM-backed keys skip the software write/context callbacks because the
+     * device owns the private state. On CRYPTOCB_UNAVAILABLE fall-through the
+     * software checks below still run. */
+    if ((ret == 0) && (key->devId != INVALID_DEVID)) {
+        ret = wc_CryptoCb_PqcStatefulSigSign(msg, (word32)msgSz, sig, sigSz,
+            WC_PQC_STATEFUL_SIG_TYPE_LMS, key);
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE)) {
+            if (ret == WC_NO_ERR_TRACE(KEY_EXHAUSTED_E)) {
+                /* Signature space exhausted. */
+                WOLFSSL_MSG("error: no LMS signatures remaining");
+                key->state = WC_LMS_STATE_NOSIGS;
+            }
+            else if (ret != 0) {
+                /* The device may have consumed the one-time key without
+                 * committing the advanced state, so presume the key is bad. */
+                key->state = WC_LMS_STATE_BAD;
+            }
+            return ret;
+        }
+        ret = 0; /* fall through to software path */
+    }
+#endif
+
+    /* Check read and write callbacks available. */
+    if ((ret == 0) && (key->write_private_key == NULL)) {
+        WOLFSSL_MSG("error: LmsKey write/read callbacks are not set");
+        ret = BAD_FUNC_ARG;
     }
 
     if (ret == 0) {
@@ -998,14 +1547,22 @@ int wc_LmsKey_Sign(LmsKey* key, byte* sig, word32* sigSz, const byte* msg,
             /* Initialize working state for use. */
             ret = wc_lmskey_state_init(state, key->params);
             if (ret == 0) {
+                /* Set the key state to bad by default. State is presumed bad
+                 * unless a correct sign and write operation happen together. */
+                key->state = WC_LMS_STATE_BAD;
                 /* Sign message. */
                 ret = wc_hss_sign(state, key->priv_raw, &key->priv,
-                    key->priv_data, msg, msgSz, sig);
+                    key->priv_data, msg, (word32)msgSz, sig);
                 wc_lmskey_state_free(state);
             }
             ForceZero(state, sizeof(LmsState));
             WC_FREE_VAR_EX(state, NULL, DYNAMIC_TYPE_TMP_BUFFER);
         }
+    }
+    if (ret == WC_NO_ERR_TRACE(KEY_EXHAUSTED_E)) {
+        /* Signature space exhausted. */
+        WOLFSSL_MSG("error: no LMS signatures remaining");
+        key->state = WC_LMS_STATE_NOSIGS;
     }
     if (ret == 0) {
         *sigSz = (word32)key->params->sig_len;
@@ -1014,9 +1571,9 @@ int wc_LmsKey_Sign(LmsKey* key, byte* sig, word32* sigSz, const byte* msg,
         int rv;
 
         /* Write private key to storage. */
-#ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
+    #ifdef WOLFSSL_WC_LMS_SERIALIZE_STATE
         const LmsParams* params = key->params;
-        int priv_data_len = LMS_PRIV_DATA_LEN(params->levels, params->height,
+        word32 priv_data_len = LMS_PRIV_DATA_LEN(params->levels, params->height,
             params->p, params->rootLevels, params->cacheBits,
             params->hash_len) + HSS_PRIVATE_KEY_LEN(key->params->hash_len);
 
@@ -1025,13 +1582,22 @@ int wc_LmsKey_Sign(LmsKey* key, byte* sig, word32* sigSz, const byte* msg,
             HSS_PRIVATE_KEY_LEN(params->hash_len));
         rv = key->write_private_key(key->priv_data, priv_data_len,
             key->context);
-#else
+    #else
         rv = key->write_private_key(key->priv_raw,
             HSS_PRIVATE_KEY_LEN(key->params->hash_len), key->context);
-#endif
+    #endif
         if (rv != WC_LMS_RC_SAVED_TO_NV_MEMORY) {
+            /* Write to NV storage failed. Erase the signature from
+             * memory to prevent OTS key reuse if state is rolled back. */
+            WOLFSSL_MSG("error: LmsKey write_private_key failed");
+            ForceZero(sig, key->params->sig_len);
             ret = IO_FAILED_E;
         }
+    }
+    if (ret == 0) {
+        /* The advanced private key was committed to storage. The key is safe
+         * to sign with again. */
+        key->state = WC_LMS_STATE_OK;
     }
 
     return ret;
@@ -1050,6 +1616,26 @@ int wc_LmsKey_SigsLeft(LmsKey* key)
 
     /* NULL keys have no signatures remaining. */
     if (key != NULL) {
+    #ifdef WOLF_CRYPTO_CB
+        if (key->devId != INVALID_DEVID) {
+            word32 sigsLeft = 0;
+            int cbRet = wc_CryptoCb_PqcStatefulSigSigsLeft(
+                WC_PQC_STATEFUL_SIG_TYPE_LMS, key, &sigsLeft);
+            if (cbRet == 0) {
+                return (sigsLeft != 0) ? 1 : 0;
+            }
+            if (cbRet != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE)) {
+                /* Device returned an actual error; the device owns the
+                 * private state so no safe software fallback exists. */
+                WOLFSSL_MSG("PqcStatefulSigSigsLeft returned an error");
+                return 0;
+            }
+            /* Cryptocb declined. priv_raw reflects software state from the
+             * CRYPTOCB_UNAVAILABLE fall-through in MakeKey/Reload, so the
+             * software check below is valid. */
+            WOLFSSL_MSG("LMS SigsLeft not supported by device, using software");
+        }
+    #endif
         ret = wc_hss_sigsleft(key->params, key->priv_raw);
     }
 
@@ -1082,6 +1668,51 @@ int wc_LmsKey_GetPubLen(const LmsKey* key, word32* len)
 }
 
 /* Export a generated public key and parameter set from one LmsKey
+ * to another, with explicit heap and device bindings.
+ *
+ * The destination key must be unused or have been freed.
+ * The destination is fully initialized as a verify-only key.
+ *
+ * @param [out] keyDst  LMS key to copy into.
+ * @param [in]  keySrc  LMS key to copy.
+ * @param [in]  heap    Heap hint for keyDst.
+ * @param [in]  devId   Device identifier for keyDst.
+ *                      Use INVALID_DEVID when not using a device.
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when keyDst or keySrc is NULL.
+ * @return  BAD_STATE_E when in the wrong state for the operation.
+ */
+int wc_LmsKey_ExportPub_ex(LmsKey* keyDst, const LmsKey* keySrc,
+                           void* heap, int devId)
+{
+    int ret = 0;
+
+    if ((keyDst == NULL) || (keySrc == NULL)) {
+        ret = BAD_FUNC_ARG;
+    }
+    if ((ret == 0) && ((!keySrc->pubSet) ||
+            ((keySrc->state != WC_LMS_STATE_OK) &&
+             (keySrc->state != WC_LMS_STATE_VERIFYONLY) &&
+             (keySrc->state != WC_LMS_STATE_NOSIGS)))) {
+        ret = BAD_STATE_E;
+    }
+
+    if (ret == 0) {
+        ret = wc_LmsKey_Init(keyDst, heap, devId);
+    }
+    if (ret == 0) {
+        keyDst->params = keySrc->params;
+        XMEMCPY(keyDst->pub, keySrc->pub, sizeof(keySrc->pub));
+        keyDst->pubSet = 1;
+
+        /* Mark this key as verify only, to prevent misuse. */
+        keyDst->state = WC_LMS_STATE_VERIFYONLY;
+    }
+
+    return ret;
+}
+
+/* Export a generated public key and parameter set from one LmsKey
  * to another. Use this to prepare a signature verification LmsKey
  * that is pub only.
  *
@@ -1089,30 +1720,25 @@ int wc_LmsKey_GetPubLen(const LmsKey* key, word32* len)
  * the parameter set is needed to calculate the signature length
  * before hand.
  *
+ * The destination key is left with no heap hint and no device
+ * binding. Callers that need either should use
+ * wc_LmsKey_ExportPub_ex.
+ *
  * @param [out] keyDst  LMS key to copy into.
  * @param [in]  keySrc  LMS key to copy.
  * @return  0 on success.
  * @return  BAD_FUNC_ARG when keyDst or keySrc is NULL.
+ * @return  BAD_STATE_E when keySrc holds no public key.
  */
 int wc_LmsKey_ExportPub(LmsKey* keyDst, const LmsKey* keySrc)
 {
-    int ret = 0;
-
-    if ((keyDst == NULL) || (keySrc == NULL)) {
-        ret = BAD_FUNC_ARG;
-    }
-
-    if (ret == 0) {
-        ForceZero(keyDst, sizeof(LmsKey));
-
-        keyDst->params = keySrc->params;
-        XMEMCPY(keyDst->pub, keySrc->pub, sizeof(keySrc->pub));
-
-        /* Mark this key as verify only, to prevent misuse. */
-        keyDst->state = WC_LMS_STATE_VERIFYONLY;
-    }
-
-    return ret;
+    return wc_LmsKey_ExportPub_ex(keyDst, keySrc,
+    #ifndef WOLFSSL_LMS_VERIFY_ONLY
+        (keySrc != NULL) ? keySrc->heap : NULL,
+    #else
+        NULL,
+    #endif
+        INVALID_DEVID);
 }
 
 /* Exports the raw LMS public key buffer from key to out buffer.
@@ -1127,6 +1753,7 @@ int wc_LmsKey_ExportPub(LmsKey* keyDst, const LmsKey* keySrc)
  *                          On out, the length of the public key in bytes.
  * @return  0 on success.
  * @return  BAD_FUNC_ARG when key, out or outLen is NULL.
+ * @return  BAD_STATE_E when in the wrong state for the operation.
  * @return  BUFFER_E when outLen is too small to hold encoded public key.
  */
 int wc_LmsKey_ExportPubRaw(const LmsKey* key, byte* out, word32* outLen)
@@ -1134,8 +1761,18 @@ int wc_LmsKey_ExportPubRaw(const LmsKey* key, byte* out, word32* outLen)
     int ret = 0;
 
     /* Validate parameters. */
-    if ((key == NULL) || (out == NULL) || (outLen == NULL)) {
+    if ((key == NULL) || (out == NULL) || (outLen == NULL) ||
+            (key->params == NULL)) {
         ret = BAD_FUNC_ARG;
+    }
+    /* Params and a signing-ready state don't mean a public key exists;
+     * Reload reaches WC_LMS_STATE_OK without populating key->pub. */
+    if ((ret == 0) && ((!key->pubSet) ||
+            ((key->state != WC_LMS_STATE_OK) &&
+             (key->state != WC_LMS_STATE_VERIFYONLY) &&
+             (key->state != WC_LMS_STATE_NOSIGS)))) {
+        WOLFSSL_MSG("error: LMS key not ready for export");
+        ret = BAD_STATE_E;
     }
     /* Check size of out is sufficient. */
     if ((ret == 0) &&
@@ -1154,39 +1791,128 @@ int wc_LmsKey_ExportPubRaw(const LmsKey* key, byte* out, word32* outLen)
 
 /* Imports a raw public key buffer from in array to LmsKey key.
  *
- * The LMS parameters must be set first with wc_LmsKey_SetLmsParm or
- * wc_LmsKey_SetParameters, and inLen must match the length returned
- * by wc_LmsKey_GetPubLen.
+ * If the LMS parameters have already been configured (via
+ * wc_LmsKey_SetLmsParm or wc_LmsKey_SetParameters), the levels /
+ * lms_algorithm_type / lmots_algorithm_type encoded in the raw key are
+ * checked for consistency and inLen must match wc_LmsKey_GetPubLen.
  *
- * Call wc_LmsKey_GetPubLen beforehand to determine pubLen.
+ * If the parameters have not yet been set (key->params == NULL), they
+ * are derived from the raw public key prefix (RFC 8554 sec 3.3 / sec
+ * 6.1: u32str(L) || lms_algorithm_type || lmots_algorithm_type) and
+ * matched against the static parameter map. The candidate is held in
+ * a local until the length check passes, so a length mismatch leaves
+ * key->params NULL.
+ *
+ * Accepts a key in INITED, PARMSET or VERIFYONLY state. WC_LMS_STATE_OK
+ * is rejected because the key already has private material loaded and
+ * silently overwriting key->pub would create an inconsistent priv/pub
+ * pair.
  *
  * @param [in, out] key    LMS key to put public key in.
  * @param [in]      in     Buffer holding encoded public key.
  * @param [in]      inLen  Length of encoded public key in bytes.
  * @return  0 on success.
- * @return  BAD_FUNC_ARG when key or in is NULL.
- * @return  BUFFER_E when inLen does not match public key length by parameters.
+ * @return  BAD_FUNC_ARG when key or in is NULL, or when the raw key's
+ *          levels / lmsType / lmOtsType disagree with pre-set params.
+ * @return  BAD_STATE_E when wrong state for operation.
+ * @return  BUFFER_E when inLen is too small to contain the LMS type
+ *          fields, or doesn't match the public key length determined
+ *          by parameters.
+ * @return  NOT_COMPILED_IN when the derived parameter set isn't built in.
  */
 int wc_LmsKey_ImportPubRaw(LmsKey* key, const byte* in, word32 inLen)
 {
-    int ret = 0;
+    int              ret = 0;
+    const LmsParams* matched = NULL;
 
     /* Validate parameters. */
     if ((key == NULL) || (in == NULL)) {
         ret = BAD_FUNC_ARG;
     }
+    /* Reject states where re-importing the public bytes would desync
+     * the key. INITED (params unset, will derive), PARMSET (params set
+     * but no private material) and VERIFYONLY (already a pub-only key)
+     * are all safe. OK means a private key is loaded; silently
+     * overwriting key->pub would create a priv/pub mismatch. Mirrors
+     * the wc_XmssKey_ImportPubRaw_ex post-condition added in the same
+     * RFC 9802 series. */
     if ((ret == 0) &&
-            (inLen != (word32)HSS_PUBLIC_KEY_LEN(key->params->hash_len))) {
-        /* Something inconsistent. Parameters weren't set, or input
-         * pub key is wrong.*/
-        return BUFFER_E;
+            (key->state != WC_LMS_STATE_INITED) &&
+            (key->state != WC_LMS_STATE_PARMSET) &&
+            (key->state != WC_LMS_STATE_VERIFYONLY)) {
+        WOLFSSL_MSG("error: LMS key not ready for import");
+        ret = BAD_STATE_E;
+    }
+    /* Need at least L || lmsType || lmOtsType to derive or validate. */
+    if ((ret == 0) && (inLen < (word32)(LMS_L_LEN + 2 * LMS_TYPE_LEN))) {
+        ret = BUFFER_E;
     }
 
     if (ret == 0) {
-        XMEMCPY(key->pub, in, inLen);
+        word32 levels = 0;
+        word32 lmsType = 0;
+        word32 lmOtsType = 0;
 
-        if (key->state != WC_LMS_STATE_OK)
-            key->state = WC_LMS_STATE_VERIFYONLY;
+        /* RFC 8554 sec 3.3 / sec 6.1: HSS public key = u32str(L) || pub[0],
+         * where pub[0] starts with lms_algorithm_type || lmots_algorithm_type.
+         */
+        ato32(in + 0,                   &levels);
+        ato32(in + LMS_L_LEN,           &lmsType);
+        ato32(in + LMS_L_LEN + LMS_TYPE_LEN, &lmOtsType);
+
+        /* The wire format carries only the RFC type code (low 12 bits);
+         * params->lmsType / lmOtsType also pack a wolfSSL-internal hash
+         * family flag in the high 4 bits (LMS_HASH_MASK). Compare on the
+         * RFC code only -- safe as long as low-12-bit codes stay globally
+         * distinct across hash families (see wc_lms_impl.c step 3.d-e
+         * note). */
+        if (key->params == NULL) {
+            /* Auto-derive: find matching entry in the static map. Hold
+             * the candidate in a local until the length check passes to
+             * avoid leaving key->params half-set on failure. */
+            int i;
+            ret = WC_NO_ERR_TRACE(NOT_COMPILED_IN);
+            for (i = 0; i < WC_LMS_MAP_LEN; i++) {
+                if (((word32)wc_lms_map[i].params.levels == levels) &&
+                    ((word32)(wc_lms_map[i].params.lmsType & LMS_H_W_MASK) ==
+                                                                     lmsType) &&
+                    ((word32)(wc_lms_map[i].params.lmOtsType& LMS_H_W_MASK) ==
+                                                                   lmOtsType)) {
+                    matched = &wc_lms_map[i].params;
+                    ret = 0;
+                    break;
+                }
+            }
+            if (ret != 0) {
+                WOLFSSL_MSG("error: LMS params from pub key not supported");
+            }
+        }
+        else {
+            /* Validate against pre-set params. */
+            if (((word32)key->params->levels != levels) ||
+                ((word32)(key->params->lmsType & LMS_H_W_MASK) != lmsType) ||
+                ((word32)(key->params->lmOtsType & LMS_H_W_MASK) != lmOtsType)){
+                WOLFSSL_MSG("error: LMS pub key doesn't match set params");
+                ret = BAD_FUNC_ARG;
+            }
+            else {
+                matched = key->params;
+            }
+        }
+    }
+    if ((ret == 0) &&
+            (inLen != (word32)HSS_PUBLIC_KEY_LEN(matched->hash_len))) {
+        ret = BUFFER_E;
+    }
+
+    if (ret == 0) {
+        /* Commit params (no-op when already set) and copy the key.
+         * State is INITED/PARMSET/VERIFYONLY here (OK is rejected
+         * above), so promoting to VERIFYONLY is always correct. */
+        key->params = matched;
+        XMEMCPY(key->pub, in, inLen);
+        key->pubSet = 1;
+        key->state = WC_LMS_STATE_VERIFYONLY;
     }
 
     return ret;
@@ -1201,14 +1927,15 @@ int wc_LmsKey_ImportPubRaw(LmsKey* key, const byte* in, word32 inLen)
  * @param [in]  key  LMS key.
  * @param [out] len  Length of a signature in bytes.
  * @return  0 on success.
- * @return  BAD_FUNC_ARG when key or len is NULL.
+ * @return  BAD_FUNC_ARG when key or len is NULL, or when the LMS
+ *          parameters have not been configured on the key.
  */
 int wc_LmsKey_GetSigLen(const LmsKey* key, word32* len)
 {
     int ret = 0;
 
     /* Validate parameters. */
-    if ((key == NULL) || (len == NULL)) {
+    if ((key == NULL) || (len == NULL) || (key->params == NULL)) {
         ret = BAD_FUNC_ARG;
     }
 
@@ -1228,6 +1955,7 @@ int wc_LmsKey_GetSigLen(const LmsKey* key, word32* len)
  * @param [in] msgSz  Length of the message in bytes.
  * @return  0 on success.
  * @return  BAD_FUNC_ARG when a key, sig or msg is NULL.
+ * @return  BAD_FUNC_ARG when msgSz is negative.
  * @return  SIG_VERIFY_E when signature did not verify message.
  * @return  BAD_STATE_E when wrong state for operation.
  * @return  BUFFER_E when sigSz is invalid for parameters.
@@ -1237,9 +1965,21 @@ int wc_LmsKey_Verify(LmsKey* key, const byte* sig, word32 sigSz,
 {
     int ret = 0;
 
-    /* Validate parameters. */
-    if ((key == NULL) || (sig == NULL) || (msg == NULL)) {
+    /* Validate parameters.  A NULL msg is valid for the empty message
+     * (msgSz == 0), per RFC 8554 which permits empty messages. */
+    if ((key == NULL) || (key->params == NULL) || (sig == NULL) ||
+            ((msg == NULL) && (msgSz != 0))) {
         ret = BAD_FUNC_ARG;
+    }
+    if ((ret == 0) && (msgSz < 0)) {
+        ret = BAD_FUNC_ARG;
+    }
+    /* An empty message may be passed as (NULL, 0); canonicalize it to a
+     * readable stand-in so that downstream consumers -- hash updates and
+     * crypto callbacks -- never see a NULL pointer. */
+    if ((ret == 0) && (msg == NULL)) {
+        static const byte lms_empty_msg = 0;
+        msg = &lms_empty_msg;
     }
     /* Check state. */
     if ((ret == 0) && (key->state != WC_LMS_STATE_OK) &&
@@ -1254,6 +1994,27 @@ int wc_LmsKey_Verify(LmsKey* key, const byte* sig, word32 sigSz,
         ret = BUFFER_E;
     }
 
+#ifdef WOLF_CRYPTO_CB
+    if ((ret == 0) && (key->devId != INVALID_DEVID)) {
+        int res = 0;
+        ret = wc_CryptoCb_PqcStatefulSigVerify(sig, sigSz, msg, (word32)msgSz,
+            &res, WC_PQC_STATEFUL_SIG_TYPE_LMS, key);
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE)) {
+            if (ret == 0 && res != 1)
+                ret = SIG_VERIFY_E;
+            return ret;
+        }
+        ret = 0; /* fall through to software path */
+    }
+#endif
+
+    /* Only the software verifier needs the public key locally; a device
+     * holds its own copy. */
+    if ((ret == 0) && (!key->pubSet)) {
+        WOLFSSL_MSG("error: LMS key holds no public key");
+        ret = BAD_STATE_E;
+    }
+
     if (ret == 0) {
         WC_DECLARE_VAR(state, LmsState, 1, 0);
 
@@ -1266,7 +2027,8 @@ int wc_LmsKey_Verify(LmsKey* key, const byte* sig, word32 sigSz,
             ret = wc_lmskey_state_init(state, key->params);
             if (ret == 0) {
                 /* Verify signature of message with public key. */
-                ret = wc_hss_verify(state, key->pub, msg, msgSz, sig);
+                ret = wc_hss_verify(state, key->pub, msg, (word32)msgSz, sig,
+                    sigSz);
                 wc_lmskey_state_free(state);
             }
             ForceZero(state, sizeof(LmsState));
@@ -1289,21 +2051,36 @@ int wc_LmsKey_Verify(LmsKey* key, const byte* sig, word32 sigSz,
  * @param [out] kidSz  Size of key ID.
  * @return  0 on success.
  * @return  BAD_FUNC_ARG when a key, kid or kidSz is NULL.
+ * @return  NOT_COMPILED_IN when key is on a device.
  */
-int wc_LmsKey_GetKid(LmsKey * key, const byte ** kid, word32* kidSz)
+int wc_LmsKey_GetKid(LmsKey* key, const byte** kid, word32* kidSz)
 {
+    int ret = 0;
     word32 offset;
 
-    if ((key == NULL) || (kid == NULL) || (kidSz == NULL)) {
-        return BAD_FUNC_ARG;
+    if ((key == NULL) || (key->params == NULL) || (kid == NULL) ||
+            (kidSz == NULL)) {
+        ret = BAD_FUNC_ARG;
     }
 
-    /* SEED length is hash length. */
-    offset = HSS_Q_LEN + HSS_PRIV_KEY_PARAM_SET_LEN + key->params->hash_len;
-    *kid = key->priv_raw + offset;
-    *kidSz = HSS_PRIVATE_KEY_LEN(key->params->hash_len) - offset;
+#ifdef WOLF_CRYPTO_CB
+    /* priv_raw is not populated for HSM-backed keys where the device owns
+     * the private state. Extend the CryptoCb surface if device-side KID
+     * retrieval becomes a requirement.
+     */
+    if ((ret == 0) && (key->devId != INVALID_DEVID)) {
+        WOLFSSL_MSG(
+                "wc_LmsKey_GetKid: priv_raw may be uninitialised for HSM keys");
+    }
+#endif
+    if (ret == 0) {
+        /* SEED length is hash length. */
+        offset = HSS_Q_LEN + HSS_PRIV_KEY_PARAM_SET_LEN + key->params->hash_len;
+        *kid = key->priv_raw + offset;
+        *kidSz = HSS_PRIVATE_KEY_LEN(key->params->hash_len) - offset;
+    }
 
-    return 0;
+    return ret;
 }
 
 
@@ -1317,20 +2094,29 @@ int wc_LmsKey_GetKid(LmsKey * key, const byte ** kid, word32* kidSz)
  * @param  Pointer to 16 byte Key ID in the private key.
  * @return  NULL on failure.
  */
-const byte * wc_LmsKey_GetKidFromPrivRaw(const byte * priv, word32 privSz)
+const byte* wc_LmsKey_GetKidFromPrivRaw(const byte* priv, word32 privSz)
 {
-    word32 seedSz = privSz - HSS_Q_LEN - HSS_PRIV_KEY_PARAM_SET_LEN - LMS_I_LEN;
+    const byte* ret;
 
-    if (priv == NULL) {
-        return NULL;
+    if ((priv == NULL) ||
+            (privSz < HSS_Q_LEN + HSS_PRIV_KEY_PARAM_SET_LEN + LMS_I_LEN)) {
+        ret = NULL;
     }
-    if ((seedSz != WC_SHA256_192_DIGEST_SIZE) &&
-            (seedSz != WC_SHA256_DIGEST_SIZE)) {
-        return NULL;
+    else {
+        word32 seedSz = privSz - HSS_Q_LEN - HSS_PRIV_KEY_PARAM_SET_LEN -
+                        LMS_I_LEN;
+        if ((seedSz != WC_SHA256_192_DIGEST_SIZE) &&
+                (seedSz != WC_SHA256_DIGEST_SIZE)) {
+            ret = NULL;
+        }
+        else {
+            ret = priv + privSz - LMS_I_LEN;
+        }
     }
-    return priv + privSz - LMS_I_LEN;
+
+    return ret;
 }
 
 #endif
 
-#endif /* WOLFSSL_HAVE_LMS && WOLFSSL_WC_LMS */
+#endif /* WOLFSSL_HAVE_LMS */

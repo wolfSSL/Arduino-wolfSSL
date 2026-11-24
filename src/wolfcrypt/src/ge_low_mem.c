@@ -1,6 +1,6 @@
 /* ge_low_mem.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -23,7 +23,9 @@
 
  /* Based from Daniel Beer's public domain work. */
 
-#ifdef HAVE_ED25519
+/* under WOLF_CRYPTO_CB_ONLY_ED25519 the callback device does all Ed25519
+ * group math, so this file compiles out */
+#if defined(HAVE_ED25519) && !defined(WOLF_CRYPTO_CB_ONLY_ED25519)
 #ifdef ED25519_SMALL /* use slower code that takes less memory */
 
 #include <wolfssl/wolfcrypt/ge_operations.h>

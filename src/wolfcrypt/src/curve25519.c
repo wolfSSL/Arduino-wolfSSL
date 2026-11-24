@@ -1,6 +1,6 @@
 /* curve25519.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -22,6 +22,15 @@
 
  /* Based On Daniel J Bernstein's curve25519 Public Domain ref10 work. */
 
+/*
+ * X25519 configuration macros:
+ *
+ * WC_X25519_NONBLOCK: Enable non-blocking support for key gen and shared
+ *                     secret. Requires CURVE25519_SMALL. Default: off.
+ */
+
+#define _WC_BUILDING_CURVE25519_C
+
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
 #ifdef NO_CURVED25519_X64
@@ -31,6 +40,9 @@
 #ifdef HAVE_CURVE25519
 
 #include <wolfssl/wolfcrypt/curve25519.h>
+#include <wolfssl/wolfcrypt/ge_operations.h>
+#include <wolfssl/wolfcrypt/error-crypt.h>
+#include <wolfssl/wolfcrypt/logging.h>
 #ifdef NO_INLINE
     #include <wolfssl/wolfcrypt/misc.h>
 #else
@@ -54,6 +66,8 @@
         #error "Blinding not needed nor available for small implementation"
     #elif defined(USE_INTEL_SPEEDUP) || defined(WOLFSSL_ARMASM)
         #error "Blinding not needed nor available for assembly implementation"
+    #elif defined(WOLFSSL_CURVE25519_USE_ED25519)
+        #error "Ed25519 base scalar mult cannot be used with blinding "
     #endif
 #endif
 
@@ -72,6 +86,13 @@ const curve25519_set_type curve25519_sets[] = {
     }
 };
 
+/* base point is only referenced by the software scalar-mult paths, which are
+ * compiled out under WOLF_CRYPTO_CB_ONLY_CURVE25519 */
+#if !defined(WOLF_CRYPTO_CB_ONLY_CURVE25519) && \
+    ((!defined(WOLFSSL_CURVE25519_USE_ED25519) && \
+     !(defined(CURVED25519_X64) || (defined(WOLFSSL_ARMASM) && \
+     defined(__aarch64__)))) || defined(WOLFSSL_CURVE25519_BLINDING) || \
+     defined(WC_X25519_NONBLOCK))
 static const word32 kCurve25519BasePoint[CURVE25519_KEYSIZE/sizeof(word32)] = {
 #ifdef BIG_ENDIAN_ORDER
     0x09000000
@@ -79,6 +100,7 @@ static const word32 kCurve25519BasePoint[CURVE25519_KEYSIZE/sizeof(word32)] = {
     9
 #endif
 };
+#endif /* !WOLFSSL_CURVE25519_USE_ED25519 || WOLFSSL_CURVE25519_BLINDING */
 
 /* Curve25519 private key must be less than order */
 /* These functions clamp private k and check it */
@@ -91,10 +113,14 @@ static WC_INLINE int curve25519_priv_clamp(byte* priv)
 }
 static WC_INLINE int curve25519_priv_clamp_check(const byte* priv)
 {
-    /* check that private part of key has been clamped */
+    /* check that private part of key has been clamped per RFC 7748 section 5:
+     *   bits 0-2 of byte 0 must be clear  (priv[0] &= 248)
+     *   bit 7 of byte 31 must be clear    (priv[31] &= 127)
+     *   bit 6 of byte 31 must be set      (priv[31] |= 64)  */
     int ret = 0;
     if ((priv[0] & ~248) ||
-        (priv[CURVE25519_KEYSIZE-1] & 128)) {
+        (priv[CURVE25519_KEYSIZE-1] & 128) ||
+        !(priv[CURVE25519_KEYSIZE-1] & 64)) {
         ret = ECC_BAD_ARG_E;
     }
     return ret;
@@ -115,21 +141,29 @@ static WC_INLINE void curve25519_copy_point(byte* out, const byte* point,
     }
 }
 
-/* compute the public key from an existing private key, using bare vectors.
+#if defined(WOLFSSL_CURVE25519_BLINDING) && !defined(FREESCALE_LTC_ECC) && \
+    !defined(WOLF_CRYPTO_CB_ONLY_CURVE25519)
+static int curve25519_make_pub_blind_sw(int public_size, byte* pub,
+    const byte* priv, WC_RNG* rng);
+#endif
+
+/* Compute pub = priv * basepoint(9).
  *
- * return value is propagated from curve25519() (0 on success), or
- * ECC_BAD_ARG_E, and the byte vectors are little endian.
+ * devId  [in]  Device to offer the private scalar to, or INVALID_DEVID to keep
+ *              it in software.  A key passes its own devId, so an unbound key
+ *              is never offloaded to whichever device happens to be registered
+ *              first; a caller holding no key passes the build default.
  */
-int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
-                           const byte* priv)
+static int curve25519_make_pub_ex(int public_size, byte* pub, int private_size,
+                                  const byte* priv, int devId)
 {
     int ret;
-#ifdef FREESCALE_LTC_ECC
+#if defined(FREESCALE_LTC_ECC) && !defined(WOLF_CRYPTO_CB_ONLY_CURVE25519)
     const ECPoint* basepoint = nxp_ltc_curve25519_GetBasePoint();
     ECPoint wc_pub;
 #endif
 
-    if ( (public_size != CURVE25519_KEYSIZE) ||
+    if ((public_size != CURVE25519_KEYSIZE) ||
         (private_size != CURVE25519_KEYSIZE)) {
         return ECC_BAD_ARG_E;
     }
@@ -142,6 +176,24 @@ int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
     if (ret != 0)
         return ret;
 
+#ifdef WOLF_CRYPTO_CB
+    #ifndef WOLF_CRYPTO_CB_FIND
+    if (devId != INVALID_DEVID)
+    #endif
+    {
+        ret = wc_CryptoCb_Curve25519MakePub(devId, public_size, pub,
+            private_size, priv);
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
+            return ret;
+        /* fall-through when unavailable */
+    }
+#else
+    (void)devId;
+#endif
+
+#ifdef WOLF_CRYPTO_CB_ONLY_CURVE25519
+    return NO_VALID_DEVID;
+#else
 #ifdef FREESCALE_LTC_ECC
     /* input basepoint on Weierstrass curve */
     ret = nxp_ltc_curve25519(&wc_pub, priv, basepoint, kLTC_Weierstrass);
@@ -154,7 +206,31 @@ int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
 
     SAVE_VECTOR_REGISTERS(return _svr_ret;);
 
+#if defined(WOLFSSL_CURVE25519_USE_ED25519)
+    {
+        ge_p3 A;
+
+        ge_scalarmult_base(&A, priv);
+    #ifndef CURVE25519_SMALL
+        fe_add(A.X, A.Z, A.Y);
+        fe_sub(A.T, A.Z, A.Y);
+        fe_invert(A.T, A.T);
+        fe_mul(A.T, A.X, A.T);
+        fe_tobytes(pub, A.T);
+    #else
+        lm_add(A.X, A.Z, A.Y);
+        lm_sub(A.T, A.Z, A.Y);
+        lm_invert(A.T, A.T);
+        lm_mul(pub, A.X, A.T);
+    #endif
+        ret = 0;
+    }
+#elif defined(CURVED25519_X64) || (defined(WOLFSSL_ARMASM) && \
+    defined(__aarch64__))
+    ret = curve25519_base(pub, priv);
+#else
     ret = curve25519(pub, priv, (byte*)kCurve25519BasePoint);
+#endif
 
     RESTORE_VECTOR_REGISTERS();
 #else
@@ -163,8 +239,7 @@ int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
 
         ret = wc_InitRng(&rng);
         if (ret == 0) {
-            ret = wc_curve25519_make_pub_blind(public_size, pub, private_size,
-                priv, &rng);
+            ret = curve25519_make_pub_blind_sw(public_size, pub, priv, &rng);
 
             wc_FreeRng(&rng);
         }
@@ -172,7 +247,35 @@ int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
 #endif /* !WOLFSSL_CURVE25519_BLINDING */
 #endif /* FREESCALE_LTC_ECC */
 
+/* If WOLFSSL_CURVE25519_BLINDING is defined, this check is run in
+ * curve25519_make_pub_blind_sw since it could be reached directly. */
+#if !defined(WOLFSSL_CURVE25519_BLINDING) || defined(FREESCALE_LTC_ECC)
+    if (ret == 0) {
+        ret = wc_curve25519_check_public(pub, (word32)public_size,
+                                    EC25519_LITTLE_ENDIAN);
+    }
+#endif
+
     return ret;
+#endif /* WOLF_CRYPTO_CB_ONLY_CURVE25519 */
+}
+
+/* compute the public key from an existing private key, using bare vectors.
+ *
+ * return value is propagated from curve25519() (0 on success), or
+ * ECC_BAD_ARG_E, and the byte vectors are little endian.
+ */
+int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
+                           const byte* priv)
+{
+#ifdef WOLF_CRYPTO_CB
+    /* no key names a device, so offer the scalar to the build default one */
+    const int devId = wc_CryptoCb_DefaultDevID();
+#else
+    const int devId = INVALID_DEVID;
+#endif
+
+    return curve25519_make_pub_ex(public_size, pub, private_size, priv, devId);
 }
 
 #ifdef WOLFSSL_CURVE25519_BLINDING
@@ -180,6 +283,7 @@ int wc_curve25519_make_pub(int public_size, byte* pub, int private_size,
 #ifndef WOLFSSL_CURVE25519_BLINDING_RAND_CNT
     #define WOLFSSL_CURVE25519_BLINDING_RAND_CNT    10
 #endif
+#ifndef WOLF_CRYPTO_CB_ONLY_CURVE25519
 static int curve25519_smul_blind(byte* rp, const byte* n, const byte* p,
     WC_RNG* rng)
 {
@@ -192,11 +296,23 @@ static int curve25519_smul_blind(byte* rp, const byte* n, const byte* p,
 
     SAVE_VECTOR_REGISTERS(return _svr_ret;);
 
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    /* Register the blinding scalar/value buffers up front (but below the
+     * SAVE_VECTOR_REGISTERS early return) so every path to the cleanup
+     * ForceZero is checked. XMEMSET makes them defined before first use. */
+    XMEMSET(a, 0, sizeof(a));
+    XMEMSET(n_a, 0, sizeof(n_a));
+    XMEMSET(rz, 0, sizeof(rz));
+    wc_MemZero_Add("curve25519_smul_blind a", a, sizeof(a));
+    wc_MemZero_Add("curve25519_smul_blind n_a", n_a, sizeof(n_a));
+    wc_MemZero_Add("curve25519_smul_blind rz", rz, sizeof(rz));
+#endif
+
     /* Generate random z. */
     for (cnt = 0; cnt < WOLFSSL_CURVE25519_BLINDING_RAND_CNT; cnt++) {
         ret = wc_RNG_GenerateBlock(rng, rz, sizeof(rz));
         if (ret < 0) {
-            return ret;
+            goto cleanup;
         }
         for (i = CURVE25519_KEYSIZE - 1; i >= 0; i--) {
             if (rz[i] != 0xff)
@@ -207,13 +323,14 @@ static int curve25519_smul_blind(byte* rp, const byte* n, const byte* p,
         }
     }
     if (cnt == WOLFSSL_CURVE25519_BLINDING_RAND_CNT) {
-        return RNG_FAILURE_E;
+        ret = RNG_FAILURE_E;
+        goto cleanup;
     }
 
     /* Generate 253 random bits. */
     ret = wc_RNG_GenerateBlock(rng, a, sizeof(a));
     if (ret != 0)
-        return ret;
+        goto cleanup;
     a[CURVE25519_KEYSIZE-1] &= 0x7f;
     /* k' = k ^ 2k ^ a */
     n_a[0] = n[0] ^ (byte)(n[0] << 1) ^ a[0];
@@ -227,17 +344,57 @@ static int curve25519_smul_blind(byte* rp, const byte* n, const byte* p,
     /* Scalar multiple blinded scalar with blinding value. */
     ret = curve25519_blind(rp, n_a, a, p, rz);
 
+cleanup:
+    ForceZero(a, sizeof(a));
+    ForceZero(n_a, sizeof(n_a));
+    ForceZero(rz, sizeof(rz));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    wc_MemZero_Check(rz, sizeof(rz));
+    wc_MemZero_Check(n_a, sizeof(n_a));
+    wc_MemZero_Check(a, sizeof(a));
+#endif
+
     RESTORE_VECTOR_REGISTERS();
 
     return ret;
 }
-#endif
 
-int wc_curve25519_make_pub_blind(int public_size, byte* pub, int private_size,
-                                 const byte* priv, WC_RNG* rng)
+/* Software half of curve25519_make_pub_blind_ex, so a caller that has already
+ * offered the scalar to a device does not offer it a second time. */
+static int curve25519_make_pub_blind_sw(int public_size, byte* pub,
+    const byte* priv, WC_RNG* rng)
 {
     int ret;
-#ifdef FREESCALE_LTC_ECC
+
+    fe_init();
+
+    ret = curve25519_smul_blind(pub, priv, (const byte*)kCurve25519BasePoint,
+                                rng);
+    if (ret == 0) {
+        ret = wc_curve25519_check_public(pub, (word32)public_size,
+                                    EC25519_LITTLE_ENDIAN);
+    }
+
+    return ret;
+}
+
+/* Software half of wc_curve25519_generic_blind; same reason. */
+static int curve25519_generic_blind_sw(byte* pub, const byte* priv,
+    const byte* basepoint, WC_RNG* rng)
+{
+    fe_init();
+
+    return curve25519_smul_blind(pub, priv, basepoint, rng);
+}
+#endif /* !WOLF_CRYPTO_CB_ONLY_CURVE25519 */
+#endif
+
+/* Blinded form of curve25519_make_pub_ex; devId means the same. */
+static int curve25519_make_pub_blind_ex(int public_size, byte* pub,
+    int private_size, const byte* priv, WC_RNG* rng, int devId)
+{
+    int ret;
+#if defined(FREESCALE_LTC_ECC) && !defined(WOLF_CRYPTO_CB_ONLY_CURVE25519)
     const ECPoint* basepoint = nxp_ltc_curve25519_GetBasePoint();
     ECPoint wc_pub;
 #endif
@@ -249,27 +406,101 @@ int wc_curve25519_make_pub_blind(int public_size, byte* pub, int private_size,
     if ((pub == NULL) || (priv == NULL)) {
         return ECC_BAD_ARG_E;
     }
+#ifndef FREESCALE_LTC_ECC
+    if (rng == NULL) {
+        return ECC_BAD_ARG_E;
+    }
+#endif
 
     /* check clamping */
     ret = curve25519_priv_clamp_check(priv);
     if (ret != 0)
         return ret;
 
+#ifdef WOLF_CRYPTO_CB
+    #ifndef WOLF_CRYPTO_CB_FIND
+    if (devId != INVALID_DEVID)
+    #endif
+    {
+        ret = wc_CryptoCb_Curve25519MakePub(devId, public_size, pub,
+            private_size, priv);
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
+            return ret;
+        /* fall-through when unavailable */
+    }
+#else
+    (void)devId;
+#endif
+
+#ifdef WOLF_CRYPTO_CB_ONLY_CURVE25519
+    /* the LTC path checks the rng, the callback path has no use for it */
+    (void)rng;
+    return NO_VALID_DEVID;
+#else
 #ifdef FREESCALE_LTC_ECC
     /* input basepoint on Weierstrass curve */
     ret = nxp_ltc_curve25519(&wc_pub, priv, basepoint, kLTC_Weierstrass);
     if (ret == 0) {
         XMEMCPY(pub, wc_pub.point, CURVE25519_KEYSIZE);
     }
-#else
-    fe_init();
 
-    ret = curve25519_smul_blind(pub, priv, (byte*)kCurve25519BasePoint, rng);
+    if (ret == 0) {
+        ret = wc_curve25519_check_public(pub, (word32)public_size,
+                                    EC25519_LITTLE_ENDIAN);
+    }
+#else
+    ret = curve25519_make_pub_blind_sw(public_size, pub, priv, rng);
 #endif
 
     return ret;
+#endif /* WOLF_CRYPTO_CB_ONLY_CURVE25519 */
+}
+
+int wc_curve25519_make_pub_blind(int public_size, byte* pub, int private_size,
+                                 const byte* priv, WC_RNG* rng)
+{
+#ifdef WOLF_CRYPTO_CB
+    /* no key names a device, so offer the scalar to the build default one */
+    const int devId = wc_CryptoCb_DefaultDevID();
+#else
+    const int devId = INVALID_DEVID;
+#endif
+
+    return curve25519_make_pub_blind_ex(public_size, pub, private_size, priv,
+        rng, devId);
 }
 #endif
+
+/* Derive a key's public point from its own private scalar.
+ *
+ * Only wc_curve25519_make_key() and the public key export use this, so the
+ * guard below is the union of their two call-site conditions: the software
+ * key generation must be compiled in and not replaced by the SE050 key
+ * creation, or the public key export must be enabled.
+ */
+#if (!defined(WOLF_CRYPTO_CB_ONLY_CURVE25519) && \
+     (!defined(WOLFSSL_SE050) || defined(WOLFSSL_SE050_ONLY_KEY_ID))) || \
+    defined(HAVE_CURVE25519_KEY_EXPORT)
+static int curve25519_key_make_pub(curve25519_key* key, WC_RNG* rng)
+{
+#ifdef WOLF_CRYPTO_CB
+    const int devId = key->devId;
+#else
+    const int devId = INVALID_DEVID;
+#endif
+
+#ifdef WOLFSSL_CURVE25519_BLINDING
+    return curve25519_make_pub_blind_ex((int)sizeof(key->p.point), key->p.point,
+        (int)sizeof(key->k), key->k, rng, devId);
+#else
+    (void)rng;
+    return curve25519_make_pub_ex((int)sizeof(key->p.point), key->p.point,
+        (int)sizeof(key->k), key->k, devId);
+#endif
+}
+#endif /* (!WOLF_CRYPTO_CB_ONLY_CURVE25519 &&
+        *  (!WOLFSSL_SE050 || WOLFSSL_SE050_ONLY_KEY_ID)) ||
+        * HAVE_CURVE25519_KEY_EXPORT */
 
 /* compute the public key from an existing private key, with supplied basepoint,
  * using bare vectors.
@@ -286,7 +517,6 @@ int wc_curve25519_generic(int public_size, byte* pub,
      * nxp_ltc_curve25519_GetBasePoint() */
     return WC_HW_E;
 #else
-#ifndef WOLFSSL_CURVE25519_BLINDING
     int ret;
 
     if ((public_size != CURVE25519_KEYSIZE) ||
@@ -302,6 +532,18 @@ int wc_curve25519_generic(int public_size, byte* pub,
     if (ret != 0)
         return ret;
 
+#ifdef WOLF_CRYPTO_CB
+    /* no key names a device, so offer the scalar to the build default one */
+    ret = wc_CryptoCb_Curve25519Generic(wc_CryptoCb_DefaultDevID(), public_size,
+        pub, private_size, priv, basepoint_size, basepoint);
+    if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
+        return ret;
+    /* fall-through when unavailable */
+#endif
+
+#ifdef WOLF_CRYPTO_CB_ONLY_CURVE25519
+    return NO_VALID_DEVID;
+#elif !defined(WOLFSSL_CURVE25519_BLINDING)
     fe_init();
 
     SAVE_VECTOR_REGISTERS(return _svr_ret;);
@@ -312,15 +554,15 @@ int wc_curve25519_generic(int public_size, byte* pub,
 
     return ret;
 #else
-    WC_RNG rng;
-    int ret;
+    {
+        WC_RNG rng;
 
-    ret = wc_InitRng(&rng);
-    if (ret == 0) {
-        ret = wc_curve25519_generic_blind(public_size, pub, private_size, priv,
-            basepoint_size, basepoint, &rng);
+        ret = wc_InitRng(&rng);
+        if (ret == 0) {
+            ret = curve25519_generic_blind_sw(pub, priv, basepoint, &rng);
 
-        wc_FreeRng(&rng);
+            wc_FreeRng(&rng);
+        }
     }
 
     return ret;
@@ -354,17 +596,29 @@ int wc_curve25519_generic_blind(int public_size, byte* pub,
     }
     if ((pub == NULL) || (priv == NULL) || (basepoint == NULL))
         return ECC_BAD_ARG_E;
+    if (rng == NULL) {
+        return ECC_BAD_ARG_E;
+    }
 
     /* check clamping */
     ret = curve25519_priv_clamp_check(priv);
     if (ret != 0)
         return ret;
 
-    fe_init();
+#ifdef WOLF_CRYPTO_CB
+    /* no key names a device, so offer the scalar to the build default one */
+    ret = wc_CryptoCb_Curve25519Generic(wc_CryptoCb_DefaultDevID(), public_size,
+        pub, private_size, priv, basepoint_size, basepoint);
+    if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
+        return ret;
+    /* fall-through when unavailable */
+#endif
 
-    ret = curve25519_smul_blind(pub, priv, basepoint, rng);
-
-    return ret;
+#ifdef WOLF_CRYPTO_CB_ONLY_CURVE25519
+    return NO_VALID_DEVID;
+#else
+    return curve25519_generic_blind_sw(pub, priv, basepoint, rng);
+#endif /* WOLF_CRYPTO_CB_ONLY_CURVE25519 */
 #endif /* FREESCALE_LTC_ECC */
 }
 #endif
@@ -395,6 +649,85 @@ int wc_curve25519_make_priv(WC_RNG* rng, int keysize, byte* key)
     return ret;
 }
 
+#ifdef WC_X25519_NONBLOCK
+
+static int wc_curve25519_make_pub_nb(curve25519_key* key)
+{
+    int ret = 0;
+
+    if (key == NULL) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (key->nb_ctx == NULL) {
+        WOLFSSL_MSG("wc_curve25519_make_pub_nb called with NULL non-blocking "
+            "context.");
+        ret = BAD_FUNC_ARG;
+    }
+
+    if (ret == 0 && key->nb_ctx->state == 0) {
+        /* check clamping */
+        ret = curve25519_priv_clamp_check(key->k);
+        if (ret == 0) {
+            fe_init();
+        }
+    }
+    if (ret == 0) {
+        ret = curve25519_nb(key->p.point, key->k, (byte*)kCurve25519BasePoint,
+                  key->nb_ctx);
+    }
+
+    return ret;
+}
+
+static int wc_curve25519_make_key_nb(WC_RNG* rng, int keysize,
+    curve25519_key* key)
+{
+    int ret = 0;
+
+    if (key == NULL || rng == NULL) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (key->nb_ctx == NULL) {
+        WOLFSSL_MSG("wc_curve25519_make_key_nb called with NULL non-blocking "
+            "context.");
+        ret = BAD_FUNC_ARG;
+    }
+
+    if (ret == 0 && key->nb_ctx->state == 0) {
+        ret = wc_curve25519_make_priv(rng, keysize, key->k);
+        if (ret == 0) {
+            key->privSet = 1;
+        }
+    }
+    if (ret == 0) {
+        ret = wc_curve25519_make_pub_nb(key);
+        if (ret == 0)  {
+            key->pubSet = 1;
+        }
+    }
+
+    return ret;
+}
+
+int wc_curve25519_set_nonblock(curve25519_key* key, x25519_nb_ctx_t* ctx)
+{
+    if (key == NULL) {
+        return BAD_FUNC_ARG;
+    }
+    /* If a different context is already set, clear it before replacing.
+     * The caller is responsible for freeing any heap-allocated context. */
+    if (key->nb_ctx != NULL && key->nb_ctx != ctx) {
+        XMEMSET(key->nb_ctx, 0, sizeof(x25519_nb_ctx_t));
+    }
+    if (ctx != NULL) {
+        XMEMSET(ctx, 0, sizeof(x25519_nb_ctx_t));
+    }
+    key->nb_ctx = ctx;
+    return 0;
+}
+
+#endif /* WC_X25519_NONBLOCK */
+
 /* generate a new keypair.
  *
  * return value is propagated from wc_curve25519_make_private() or
@@ -408,7 +741,10 @@ int wc_curve25519_make_key(WC_RNG* rng, int keysize, curve25519_key* key)
         return BAD_FUNC_ARG;
 
 #ifdef WOLF_CRYPTO_CB
-    if (key->devId != INVALID_DEVID) {
+    #ifndef WOLF_CRYPTO_CB_FIND
+    if (key->devId != INVALID_DEVID)
+    #endif
+    {
         ret = wc_CryptoCb_Curve25519Gen(rng, keysize, key);
         if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
             return ret;
@@ -416,27 +752,52 @@ int wc_curve25519_make_key(WC_RNG* rng, int keysize, curve25519_key* key)
     }
 #endif
 
-#ifdef WOLFSSL_SE050
-    ret = se050_curve25519_create_key(key, keysize);
+#ifdef WOLF_CRYPTO_CB_ONLY_CURVE25519
+    /* software path stripped; callback is the only provider */
+    return NO_VALID_DEVID;
 #else
-    ret = wc_curve25519_make_priv(rng, keysize, key->k);
-    if (ret == 0) {
-        key->privSet = 1;
-#ifdef WOLFSSL_CURVE25519_BLINDING
-        ret = wc_curve25519_make_pub_blind((int)sizeof(key->p.point),
-                                           key->p.point, (int)sizeof(key->k),
-                                           key->k, rng);
-        if (ret == 0) {
-            ret = wc_curve25519_set_rng(key, rng);
+#if defined(WOLFSSL_ASYNC_CRYPT) && defined(WC_ASYNC_ENABLE_X25519) && \
+    defined(WOLFSSL_ASYNC_CRYPT_SW)
+    if (key->asyncDev.marker == WOLFSSL_ASYNC_MARKER_X25519) {
+        if (wc_AsyncSwInit(&key->asyncDev, ASYNC_SW_X25519_MAKE)) {
+            WC_ASYNC_SW* sw = &key->asyncDev.sw;
+            sw->x25519Make.rng = rng;
+            sw->x25519Make.size = keysize;
+            sw->x25519Make.key = key;
+            return WC_PENDING_E;
         }
-#else
-        ret = wc_curve25519_make_pub((int)sizeof(key->p.point), key->p.point,
-                                     (int)sizeof(key->k), key->k);
-#endif
-        key->pubSet = (ret == 0);
     }
+#endif /* WOLFSSL_ASYNC_CRYPT && WC_ASYNC_ENABLE_X25519 &&
+        * WOLFSSL_ASYNC_CRYPT_SW */
+
+#if defined(WOLFSSL_SE050) && !defined(WOLFSSL_SE050_ONLY_KEY_ID)
+    ret = se050_curve25519_create_key(key, keysize);
+#elif defined(WC_X25519_NONBLOCK)
+    if (key->nb_ctx != NULL) {
+        ret = wc_curve25519_make_key_nb(rng, keysize, key);
+    }
+    else
 #endif
+    /* Under WOLFSSL_SE050_ONLY_KEY_ID, generate a software key (keyIdSet == 0);
+     * its shared-secret computation routes through software (privSet == 1). */
+#if !defined(WOLFSSL_SE050) || defined(WOLFSSL_SE050_ONLY_KEY_ID)
+    {
+        ret = wc_curve25519_make_priv(rng, keysize, key->k);
+        if (ret == 0) {
+            key->privSet = 1;
+            ret = curve25519_key_make_pub(key, rng);
+#ifdef WOLFSSL_CURVE25519_BLINDING
+            if (ret == 0) {
+                ret = wc_curve25519_set_rng(key, rng);
+            }
+#endif
+            key->pubSet = (ret == 0);
+        }
+    }
+#endif /* !WOLFSSL_SE050 */
+
     return ret;
+#endif /* WOLF_CRYPTO_CB_ONLY_CURVE25519 */
 }
 
 #ifdef HAVE_CURVE25519_SHARED_SECRET
@@ -449,12 +810,76 @@ int wc_curve25519_shared_secret(curve25519_key* private_key,
                                           out, outlen, EC25519_BIG_ENDIAN);
 }
 
+#ifdef WC_X25519_NONBLOCK
+
+static int wc_curve25519_shared_secret_nb(curve25519_key* privKey,
+    curve25519_key* pubKey, byte* out, word32* outlen, int endian)
+{
+    int ret = FP_WOULDBLOCK;
+
+    switch (privKey->nb_ctx->ssState) {
+        case 0:
+            privKey->nb_ctx->ssState = 1;
+            break;
+        case 1:
+            /* Write the result directly into the caller's 'out' buffer.
+             * curve25519_nb() zeroes the non-blocking context on completion,
+             * so any output buffer that lives inside nb_ctx (e.g.
+             * nb_ctx->o.point) would be clobbered to zero before we could
+             * read it. The output is little-endian; case 2 handles the
+             * optional byte-reversal for EC25519_BIG_ENDIAN. */
+            ret = curve25519_nb(out, privKey->k, pubKey->p.point,
+                      privKey->nb_ctx);
+            if (ret == 0) {
+                ret = FP_WOULDBLOCK;
+                privKey->nb_ctx->ssState = 2;
+            }
+            break;
+        case 2:
+        #ifndef WOLFSSL_NO_ECDHX_SHARED_ZERO_CHECK
+            {
+                int i;
+                byte t = 0;
+
+                for (i = 0; i < CURVE25519_KEYSIZE; i++) {
+                    t |= out[i];
+                }
+                if (t == 0) {
+                    ForceZero(out, CURVE25519_KEYSIZE);
+                    ret = ECC_OUT_OF_RANGE_E;
+                    break;
+                }
+            }
+        #endif /* !WOLFSSL_NO_ECDHX_SHARED_ZERO_CHECK */
+            if (endian == EC25519_BIG_ENDIAN) {
+                /* Reverse the little-endian result in place. */
+                int i;
+                byte tmp;
+                for (i = 0; i < CURVE25519_KEYSIZE / 2; i++) {
+                    tmp = out[i];
+                    out[i] = out[CURVE25519_KEYSIZE - 1 - i];
+                    out[CURVE25519_KEYSIZE - 1 - i] = tmp;
+                }
+            }
+            *outlen = CURVE25519_KEYSIZE;
+            ret = 0;
+            break;
+    }
+
+    if (ret != FP_WOULDBLOCK) {
+        XMEMSET(privKey->nb_ctx, 0, sizeof(x25519_nb_ctx_t));
+    }
+
+    return ret;
+}
+
+#endif /* WC_X25519_NONBLOCK */
+
 int wc_curve25519_shared_secret_ex(curve25519_key* private_key,
                                    curve25519_key* public_key,
                                    byte* out, word32* outlen, int endian)
 {
-    int ret;
-    ECPoint o;
+    int ret = 0;
 
     /* sanity check */
     if (private_key == NULL || public_key == NULL ||
@@ -471,13 +896,18 @@ int wc_curve25519_shared_secret_ex(curve25519_key* private_key,
         return ECC_BAD_ARG_E;
     }
 
+#ifdef WOLFSSL_X25519_NO_MASK_PEER
     /* avoid implementation fingerprinting - make sure signed bit is not set */
     if (public_key->p.point[CURVE25519_KEYSIZE-1] & 0x80) {
         return ECC_BAD_ARG_E;
     }
+#endif
 
 #ifdef WOLF_CRYPTO_CB
-    if (private_key->devId != INVALID_DEVID) {
+    #ifndef WOLF_CRYPTO_CB_FIND
+    if (private_key->devId != INVALID_DEVID)
+    #endif
+    {
         ret = wc_CryptoCb_Curve25519(private_key, public_key, out, outlen,
             endian);
         if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
@@ -486,53 +916,104 @@ int wc_curve25519_shared_secret_ex(curve25519_key* private_key,
     }
 #endif
 
-    XMEMSET(&o, 0, sizeof(o));
-
-#ifdef FREESCALE_LTC_ECC
-    /* input point P on Curve25519 */
-    ret = nxp_ltc_curve25519(&o, private_key->k, &public_key->p,
-        kLTC_Curve25519);
+#ifdef WOLF_CRYPTO_CB_ONLY_CURVE25519
+    /* software path stripped; callback is the only provider */
+    return NO_VALID_DEVID;
 #else
-    #ifdef WOLFSSL_SE050
-    if (!private_key->privSet) {
-        /* use NXP SE050: "privSet" is not set */
-        ret = se050_curve25519_shared_secret(private_key, public_key, &o);
+#ifdef WC_X25519_NONBLOCK
+
+#if defined(WOLFSSL_ASYNC_CRYPT) && defined(WC_ASYNC_ENABLE_X25519) && \
+    defined(WOLFSSL_ASYNC_CRYPT_SW)
+    if (private_key->asyncDev.marker == WOLFSSL_ASYNC_MARKER_X25519) {
+        if (wc_AsyncSwInit(&private_key->asyncDev,
+                ASYNC_SW_X25519_SHARED_SEC)) {
+            WC_ASYNC_SW* sw = &private_key->asyncDev.sw;
+            sw->x25519SharedSec.priv = private_key;
+            sw->x25519SharedSec.pub = public_key;
+            sw->x25519SharedSec.out = out;
+            sw->x25519SharedSec.outLen = outlen;
+            sw->x25519SharedSec.endian = endian;
+            return WC_PENDING_E;
+        }
+    }
+#endif /* WOLFSSL_ASYNC_CRYPT && WC_ASYNC_ENABLE_X25519 &&
+        * WOLFSSL_ASYNC_CRYPT_SW */
+
+    if (private_key->nb_ctx != NULL) {
+        ret = wc_curve25519_shared_secret_nb(private_key, public_key, out,
+                  outlen, endian);
     }
     else
-    #endif
+#endif /* WC_X25519_NONBLOCK */
     {
-#ifndef WOLFSSL_CURVE25519_BLINDING
-    SAVE_VECTOR_REGISTERS(return _svr_ret;);
+        ECPoint o;
 
-    ret = curve25519(o.point, private_key->k, public_key->p.point);
+        XMEMSET(&o, 0, sizeof(o));
 
-    RESTORE_VECTOR_REGISTERS();
+#ifdef FREESCALE_LTC_ECC
+        /* input point P on Curve25519 */
+        ret = nxp_ltc_curve25519(&o, private_key->k, &public_key->p,
+            kLTC_Curve25519);
 #else
-    ret = curve25519_smul_blind(o.point, private_key->k, public_key->p.point,
-                                private_key->rng);
-#endif
-    }
-#endif
-#ifdef WOLFSSL_ECDHX_SHARED_NOT_ZERO
-    if (ret == 0) {
-        int i;
-        byte t = 0;
-        for (i = 0; i < CURVE25519_KEYSIZE; i++) {
-            t |= o.point[i];
+    #ifdef WOLFSSL_SE050
+        if (!private_key->privSet) {
+            /* use NXP SE050: "privSet" is not set */
+            ret = se050_curve25519_shared_secret(private_key, public_key, &o);
         }
-        if (t == 0) {
-            ret = ECC_OUT_OF_RANGE_E;
-        }
-    }
-#endif
-    if (ret == 0) {
-        curve25519_copy_point(out, o.point, endian);
-        *outlen = CURVE25519_KEYSIZE;
-    }
+        else
+    #endif /* WOLFSSL_SE050 */
+        {
+        #ifdef WOLFSSL_X25519_NO_MASK_PEER
+            byte* pubVal = public_key->p.point;
+        #else
+            byte pubVal[CURVE25519_KEYSIZE];
 
-    ForceZero(&o, sizeof(o));
+            XMEMCPY(pubVal, public_key->p.point, CURVE25519_KEYSIZE);
+            pubVal[CURVE25519_KEYSIZE-1] &= 0x7f;
+        #endif
+
+#ifndef WOLFSSL_CURVE25519_BLINDING
+            SAVE_VECTOR_REGISTERS(return _svr_ret;);
+
+            ret = curve25519(o.point, private_key->k, pubVal);
+
+            RESTORE_VECTOR_REGISTERS();
+#else
+            ret = curve25519_smul_blind(o.point, private_key->k, pubVal,
+                      private_key->rng);
+#endif
+        }
+#endif /* FREESCALE_LTC_ECC */
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+        /* Past the SAVE_VECTOR_REGISTERS early-return: o now holds the shared
+         * secret and every remaining path reaches the ForceZero below. */
+        wc_MemZero_Add("wc_curve25519_shared_secret_ex o", &o, sizeof(o));
+#endif
+#ifndef WOLFSSL_NO_ECDHX_SHARED_ZERO_CHECK
+        if (ret == 0) {
+            int i;
+            byte t = 0;
+            for (i = 0; i < CURVE25519_KEYSIZE; i++) {
+                t |= o.point[i];
+            }
+            if (t == 0) {
+                ret = ECC_OUT_OF_RANGE_E;
+            }
+        }
+#endif /* !WOLFSSL_NO_ECDHX_SHARED_ZERO_CHECK */
+        if (ret == 0) {
+            curve25519_copy_point(out, o.point, endian);
+            *outlen = CURVE25519_KEYSIZE;
+        }
+
+        ForceZero(&o, sizeof(o));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Check(&o, sizeof(o));
+#endif
+    }
 
     return ret;
+#endif /* WOLF_CRYPTO_CB_ONLY_CURVE25519 */
 }
 
 #endif /* HAVE_CURVE25519_SHARED_SECRET */
@@ -566,12 +1047,9 @@ int wc_curve25519_export_public_ex(curve25519_key* key, byte* out,
     /* calculate public if missing */
     if (!key->pubSet) {
 #ifdef WOLFSSL_CURVE25519_BLINDING
-        ret = wc_curve25519_make_pub_blind((int)sizeof(key->p.point),
-                                           key->p.point, (int)sizeof(key->k),
-                                           key->k, key->rng);
+        ret = curve25519_key_make_pub(key, key->rng);
 #else
-        ret = wc_curve25519_make_pub((int)sizeof(key->p.point), key->p.point,
-                                     (int)sizeof(key->k), key->k);
+        ret = curve25519_key_make_pub(key, NULL);
 #endif
         key->pubSet = (ret == 0);
     }
@@ -696,7 +1174,7 @@ int wc_curve25519_check_public(const byte* pub, word32 pubSz, int endian)
         /* Check for order-1 or higher. */
         if (pub[0] == 0x7f) {
             for (i = 1; i < CURVE25519_KEYSIZE - 1; i++) {
-                if (pub[i] != 0)
+                if (pub[i] != 0xff)
                     break;
             }
             if (i == CURVE25519_KEYSIZE - 1 && (pub[i] >= 0xec))
@@ -731,6 +1209,9 @@ int wc_curve25519_export_private_raw_ex(curve25519_key* key, byte* out,
     /* sanity check */
     if (key == NULL || out == NULL || outLen == NULL)
         return BAD_FUNC_ARG;
+
+    if (!key->privSet)
+        return ECC_BAD_ARG_E;
 
     /* check size of outgoing buffer */
     if (*outLen < CURVE25519_KEYSIZE) {
@@ -874,10 +1355,12 @@ curve25519_key* wc_curve25519_new(void* heap, int devId, int *result_code)
 }
 
 int wc_curve25519_delete(curve25519_key* key, curve25519_key** key_p) {
+    void* heap;
     if (key == NULL)
         return BAD_FUNC_ARG;
+    heap = key->heap;
     wc_curve25519_free(key);
-    XFREE(key, key->heap, DYNAMIC_TYPE_CURVE25519);
+    XFREE(key, heap, DYNAMIC_TYPE_CURVE25519);
     if (key_p != NULL)
         *key_p = NULL;
     return 0;
@@ -886,30 +1369,41 @@ int wc_curve25519_delete(curve25519_key* key, curve25519_key** key_p) {
 
 int wc_curve25519_init_ex(curve25519_key* key, void* heap, int devId)
 {
-    if (key == NULL)
-       return BAD_FUNC_ARG;
+    int ret = 0;
 
-    XMEMSET(key, 0, sizeof(*key));
+    if (key == NULL) {
+       ret = BAD_FUNC_ARG;
+    }
+    else {
+        XMEMSET(key, 0, sizeof(*key));
 
-    /* currently the format for curve25519 */
-    key->dp = &curve25519_sets[0];
+        /* currently the format for curve25519 */
+        key->dp = &curve25519_sets[0];
 
-#ifdef WOLF_CRYPTO_CB
-    key->devId = devId;
-#else
-    (void)devId;
-#endif
-    (void)heap; /* if needed for XMALLOC/XFREE in future */
+    #ifdef WOLF_CRYPTO_CB
+        key->devId = devId;
+    #else
+        (void)devId;
+    #endif
+        (void)heap; /* if needed for XMALLOC/XFREE in future */
 
-#ifndef FREESCALE_LTC_ECC
-    fe_init();
-#endif
+    /* field math is implemented in the callback in crypto cb only */
+    #if !defined(FREESCALE_LTC_ECC) && !defined(WOLF_CRYPTO_CB_ONLY_CURVE25519)
+        fe_init();
+    #endif
 
-#ifdef WOLFSSL_CHECK_MEM_ZERO
-    wc_MemZero_Add("wc_curve25519_init_ex key->k", key->k, CURVE25519_KEYSIZE);
-#endif
+    #ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Add("wc_curve25519_init_ex key->k", key->k,
+            CURVE25519_KEYSIZE);
+    #endif
 
-    return 0;
+    #if defined(WOLFSSL_ASYNC_CRYPT) && defined(WC_ASYNC_ENABLE_X25519)
+        ret = wolfAsync_DevCtxInit(&key->asyncDev, WOLFSSL_ASYNC_MARKER_X25519,
+                  heap, devId);
+    #endif
+    }
+
+    return ret;
 }
 
 int wc_curve25519_init(curve25519_key* key)
@@ -940,6 +1434,17 @@ int wc_curve25519_set_rng(curve25519_key* key, WC_RNG* rng)
     if (key == NULL)
         return BAD_FUNC_ARG;
     key->rng = rng;
+    return 0;
+}
+
+/* Companion to wc_curve25519_set_rng(): detach the key's RNG association.
+ * Subsequent blinded operations then fail in the RNG service (BAD_FUNC_ARG
+ * on the NULL WC_RNG) until a new one is set. */
+int wc_curve25519_clear_rng(curve25519_key* key)
+{
+    if (key == NULL)
+        return BAD_FUNC_ARG;
+    key->rng = NULL;
     return 0;
 }
 #endif

@@ -1,6 +1,6 @@
 /* ed448.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -30,13 +30,13 @@
  *     Check that the private key didn't change during the signing operations.
  */
 
+#define WC_FIPS_LL_CRYPTO
+#define _WC_BUILDING_ED448_C
+
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
 #ifdef HAVE_ED448
 #if FIPS_VERSION3_GE(6,0,0)
-    /* set NO_WRAPPERS before headers, use direct internal f()s not wrappers */
-    #define FIPS_NO_WRAPPERS
-
        #ifdef USE_WINDOWS_API
                #pragma code_seg(".fipsA$f")
                #pragma const_seg(".fipsB$f")
@@ -45,6 +45,9 @@
 
 #include <wolfssl/wolfcrypt/ed448.h>
 #include <wolfssl/wolfcrypt/hash.h>
+#ifdef WOLF_CRYPTO_CB
+    #include <wolfssl/wolfcrypt/cryptocb.h>
+#endif
 #ifdef NO_INLINE
     #include <wolfssl/wolfcrypt/misc.h>
 #else
@@ -152,7 +155,7 @@ static int ed448_hash(ed448_key* key, const byte* in, word32 inLen,
 {
     int ret;
 #ifndef WOLFSSL_ED448_PERSISTENT_SHA
-    wc_Shake sha[1];
+    WC_DECLARE_VAR(sha, wc_Shake, 1, key ? key->heap : NULL);
 #else
     wc_Shake *sha;
 #endif
@@ -165,10 +168,16 @@ static int ed448_hash(ed448_key* key, const byte* in, word32 inLen,
     sha = &key->sha;
     ret = ed448_hash_reset(key);
 #else
+    WC_ALLOC_VAR_EX(sha, wc_Shake, 1, key->heap, DYNAMIC_TYPE_HASHES,
+                    return MEMORY_E);
     ret = ed448_hash_init(key, sha);
 #endif
-    if (ret < 0)
+    if (ret < 0) {
+    #ifndef WOLFSSL_ED448_PERSISTENT_SHA
+        WC_FREE_VAR_EX(sha, key->heap, DYNAMIC_TYPE_HASHES);
+    #endif
         return ret;
+    }
 
     ret = ed448_hash_update(key, sha, in, inLen);
     if (ret == 0)
@@ -176,6 +185,7 @@ static int ed448_hash(ed448_key* key, const byte* in, word32 inLen,
 
 #ifndef WOLFSSL_ED448_PERSISTENT_SHA
     ed448_hash_free(key, sha);
+    WC_FREE_VAR_EX(sha, key->heap, DYNAMIC_TYPE_HASHES);
 #endif
 
     return ret;
@@ -231,7 +241,132 @@ static int ed448_pairwise_consistency_test(ed448_key* key, WC_RNG* rng)
 }
 #endif
 
+/* Reject small-order Ed448 public keys: h*A vanishes during verification
+ * so any (R = [S]B, S) verifies for an arbitrary message. Cofactor is 4. */
+static int ed448_is_small_order(const byte p[ED448_PUB_KEY_SIZE])
+{
+    /* y-coordinates of every order-1/2/4 point plus the non-canonical
+     * encodings y = p / y = p+1. Byte 56 is cleared in both table and
+     * input before compare, masking the x-sign bit and the
+     * spec-mandated-zero (but decoder-ignored) bits 0-6. The decoder
+     * (fe448_from_bytes) reads bytes 0-55 modulo p with no canonical-form
+     * check, so y = p decodes to 0 and y = p+1 decodes to 1; both must
+     * be rejected here. Only {y, y + p} fits in 56 bytes (2p overflows),
+     * so listing y and y + p exhausts the reachable encodings.
+     * wc_ed448_check_key() depends on the y = p row: its Y-range test
+     * accepts that encoding, so dropping the row would let a y outside
+     * [0, p - 1] through. */
+    static const byte small_order_y[][ED448_PUB_KEY_SIZE] = {
+        /* order 1: identity y = 1, x = 0 */
+        {0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00},
+        /* order 4: y = 0 (x = +/-1; sign bit covered by mask) */
+        {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00},
+        /* order 2: y = p - 1, x = 0; p = 2^448 - 2^224 - 1 */
+        {0xfe,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xfe,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0x00},
+        /* non-canonical y = p (decodes to y = 0) */
+        {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xfe,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0x00},
+        /* non-canonical y = p + 1 (decodes to y = 1) */
+        {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+         0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+         0x00},
+    };
+    byte y[ED448_PUB_KEY_SIZE];
+    word32 i;
+
+    XMEMCPY(y, p, ED448_PUB_KEY_SIZE);
+    y[ED448_PUB_KEY_SIZE - 1] = 0;
+    for (i = 0; i < sizeof(small_order_y) / ED448_PUB_KEY_SIZE; i++) {
+        if (XMEMCMP(y, small_order_y[i], ED448_PUB_KEY_SIZE) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Check the y-coordinate of an encoded Ed448 public key is in [0, p - 1]
+ * (RFC 8032 5.2.3). Only have y so check that ordinate.
+ * p = 2^448-2^224-1 = 0xff..fe..ff
+ *
+ * The decoder (fe448_from_bytes) reads bytes 0-55 modulo p and ignores bits
+ * 0-6 of byte 56, so an out of range y decodes to the same point as its
+ * canonical encoding and must be rejected here.
+ *
+ * @param [in] p  Encoded public key.
+ * @return  1 when y is in range.
+ * @return  0 when y >= p.
+ */
+static int ed448_pub_y_in_range(const byte p[ED448_PUB_KEY_SIZE])
+{
+    int i;
+
+    /* Last byte: bit 7 is the sign of x, bits 0-6 are the top bits of y and
+     * must be zero; when set y >= 2^448 > p. */
+    if ((p[ED448_PUB_KEY_SIZE - 1] & 0x7f) != 0)
+        return 0;
+
+    /* Check top part before 0xFE - skipping the sign byte. */
+    for (i = ED448_PUB_KEY_SIZE - 2; i > ED448_PUB_KEY_SIZE/2; i--) {
+        if (p[i] < 0xff)
+            return 1;
+    }
+    /* Every byte above this one is 0xff here, so y > p whenever this byte is
+     * 0xff, and y == p is then the only remaining encoding outside
+     * [0, p - 1]. It is rejected by ed448_is_small_order(), whose table
+     * carries y == p as a non-canonical encoding, so the low bytes need no
+     * check. */
+    return p[ED448_PUB_KEY_SIZE/2] <= 0xfe;
+}
+
+/* Mirror a derived public key into the key object, in the layout
+ * wc_ed448_make_key() leaves: key->p, and a copy after the private key in
+ * key->k.  Only ever called for a key with no public half yet - deriving into
+ * scratch and comparing against key->p is how wc_ed448_check_key() works.
+ */
+static void ed448_store_public(ed448_key* key, const byte* pubKey)
+{
+    if (pubKey != key->p) {
+        XMEMCPY(key->p, pubKey, ED448_PUB_KEY_SIZE);
+    }
+    /* put public key after private key, on the same buffer */
+    XMEMMOVE(key->k + ED448_KEY_SIZE, key->p, ED448_PUB_KEY_SIZE);
+}
+
 /* Derive the public key for the private key.
+ *
+ * Also stores the derived key in the key object when it did not already carry
+ * a public half.
  *
  * key       [in]  Ed448 key object.
  * pubKey    [in]  Byte array to hold the public key.
@@ -244,6 +379,7 @@ static int ed448_pairwise_consistency_test(ed448_key* key, WC_RNG* rng)
 int wc_ed448_make_public(ed448_key* key, unsigned char* pubKey, word32 pubKeySz)
 {
     int   ret = 0;
+    int   storePub = 0;
     byte  az[ED448_PRV_KEY_SIZE];
     ge448_p2 A;
 
@@ -253,6 +389,14 @@ int wc_ed448_make_public(ed448_key* key, unsigned char* pubKey, word32 pubKeySz)
 
     if ((ret == 0) && (!key->privKeySet)) {
         ret = ECC_PRIV_KEY_E;
+    }
+
+    if (ret == 0) {
+        /* The key doesn't carry its public half yet (e.g. it was decoded from
+         * a PKCS#8 v1 PrivateKeyInfo, which holds only the seed): fill it in
+         * as well, so pubKeySet below doesn't end up set on a key whose p/k
+         * are still empty. */
+        storePub = !key->pubKeySet;
     }
 
     if (ret == 0)
@@ -270,6 +414,8 @@ int wc_ed448_make_public(ed448_key* key, unsigned char* pubKey, word32 pubKeySz)
     if (ret == 0) {
         ge448_to_bytes(pubKey, &A);
 
+        if (storePub)
+            ed448_store_public(key, pubKey);
         key->pubKeySet = 1;
     }
 
@@ -307,23 +453,22 @@ int wc_ed448_make_key(WC_RNG* rng, int keySz, ed448_key* key)
     }
     if (ret == 0) {
         key->privKeySet = 1;
+        /* pubKeySet was just cleared, so this also stores the public key in
+         * key->p and after the private key in key->k */
         ret = wc_ed448_make_public(key, key->p, ED448_PUB_KEY_SIZE);
         if (ret != 0) {
             key->privKeySet = 0;
             ForceZero(key->k, ED448_KEY_SIZE);
         }
     }
+#if FIPS_VERSION3_GE(6,0,0)
     if (ret == 0) {
-        /* put public key after private key, on the same buffer */
-        XMEMMOVE(key->k + ED448_KEY_SIZE, key->p, ED448_PUB_KEY_SIZE);
-
-    #if FIPS_VERSION3_GE(6,0,0)
         ret = wc_ed448_check_key(key);
         if (ret == 0) {
             ret = ed448_pairwise_consistency_test(key, rng);
         }
-    #endif
     }
+#endif
 
     return ret;
 }
@@ -358,13 +503,60 @@ int wc_ed448_sign_msg_ex(const byte* in, word32 inLen, byte* out,
 #ifdef WOLFSSL_EDDSA_CHECK_PRIV_ON_SIGN
     byte     orig_k[ED448_KEY_SIZE];
 #endif
+#ifndef WOLFSSL_ED448_PERSISTENT_SHA
+    WC_DECLARE_VAR(sha, wc_Shake, 1, key ? key->heap : NULL);
+#endif
 
     /* sanity check on arguments */
-    if ((in == NULL) || (out == NULL) || (outLen == NULL) || (key == NULL) ||
-                                     ((context == NULL) && (contextLen != 0))) {
+    if (((in == NULL) && (inLen != 0)) || (out == NULL) || (outLen == NULL) ||
+            (key == NULL) || ((context == NULL) && (contextLen != 0))) {
         ret = BAD_FUNC_ARG;
     }
+    /* An empty message may be passed as (NULL, 0); canonicalize it to a
+     * readable stand-in so that downstream consumers -- hash updates and
+     * crypto callbacks -- never see a NULL pointer. */
+    if ((ret == 0) && (in == NULL)) {
+        static const byte ed448_empty_msg = 0;
+        in = &ed448_empty_msg;
+    }
+
+    if ((ret == 0) && (type == Ed448ph) && (inLen != ED448_PREHASH_SIZE)) {
+        ret = BAD_LENGTH_E;
+    }
+
+#ifdef WOLF_CRYPTO_CB
+    if (ret == 0) {
+    #ifndef WOLF_CRYPTO_CB_FIND
+        if (key->devId != INVALID_DEVID)
+    #endif
+        {
+            ret = wc_CryptoCb_Ed448Sign(in, inLen, out, outLen, key, type,
+                context, contextLen);
+            if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
+                return ret;
+            ret = 0; /* fall-through when unavailable */
+        }
+    }
+#endif
+
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    /* Register the secret nonce/expanded-key buffers up front so that any exit
+     * path from here to the ForceZero below is checked for proper zeroization.
+     * XMEMSET gives them a defined value before the hash steps fill them. */
+    XMEMSET(az, 0, sizeof(az));
+    XMEMSET(nonce, 0, sizeof(nonce));
+    wc_MemZero_Add("wc_ed448_sign_msg_ex az", az, sizeof(az));
+    wc_MemZero_Add("wc_ed448_sign_msg_ex nonce", nonce, sizeof(nonce));
+#ifdef WOLFSSL_EDDSA_CHECK_PRIV_ON_SIGN
+    XMEMSET(orig_k, 0, sizeof(orig_k));
+    wc_MemZero_Add("wc_ed448_sign_msg_ex orig_k", orig_k, sizeof(orig_k));
+#endif
+#endif
+
     if ((ret == 0) && (!key->pubKeySet)) {
+        ret = BAD_FUNC_ARG;
+    }
+    if ((ret == 0) && (!key->privKeySet)) {
         ret = BAD_FUNC_ARG;
     }
 
@@ -389,18 +581,19 @@ int wc_ed448_sign_msg_ex(const byte* in, word32 inLen, byte* out,
 #ifdef WOLFSSL_ED448_PERSISTENT_SHA
         wc_Shake *sha = &key->sha;
 #else
-        wc_Shake sha[1];
-        ret = ed448_hash_init(key, sha);
-        if (ret < 0)
-            return ret;
+        WC_ALLOC_VAR_EX(sha, wc_Shake, 1, key->heap, DYNAMIC_TYPE_HASHES,
+                        ret = MEMORY_E);
+        if (ret == 0)
+            ret = ed448_hash_init(key, sha);
 #endif
         /* apply clamp */
         az[0]  &= 0xfc;
         az[55] |= 0x80;
         az[56]  = 0x00;
 
-        ret = ed448_hash_update(key, sha, ed448Ctx, ED448CTX_SIZE);
-
+        if (ret == 0) {
+            ret = ed448_hash_update(key, sha, ed448Ctx, ED448CTX_SIZE);
+        }
         if (ret == 0) {
             ret = ed448_hash_update(key, sha, &type, sizeof(type));
         }
@@ -427,17 +620,15 @@ int wc_ed448_sign_msg_ex(const byte* in, word32 inLen, byte* out,
 #ifdef WOLFSSL_ED448_PERSISTENT_SHA
         wc_Shake *sha = &key->sha;
 #else
-        wc_Shake sha[1];
         ret = ed448_hash_init(key, sha);
-        if (ret < 0)
-            return ret;
 #endif
-        sc448_reduce(nonce);
-
+        if (ret == 0)
+            sc448_reduce(nonce);
         /* step 2: computing R = rB where rB is the scalar multiplication of
            r and B */
-        ret = ge448_scalarmult_base(&R,nonce);
-
+        if (ret == 0) {
+            ret = ge448_scalarmult_base(&R,nonce);
+        }
         /* step 3: hash R + public key + message getting H(R,A,M) then
            creating S = (r + H(R,A,M)a) mod l */
         if (ret == 0) {
@@ -470,6 +661,9 @@ int wc_ed448_sign_msg_ex(const byte* in, word32 inLen, byte* out,
         ed448_hash_free(key, sha);
 #endif
     }
+#ifndef WOLFSSL_ED448_PERSISTENT_SHA
+    WC_FREE_VAR_EX(sha, key->heap, DYNAMIC_TYPE_HASHES);
+#endif
 
     if (ret == 0) {
         sc448_reduce(hram);
@@ -485,8 +679,18 @@ int wc_ed448_sign_msg_ex(const byte* in, word32 inLen, byte* out,
         }
         ret = ctMaskGT(c, 0) & SIG_VERIFY_E;
     }
+    ForceZero(orig_k, sizeof(orig_k));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    wc_MemZero_Check(orig_k, sizeof(orig_k));
+#endif
 #endif
 
+    ForceZero(az, sizeof(az));
+    ForceZero(nonce, sizeof(nonce));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    wc_MemZero_Check(nonce, sizeof(nonce));
+    wc_MemZero_Check(az, sizeof(az));
+#endif
     return ret;
 }
 
@@ -708,6 +912,19 @@ static int ed448_verify_msg_final_with_sha(const byte* sig, word32 sigLen,
     if (i == -1)
         return BAD_FUNC_ARG;
 
+    /* Defence in depth: also catch small-order and non-canonical keys
+     * imported with trusted=1. */
+    if (ed448_is_small_order(key->p)) {
+        WOLFSSL_MSG("Ed448 small-order public key rejected during "
+                    "signature verification");
+        return BAD_FUNC_ARG;
+    }
+    if (!ed448_pub_y_in_range(key->p)) {
+        WOLFSSL_MSG("Ed448 public key with y >= p rejected during "
+                    "signature verification");
+        return BAD_FUNC_ARG;
+    }
+
     /* uncompress A (public key), test if valid, and negate it */
     if (ge448_from_bytes_negate_vartime(&A, key->p) != 0)
         return BAD_FUNC_ARG;
@@ -787,18 +1004,55 @@ int wc_ed448_verify_msg_ex(const byte* sig, word32 sigLen, const byte* msg,
 #ifdef WOLFSSL_ED448_PERSISTENT_SHA
     wc_Shake *sha;
 #else
-    wc_Shake sha[1];
+    WC_DECLARE_VAR(sha, wc_Shake, 1, key ? key->heap : NULL);
 #endif
 
     if (key == NULL)
         return BAD_FUNC_ARG;
 
+    /* A NULL msg is valid for the empty message (msgLen == 0). */
+    if ((sig == NULL) || (res == NULL) || ((msg == NULL) && (msgLen != 0)))
+        return BAD_FUNC_ARG;
+
+    /* An empty message may be passed as (NULL, 0); canonicalize it to a
+     * readable stand-in so that downstream consumers -- hash updates and
+     * crypto callbacks -- never see a NULL pointer. */
+    if (msg == NULL) {
+        static const byte ed448_empty_msg = 0;
+        msg = &ed448_empty_msg;
+    }
+
+    if ((type == Ed448ph) &&
+        (msgLen != ED448_PREHASH_SIZE))
+    {
+        return BAD_LENGTH_E;
+    }
+
+#ifdef WOLF_CRYPTO_CB
+    #ifndef WOLF_CRYPTO_CB_FIND
+    if (key->devId != INVALID_DEVID)
+    #endif
+    {
+        if (res != NULL)
+            *res = 0;
+        ret = wc_CryptoCb_Ed448Verify(sig, sigLen, msg, msgLen, res, key, type,
+            context, contextLen);
+        if (ret != WC_NO_ERR_TRACE(CRYPTOCB_UNAVAILABLE))
+            return ret;
+        /* fall-through when unavailable */
+    }
+#endif
+
 #ifdef WOLFSSL_ED448_PERSISTENT_SHA
     sha = &key->sha;
 #else
+    WC_ALLOC_VAR_EX(sha, wc_Shake, 1, key->heap, DYNAMIC_TYPE_HASHES,
+                    return MEMORY_E);
     ret = ed448_hash_init(key, sha);
-    if (ret < 0)
+    if (ret < 0) {
+        WC_FREE_VAR_EX(sha, key->heap, DYNAMIC_TYPE_HASHES);
         return ret;
+    }
 #endif
 
     ret = ed448_verify_msg_init_with_sha(sig, sigLen, key, sha,
@@ -810,6 +1064,7 @@ int wc_ed448_verify_msg_ex(const byte* sig, word32 sigLen, const byte* msg,
 
 #ifndef WOLFSSL_ED448_PERSISTENT_SHA
     ed448_hash_free(key, sha);
+    WC_FREE_VAR_EX(sha, key->heap, DYNAMIC_TYPE_HASHES);
 #endif
 
     return ret;
@@ -956,6 +1211,41 @@ void wc_ed448_free(ed448_key* key)
     }
 }
 
+#ifndef WC_NO_CONSTRUCTORS
+ed448_key* wc_ed448_new(void* heap, int devId, int *result_code)
+{
+    int ret;
+    ed448_key* key = (ed448_key*)XMALLOC(sizeof(ed448_key), heap,
+                        DYNAMIC_TYPE_ED448);
+    if (key == NULL) {
+        ret = MEMORY_E;
+    }
+    else {
+        ret = wc_ed448_init_ex(key, heap, devId);
+        if (ret != 0) {
+            XFREE(key, heap, DYNAMIC_TYPE_ED448);
+            key = NULL;
+        }
+    }
+
+    if (result_code != NULL)
+        *result_code = ret;
+
+    return key;
+}
+
+int wc_ed448_delete(ed448_key* key, ed448_key** key_p) {
+    void* heap;
+    if (key == NULL)
+        return BAD_FUNC_ARG;
+    heap = key->heap;
+    wc_ed448_free(key);
+    XFREE(key, heap, DYNAMIC_TYPE_ED448);
+    if (key_p != NULL)
+        *key_p = NULL;
+    return 0;
+}
+#endif /* !WC_NO_CONSTRUCTORS */
 
 #ifdef HAVE_ED448_KEY_EXPORT
 
@@ -965,7 +1255,8 @@ void wc_ed448_free(ed448_key* key)
  * out     [in]      Array to hold public key.
  * outLen  [in/out]  On in, the number of bytes in array.
  *                   On out, the number bytes put into array.
- * returns BAD_FUNC_ARG when a parameter is NULL,
+ * returns PUBLIC_KEY_E the given key only has a private key present,
+ *         BAD_FUNC_ARG when a parameter is NULL,
  *         ECC_BAD_ARG_E when outLen is less than ED448_PUB_KEY_SIZE,
  *         0 otherwise.
  */
@@ -981,6 +1272,10 @@ int wc_ed448_export_public(const ed448_key* key, byte* out, word32* outLen)
     if ((ret == 0) && (*outLen < ED448_PUB_KEY_SIZE)) {
         *outLen = ED448_PUB_KEY_SIZE;
         ret = BUFFER_E;
+    }
+
+    if ((ret == 0) && (!key->pubKeySet)) {
+        ret = PUBLIC_KEY_E;
     }
 
     if (ret == 0) {
@@ -1173,7 +1468,7 @@ int wc_ed448_import_private_key_ex(const byte* priv, word32 privSz,
     }
 
     /* make the private key (priv + pub) */
-    XMEMCPY(key->k + ED448_KEY_SIZE, key->p, ED448_PUB_KEY_SIZE);
+    ed448_store_public(key, key->p);
 
     return ret;
 }
@@ -1221,6 +1516,10 @@ int wc_ed448_export_private_only(const ed448_key* key, byte* out, word32* outLen
         ret = BAD_FUNC_ARG;
     }
 
+    if ((ret == 0) && (!key->privKeySet)) {
+        ret = BAD_FUNC_ARG;
+    }
+
     if ((ret == 0) && (*outLen < ED448_KEY_SIZE)) {
         *outLen = ED448_KEY_SIZE;
         ret = BUFFER_E;
@@ -1250,6 +1549,10 @@ int wc_ed448_export_private(const ed448_key* key, byte* out, word32* outLen)
 
     /* sanity checks on arguments */
     if ((key == NULL) || (out == NULL) || (outLen == NULL)) {
+        ret = BAD_FUNC_ARG;
+    }
+
+    if ((ret == 0) && (!key->privKeySet)) {
         ret = BAD_FUNC_ARG;
     }
 
@@ -1323,6 +1626,13 @@ int wc_ed448_check_key(ed448_key* key)
         ret = PUBLIC_KEY_E;
     }
 
+    /* Reject small-order pub key before the priv-vs-pub compare so the
+     * diagnostic isn't masked by a "mismatch" error. */
+    if ((ret == 0) && ed448_is_small_order(key->p)) {
+        WOLFSSL_MSG("Ed448 small-order public key rejected during key check");
+        ret = PUBLIC_KEY_E;
+    }
+
     /* If we have a private key just make the public key and compare. */
     if ((ret == 0) && key->privKeySet) {
         ret = wc_ed448_make_public(key, pubKey, sizeof(pubKey));
@@ -1331,45 +1641,10 @@ int wc_ed448_check_key(ed448_key* key)
         }
     }
     /* No private key, check Y is valid. */
-    else if ((ret == 0) && (!key->privKeySet)) {
-        /* Verify that Q is not identity element 0.
-         * 0 has no representation for Ed448. */
-
-        /* Verify that xQ and yQ are integers in the interval [0, p - 1].
-         * Only have yQ so check that ordinate.
-         * p = 2^448-2^224-1 = 0xff..fe..ff
-         */
-        {
-            int i;
+    else if (ret == 0) {
+        /* Verify that xQ and yQ are integers in the interval [0, p - 1]. */
+        if (!ed448_pub_y_in_range(key->p)) {
             ret = PUBLIC_KEY_E;
-
-            /* Check top part before 0xFE. */
-            for (i = ED448_PUB_KEY_SIZE - 1; i > ED448_PUB_KEY_SIZE/2; i--) {
-                if (key->p[i] < 0xff) {
-                    ret = 0;
-                    break;
-                }
-            }
-            if (ret == WC_NO_ERR_TRACE(PUBLIC_KEY_E)) {
-                /* Check against 0xFE. */
-                if (key->p[ED448_PUB_KEY_SIZE/2] < 0xfe) {
-                    ret = 0;
-                }
-                else if (key->p[ED448_PUB_KEY_SIZE/2] == 0xfe) {
-                    /* Check bottom part before last byte. */
-                    for (i = ED448_PUB_KEY_SIZE/2 - 1; i > 0; i--) {
-                        if (key->p[i] != 0xff) {
-                            ret = 0;
-                            break;
-                        }
-                    }
-                    /* Check last byte. */
-                    if ((ret == WC_NO_ERR_TRACE(PUBLIC_KEY_E)) &&
-                        (key->p[0] < 0xff)) {
-                        ret = 0;
-                    }
-                }
-            }
         }
 
         if (ret == 0) {

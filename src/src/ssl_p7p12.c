@@ -1,6 +1,6 @@
 /* ssl_p7p12.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -269,29 +269,48 @@ WOLFSSL_STACK* wolfSSL_PKCS7_get0_signers(PKCS7* pkcs7, WOLFSSL_STACK* certs,
     WOLFSSL_X509* x509 = NULL;
     WOLFSSL_STACK* signers = NULL;
     WOLFSSL_PKCS7* p7 = (WOLFSSL_PKCS7*)pkcs7;
+    byte* signerCert;
+    word32 signerCertSz;
 
     if (p7 == NULL)
         return NULL;
 
-    /* Only PKCS#7 messages with a single cert that is the verifying certificate
-     * is supported.
-     */
     if (flags & PKCS7_NOINTERN) {
         WOLFSSL_MSG("PKCS7_NOINTERN flag not supported");
         return NULL;
+    }
+
+    /* Prefer the certificate that actually verified the signature. Falling
+     * back to singleCert (cert[0]) would let an attacker that bundles a
+     * trusted cert ahead of their own attacker cert have the trusted cert
+     * reported as the signer even though it did not produce the signature.
+     *
+     * Copy the chosen pointer into a local before passing its address to
+     * wolfSSL_d2i_X509; d2i_X509 advances *in by the DER length, and if
+     * we handed it the address of the struct field directly it would
+     * permanently corrupt the field, producing a heap-OOB read on the
+     * next use (pointer advanced, singleCertSz unchanged). */
+    if (p7->pkcs7.verifyCert != NULL && p7->pkcs7.verifyCertSz > 0) {
+        signerCert   = p7->pkcs7.verifyCert;
+        signerCertSz = p7->pkcs7.verifyCertSz;
+    }
+    else {
+        signerCert   = p7->pkcs7.singleCert;
+        signerCertSz = p7->pkcs7.singleCertSz;
     }
 
     signers = wolfSSL_sk_X509_new_null();
     if (signers == NULL)
         return NULL;
 
-    if (wolfSSL_d2i_X509(&x509, (const byte**)&p7->pkcs7.singleCert,
-                         p7->pkcs7.singleCertSz) == NULL) {
+    if (wolfSSL_d2i_X509(&x509, (const byte**)&signerCert,
+                         signerCertSz) == NULL) {
         wolfSSL_sk_X509_pop_free(signers, NULL);
         return NULL;
     }
 
     if (wolfSSL_sk_X509_push(signers, x509) <= 0) {
+        wolfSSL_X509_free(x509);
         wolfSSL_sk_X509_pop_free(signers, NULL);
         return NULL;
     }
@@ -797,6 +816,19 @@ int wolfSSL_PKCS7_verify(PKCS7* pkcs7, WOLFSSL_STACK* certs,
     if (ret != 0)
         return WOLFSSL_FAILURE;
 
+    /* Reject a degenerate (certs-only) PKCS#7 with no verified signer. Such an
+     * object has empty signerInfos, so wc_PKCS7_VerifySignedData() succeeds
+     * without authenticating the content. pkcs7.verifyCert is only set once a
+     * signer's signature has actually been verified, so a NULL value here means
+     * the content carries no valid signature and must not be reported as
+     * verified - regardless of PKCS7_NOVERIFY, which only suppresses signer
+     * certificate chain validation, not the requirement that a signature exist.
+     */
+    if (p7->pkcs7.verifyCert == NULL) {
+        WOLFSSL_MSG("PKCS7 has no verified signer (degenerate/certs-only)");
+        return WOLFSSL_FAILURE;
+    }
+
     if ((flags & PKCS7_NOVERIFY) != PKCS7_NOVERIFY) {
         /* Verify signer certificates */
         if (store == NULL || store->cm == NULL) {
@@ -871,6 +903,7 @@ int wolfSSL_PKCS7_encode_certs(PKCS7* pkcs7, WOLFSSL_STACK* certs,
 {
     int ret;
     WOLFSSL_PKCS7* p7;
+    WOLFSSL_STACK* certHead = certs;
     WOLFSSL_ENTER("wolfSSL_PKCS7_encode_certs");
 
     if (!pkcs7 || !certs || !out) {
@@ -879,10 +912,6 @@ int wolfSSL_PKCS7_encode_certs(PKCS7* pkcs7, WOLFSSL_STACK* certs,
     }
 
     p7 = (WOLFSSL_PKCS7*)pkcs7;
-
-    /* take ownership of certs */
-    p7->certs = certs;
-    /* TODO: takes ownership even on failure below but not on above failure. */
 
     if (pkcs7->certList) {
         WOLFSSL_MSG("wolfSSL_PKCS7_encode_certs called multiple times on same "
@@ -932,6 +961,12 @@ int wolfSSL_PKCS7_encode_certs(PKCS7* pkcs7, WOLFSSL_STACK* certs,
 
     ret = wolfSSL_i2d_PKCS7_bio(out, pkcs7);
 
+    /* Transfer stack ownership only on full success; every failure path leaves
+     * p7->certs NULL so the caller still owns certs and cannot double-free. */
+    if (ret == WOLFSSL_SUCCESS) {
+        p7->certs = certHead;
+    }
+
     return ret;
 }
 
@@ -969,7 +1004,7 @@ int wolfSSL_PEM_write_bio_PKCS7(WOLFSSL_BIO* bio, PKCS7* p7)
     outputHead = (byte*)XMALLOC(outputHeadSz, bio->heap,
         DYNAMIC_TYPE_TMP_BUFFER);
     if (outputHead == NULL)
-        return MEMORY_E;
+        return WOLFSSL_FAILURE;
 
     outputFoot = (byte*)XMALLOC(outputFootSz, bio->heap,
         DYNAMIC_TYPE_TMP_BUFFER);
@@ -1029,7 +1064,8 @@ int wolfSSL_PEM_write_bio_PKCS7(WOLFSSL_BIO* bio, PKCS7* p7)
 
     XMEMSET(pem, 0, pemSz);
 
-    if (wc_DerToPemEx(output, outputSz, pem, (word32)pemSz, NULL, CERT_TYPE) < 0) {
+    if (wc_DerToPemEx(output, outputSz, pem, (word32)pemSz, NULL,CERT_TYPE)
+                                                                          < 0) {
         goto error;
     }
     if ((wolfSSL_BIO_write(bio, pem, pemSz) == pemSz)) {
@@ -1057,8 +1093,7 @@ error:
 * RETURNS:
 * returns pointer to a PKCS7 structure on success, otherwise returns NULL
 */
-PKCS7* wolfSSL_SMIME_read_PKCS7(WOLFSSL_BIO* in,
-        WOLFSSL_BIO** bcont)
+PKCS7* wolfSSL_SMIME_read_PKCS7(WOLFSSL_BIO* in, WOLFSSL_BIO** bcont)
 {
     MimeHdr* allHdrs = NULL;
     MimeHdr* curHdr = NULL;
@@ -1205,12 +1240,14 @@ PKCS7* wolfSSL_SMIME_read_PKCS7(WOLFSSL_BIO* in,
                 /* If line endings were added, the initial length may be
                  * exceeded. */
                 if ((canonPos + canonLineLen) >= canonSize) {
+                    char* newCanonSection;
                     canonSize = canonPos + canonLineLen;
-                    canonSection = (char*)XREALLOC(canonSection, canonSize,
+                    newCanonSection = (char*)XREALLOC(canonSection, canonSize,
                                                    NULL, DYNAMIC_TYPE_PKCS7);
-                    if (canonSection == NULL) {
+                    if (newCanonSection == NULL) {
                         goto error;
                     }
+                    canonSection = newCanonSection;
                 }
                 XMEMCPY(&canonSection[canonPos], canonLine,
                         (int)canonLineLen - 1);
@@ -1368,8 +1405,8 @@ PKCS7* wolfSSL_SMIME_read_PKCS7(WOLFSSL_BIO* in,
         WOLFSSL_MSG("Error base64 decoding S/MIME message.");
         goto error;
     }
-    pkcs7 = wolfSSL_d2i_PKCS7_only(NULL, (const unsigned char**)&out, (int)outLen,
-        bcontMem, (word32)bcontMemSz);
+    pkcs7 = wolfSSL_d2i_PKCS7_only(NULL, (const unsigned char**)&out,
+        (int)outLen, bcontMem, (word32)bcontMemSz);
 
     wc_MIME_free_hdrs(allHdrs);
     XFREE(outHead, NULL, DYNAMIC_TYPE_PKCS7);
@@ -1525,11 +1562,19 @@ int wolfSSL_SMIME_write_PKCS7(WOLFSSL_BIO* out, PKCS7* pkcs7, WOLFSSL_BIO* in,
                 ret = 0;
             }
 
+            if ((ret > 0) && (wc_LockMutex(&globalRNGMutex) != 0)) {
+                WOLFSSL_MSG("Bad Lock Mutex rng");
+                ret = 0;
+            }
+
             /* no need to generate random byte for null terminator (size-1) */
-            if ((ret > 0) && (wc_RNG_GenerateBlock(&globalRNG, (byte*)boundary,
-                                  sizeof(boundary) - 1 ) != 0)) {
+            if (ret > 0) {
+                if (wc_RNG_GenerateBlock(&globalRNG, (byte*)boundary,
+                                  sizeof(boundary) - 1 ) != 0) {
                     WOLFSSL_MSG("Error in wc_RNG_GenerateBlock");
                     ret = 0;
+                }
+                wc_UnLockMutex(&globalRNGMutex);
             }
 
             if (ret > 0) {
@@ -1912,7 +1957,8 @@ int wolfSSL_PKCS12_parse(WC_PKCS12* pkcs12, const char* psw,
                 DYNAMIC_TYPE_X509);
             InitX509(x509, 1, heap);
             InitDecodedCert(DeCert, current->buffer, current->bufferSz, heap);
-            if (ParseCertRelative(DeCert, CERT_TYPE, NO_VERIFY, NULL, NULL) != 0) {
+            if (ParseCertRelative(DeCert, CERT_TYPE, NO_VERIFY, NULL, NULL)
+                                                                         != 0) {
                 WOLFSSL_MSG("Issue with parsing certificate");
                 FreeDecodedCert(DeCert);
                 wolfSSL_X509_free(x509);

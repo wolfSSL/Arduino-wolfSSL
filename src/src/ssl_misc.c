@@ -1,6 +1,6 @@
 /* ssl_misc.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -70,6 +70,11 @@ static int wolfssl_read_bio_file(WOLFSSL_BIO* bio, char** data)
 
             /* Update total read. */
             ret += sz;
+            /* Cap total like the direct-file path to avoid int overflow. */
+            if (ret > MAX_WOLFSSL_FILE_SIZE) {
+                sz = BUFFER_E;
+                break;
+            }
             /* Calculate remaining unused memory. */
             remaining = READ_BIO_FILE_CHUNK - (ret % READ_BIO_FILE_CHUNK);
             /* Check for space remaining. */
@@ -230,7 +235,15 @@ static int wolfssl_file_len(XFILE fp, long* fileSz)
         /* Get file offset at end of file. */
         curr = (long)XFTELL(fp);
         if (curr < 0) {
-            ret = WOLFSSL_BAD_FILE;
+#ifdef ESPIPE
+            if (errno == ESPIPE) {
+                WOLFSSL_ERROR_MSG("wolfssl_file_len: file is a pipe");
+                *fileSz = 0;
+                ret = WOLFSSL_BAD_FILETYPE;
+            }
+            else
+#endif
+                ret = WOLFSSL_BAD_FILE;
         }
     }
     /* Move to end of file. */

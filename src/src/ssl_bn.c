@@ -1,6 +1,6 @@
 /* ssl_bn.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -134,9 +134,7 @@ int wolfssl_bn_set_value(WOLFSSL_BIGNUM** bn, mp_int* mpi)
     int ret = 1;
     WOLFSSL_BIGNUM* a = NULL;
 
-#ifdef WOLFSSL_DEBUG_OPENSSL
-    WOLFSSL_ENTER("wolfssl_bn_set_value");
-#endif
+    WOLFSSL_ENTER_VERBOSE("wolfssl_bn_set_value");
 
     /* Validate parameters. */
     if ((bn == NULL) || (mpi == NULL)) {
@@ -193,9 +191,7 @@ WOLFSSL_BIGNUM* wolfSSL_BN_new(void)
 {
     WOLFSSL_BIGNUM* bn = NULL;
 
-#ifdef WOLFSSL_DEBUG_OPENSSL
-    WOLFSSL_ENTER("wolfSSL_BN_new");
-#endif
+    WOLFSSL_ENTER_VERBOSE("wolfSSL_BN_new");
 
     /* Allocate memory for big number. */
     bn = (WOLFSSL_BIGNUM*)XMALLOC(sizeof(WOLFSSL_BIGNUM), NULL,
@@ -222,9 +218,7 @@ WOLFSSL_BIGNUM* wolfSSL_BN_new(void)
  */
 void wolfSSL_BN_init(WOLFSSL_BIGNUM* bn)
 {
-#ifdef WOLFSSL_DEBUG_OPENSSL
-    WOLFSSL_ENTER("wolfSSL_BN_init");
-#endif
+    WOLFSSL_ENTER_VERBOSE("wolfSSL_BN_init");
 
     /* Validate parameter. */
     if (bn != NULL) {
@@ -242,9 +236,7 @@ void wolfSSL_BN_init(WOLFSSL_BIGNUM* bn)
  */
 void wolfSSL_BN_free(WOLFSSL_BIGNUM* bn)
 {
-#ifdef WOLFSSL_DEBUG_OPENSSL
-    WOLFSSL_ENTER("wolfSSL_BN_free");
-#endif
+    WOLFSSL_ENTER_VERBOSE("wolfSSL_BN_free");
 
     /* Validate parameter. */
     if (bn != NULL) {
@@ -267,9 +259,7 @@ void wolfSSL_BN_free(WOLFSSL_BIGNUM* bn)
  */
 void wolfSSL_BN_clear_free(WOLFSSL_BIGNUM* bn)
 {
-#ifdef WOLFSSL_DEBUG_OPENSSL
-    WOLFSSL_ENTER("wolfSSL_BN_clear_free");
-#endif
+    WOLFSSL_ENTER_VERBOSE("wolfSSL_BN_clear_free");
 
     /* Validate parameter. */
     if (bn != NULL) {
@@ -289,9 +279,7 @@ void wolfSSL_BN_clear_free(WOLFSSL_BIGNUM* bn)
  */
 void wolfSSL_BN_clear(WOLFSSL_BIGNUM* bn)
 {
-#ifdef WOLFSSL_DEBUG_OPENSSL
-    WOLFSSL_ENTER("wolfSSL_BN_clear");
-#endif
+    WOLFSSL_ENTER_VERBOSE("wolfSSL_BN_clear");
 
     /* Validate parameter. */
     if (!BN_IS_NULL(bn)) {
@@ -326,23 +314,21 @@ const WOLFSSL_BIGNUM* wolfSSL_BN_value_one(void)
             wolfSSL_BN_free(one);
             one = NULL;
         }
-        else
+        else {
     #ifndef SINGLE_THREADED
-        /* Ensure global has not been set by another thread. */
-        if (bn_one == NULL)
-    #endif
-        {
+            void* expected = NULL;
+            /* Publish atomically so a losing thread frees only its own object,
+             * never a pointer already handed to another thread. */
+            if (!wolfSSL_Atomic_Ptr_CompareExchange((void* volatile*)&bn_one,
+                    &expected, one)) {
+                wolfSSL_BN_free(one);
+                one = (WOLFSSL_BIGNUM*)expected;
+            }
+    #else
             /* Set this big number as the global. */
             bn_one = one;
-        }
-    #ifndef SINGLE_THREADED
-        /* Check if another thread has set the global. */
-        if (bn_one != one) {
-            /* Dispose of this big number and return the global.  */
-            wolfSSL_BN_free(one);
-            one = bn_one;
-        }
     #endif
+        }
     }
 
     return one;
@@ -465,6 +451,56 @@ int wolfSSL_BN_bn2bin(const WOLFSSL_BIGNUM* bn, unsigned char* r)
     }
 
     return ret;
+}
+
+
+/* Encode a big number as a big-endian byte array, zero-padded to toLen bytes.
+ *
+ * Returns toLen on success, -1 on error (including when the number is too
+ * large to fit in toLen bytes).
+ *
+ * @param [in]  bn     Big number to encode.
+ * @param [out] r      Buffer to place encoding into. Must be at least toLen
+ *                     bytes.
+ * @param [in]  toLen  Desired output length in bytes.
+ * @return  toLen on success.
+ * @return  -1 on error.
+ */
+int wolfSSL_BN_bn2binpad(const WOLFSSL_BIGNUM* bn, unsigned char* r, int toLen)
+{
+    int numBytes;
+
+    WOLFSSL_ENTER("wolfSSL_BN_bn2binpad");
+
+    /* Validate parameters. */
+    if (BN_IS_NULL(bn) || (r == NULL) || (toLen < 0)) {
+        WOLFSSL_MSG("NULL bn, r, or invalid toLen error");
+        return WOLFSSL_FATAL_ERROR;
+    }
+
+    /* Get the number of bytes needed to encode the big number. */
+    numBytes = mp_unsigned_bin_size((mp_int*)bn->internal);
+    if (numBytes < 0) {
+        WOLFSSL_MSG("mp_unsigned_bin_size error");
+        return WOLFSSL_FATAL_ERROR;
+    }
+    if (numBytes > toLen) {
+        WOLFSSL_MSG("BN too large for toLen");
+        return WOLFSSL_FATAL_ERROR;
+    }
+
+    /* Zero-pad leading bytes. */
+    XMEMSET(r, 0, (size_t)(toLen - numBytes));
+
+    /* Encode the big number into the remaining bytes. */
+    if (numBytes > 0 &&
+        mp_to_unsigned_bin((mp_int*)bn->internal, r + toLen - numBytes) !=
+            MP_OKAY) {
+        WOLFSSL_MSG("mp_to_unsigned_bin error");
+        return WOLFSSL_FATAL_ERROR;
+    }
+
+    return toLen;
 }
 
 
@@ -2096,10 +2132,19 @@ int wolfSSL_BN_rand(WOLFSSL_BIGNUM* bn, int bits, int top, int bottom)
             WOLFSSL_MSG("Failed to allocate buffer.");
             ret = 0;
         }
-        /* Generate bytes to cover bits. */
-        if ((ret == 1) && wc_RNG_GenerateBlock(rng, buff, len) != 0) {
-            WOLFSSL_MSG("wc_RNG_GenerateBlock failed");
+        /* Global RNG is shared, lock it while generating. */
+        if ((ret == 1) && (wc_LockMutex(&globalRNGMutex) != 0)) {
+            WOLFSSL_MSG("Bad Lock Mutex rng");
             ret = 0;
+        }
+
+        /* Generate bytes to cover bits. */
+        if (ret == 1) {
+            if (wc_RNG_GenerateBlock(rng, buff, len) != 0) {
+                WOLFSSL_MSG("wc_RNG_GenerateBlock failed");
+                ret = 0;
+            }
+            wc_UnLockMutex(&globalRNGMutex);
         }
         /* Read bytes in to big number. */
         if ((ret == 1) && mp_read_unsigned_bin((mp_int*)bn->internal, buff, len)
@@ -2110,8 +2155,8 @@ int wolfSSL_BN_rand(WOLFSSL_BIGNUM* bn, int bits, int top, int bottom)
         /* Dispose of buffer - no longer needed. */
         XFREE(buff, NULL, DYNAMIC_TYPE_TMP_BUFFER);
 
-        if (ret == 1) {
-            /* Truncate to requested bit length. */
+        /* Truncate to requested bit length when not a whole number of bytes. */
+        if ((ret == 1) && ((bits % 8) != 0)) {
             mp_rshb((mp_int*)bn->internal, 8 - (bits % 8));
         }
 

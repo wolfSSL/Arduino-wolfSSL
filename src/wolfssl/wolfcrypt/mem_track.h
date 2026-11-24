@@ -1,6 +1,6 @@
 /* mem_track.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -79,9 +79,12 @@
     !defined(WOLFSSL_STATIC_MEMORY)
 
 #define DO_MEM_STATS
-#if (defined(__linux__) && !defined(WOLFSSL_KERNEL_MODE)) || defined(__MACH__)
+#if (defined(__linux__) && !defined(WOLFSSL_KERNEL_MODE)) || \
+    defined(__MACH__) || defined(__ZEPHYR__)
     #define DO_MEM_LIST
 #endif
+
+struct memoryList;
 
 typedef struct memoryStats {
     long totalAllocs;     /* number of allocations */
@@ -97,6 +100,9 @@ typedef struct memoryStats {
     long peakBytesTripOdometer; /* peak concurrent bytes, subject to reset
                                  * by wolfCrypt_heap_peak_checkpoint()
                                  */
+#endif
+#ifdef DO_MEM_LIST
+    struct memoryList *memList;
 #endif
 } memoryStats;
 
@@ -133,11 +139,15 @@ typedef struct memoryList {
 
 
 static memoryStats ourMemStats;
+WOLFSSL_API extern memoryStats *wc_MemStats_Ptr;
 
 #ifdef DO_MEM_LIST
-    #include <pthread.h>
     static memoryList ourMemList;
-    static pthread_mutex_t memLock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+#if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
+    static wolfSSL_Mutex memLock;
+    static int memLockInit = 0;
 #endif
 
 #ifdef WOLFSSL_DEBUG_MEMORY
@@ -175,7 +185,7 @@ static WC_INLINE void* TrackMalloc(size_t sz)
 #endif
 #endif
 #if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
-    if (pthread_mutex_lock(&memLock) == 0)
+    if (wc_LockMutex(&memLock) == 0)
     {
 #endif
 
@@ -221,9 +231,9 @@ static WC_INLINE void* TrackMalloc(size_t sz)
         ourMemList.count++;
 #endif
 #if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
-        pthread_mutex_unlock(&memLock);
+        wc_UnLockMutex(&memLock);
     }
-#endif /* DO_MEM_LIST */
+#endif /* !SINGLE_THREADED && (DO_MEM_LIST || DO_MEM_STATS) */
 
     return header->thisMemory;
 }
@@ -248,7 +258,7 @@ static WC_INLINE void TrackFree(void* ptr)
     sz = header->thisSize;
 
 #if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
-    if (pthread_mutex_lock(&memLock) == 0)
+    if (wc_LockMutex(&memLock) == 0)
     {
 #endif
 
@@ -282,7 +292,7 @@ static WC_INLINE void TrackFree(void* ptr)
 #endif
 
 #if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
-        pthread_mutex_unlock(&memLock);
+        wc_UnLockMutex(&memLock);
     }
 #endif
 
@@ -355,14 +365,27 @@ static WC_INLINE int InitMemoryTracker(void)
     if (ret < 0) {
         wc_mem_printf("wolfSSL GetAllocators failed to get the defaults\n");
     }
+
+#if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
+    /* Init the mutex before installing the tracking allocators, so the
+     * mutex is ready as soon as another thread can enter TrackMalloc. */
+    if (!memLockInit) {
+        if (wc_InitMutex(&memLock) != 0) {
+            wc_mem_printf("wc_InitMutex failed for track memory\n");
+            return -1;
+        }
+        memLockInit = 1;
+    }
+#endif
+
     ret = wolfSSL_SetAllocators(TrackMalloc, TrackFree, TrackRealloc);
     if (ret < 0) {
         wc_mem_printf("wolfSSL SetAllocators failed for track memory\n");
         return ret;
     }
 
-#ifdef DO_MEM_LIST
-    if (pthread_mutex_lock(&memLock) == 0)
+#if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
+    if (wc_LockMutex(&memLock) == 0)
 #endif
     {
     #ifdef DO_MEM_STATS
@@ -379,18 +402,24 @@ static WC_INLINE int InitMemoryTracker(void)
 
     #ifdef DO_MEM_LIST
         XMEMSET(&ourMemList, 0, sizeof(ourMemList));
+        ourMemStats.memList = &ourMemList;
+    #endif
 
-        pthread_mutex_unlock(&memLock);
+    #if !defined(SINGLE_THREADED) && \
+        (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
+        wc_UnLockMutex(&memLock);
     #endif
     }
+
+    wc_MemStats_Ptr = &ourMemStats;
 
     return ret;
 }
 
 static WC_INLINE void ShowMemoryTracker(void)
 {
-#ifdef DO_MEM_LIST
-    if (pthread_mutex_lock(&memLock) == 0)
+#if !defined(SINGLE_THREADED) && (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
+    if (wc_LockMutex(&memLock) == 0)
 #endif
     {
     #ifdef DO_MEM_STATS
@@ -419,15 +448,25 @@ static WC_INLINE void ShowMemoryTracker(void)
         #endif
             }
         }
+    #endif
 
-        pthread_mutex_unlock(&memLock);
+    #if !defined(SINGLE_THREADED) && \
+        (defined(DO_MEM_LIST) || defined(DO_MEM_STATS))
+        wc_UnLockMutex(&memLock);
     #endif
     }
 }
 
 static WC_INLINE int CleanupMemoryTracker(void)
 {
-    /* restore default allocators */
+    wc_MemStats_Ptr = NULL;
+    /* Restore default allocators. memLock is intentionally left
+     * initialized for process lifetime (matching the prior static
+     * PTHREAD_MUTEX_INITIALIZER behavior): SetAllocators stops new
+     * entries into TrackMalloc/TrackFree but does not synchronize
+     * with in-flight calls, so freeing the mutex here would be a
+     * use-after-free hazard. The memLockInit flag keeps re-Init
+     * idempotent across an Init/Cleanup/Init cycle. */
     return wolfSSL_SetAllocators(mfDefault, ffDefault, rfDefault);
 }
 #endif /* WOLFSSL_TRACK_MEMORY && USE_WOLFSSL_MEMORY && \
@@ -438,14 +477,18 @@ static WC_INLINE int CleanupMemoryTracker(void)
 
 #include <stdio.h>
 
-#ifdef HAVE_PTHREAD
+/* Zephyr supplies its own POSIX types, and wc_port.h only leaves HAVE_PTHREAD
+ * set when !SINGLE_THREADED, where StackSizeCheck uses the k_thread path. The
+ * host <pthread.h> is therefore unused here and clashes with Zephyr's
+ * pthread_t when building against an external libc. */
+#if defined(HAVE_PTHREAD) && !defined(WOLFSSL_ZEPHYR)
     #include <pthread.h>
     #include <errno.h>
     #include <sched.h>
     #include <unistd.h>
 #endif
 
-typedef void* (*thread_func)(void* args);
+typedef THREAD_RETURN (*thread_func)(void* args);
 #define STACK_CHECK_VAL 0x01
 
 struct stack_size_debug_context {
@@ -581,7 +624,7 @@ static WC_INLINE int StackSizeCheck_Rebaseline(void)
  * ./configure --enable-stacksize=verbose [...]
  */
 
-static void* debug_stack_size_verbose_shim(
+static THREAD_RETURN debug_stack_size_verbose_shim(
     struct stack_size_debug_context *shim_args)
 {
     StackSizeCheck_myStack = shim_args->myStack;
@@ -689,12 +732,114 @@ int StackSizeHWMReset(void)
 
 #if defined(__GNUC__) || defined(__clang__)
 #define STACK_SIZE_INIT() \
-    (void)StackSizeSetOffset(__FUNCTION__, __builtin_frame_address(0))
+    (void)StackSizeSetOffset(__func__, __builtin_frame_address(0))
 #endif
 
 #endif /* HAVE_STACK_SIZE_VERBOSE */
 
-#ifdef HAVE_PTHREAD
+#if defined(WOLFSSL_ZEPHYR) && !defined(SINGLE_THREADED)
+
+static WC_INLINE int StackSizeCheck(struct func_args* args, thread_func tf)
+{
+    size_t            i;
+    int               ret = 0;
+    int               err;
+    struct k_thread*  tid = NULL;
+    k_thread_stack_t* threadStack = NULL;
+    unsigned char*    myStack = NULL;
+
+#ifdef HAVE_STACK_SIZE_VERBOSE
+    struct stack_size_debug_context shim_args;
+#endif
+
+    tid = (struct k_thread*)XMALLOC(
+            Z_KERNEL_STACK_SIZE_ADJUST(sizeof(struct k_thread)),
+            wolfsslThreadHeapHint, DYNAMIC_TYPE_TMP_BUFFER);
+    if (tid == NULL) {
+        printf("error: XMALLOC tid failed\n");
+        ret = MEMORY_E;
+        goto out;
+    }
+
+#ifndef WOLFSSL_ZEPHYR_STACK_SZ
+    #define WOLFSSL_ZEPHYR_STACK_SZ (48*1024)
+#endif
+
+    threadStack = (void*)XMALLOC(
+                Z_KERNEL_STACK_SIZE_ADJUST(WOLFSSL_ZEPHYR_STACK_SZ),
+                wolfsslThreadHeapHint, DYNAMIC_TYPE_TMP_BUFFER);
+    if (threadStack == NULL) {
+        printf("error: XMALLOC threadStack failed\n");
+        ret = MEMORY_E;
+        goto out;
+    }
+
+    myStack = K_THREAD_STACK_BUFFER(threadStack);
+    XMEMSET(myStack, STACK_CHECK_VAL, WOLFSSL_ZEPHYR_STACK_SZ);
+
+#ifdef HAVE_STACK_SIZE_VERBOSE
+    StackSizeCheck_stackSizeHWM = 0;
+    shim_args.myStack = myStack;
+    shim_args.stackSize = WOLFSSL_ZEPHYR_STACK_SZ;
+    shim_args.stackSizeHWM_ptr = &StackSizeCheck_stackSizeHWM;
+    shim_args.fn = tf;
+    shim_args.args = args;
+
+    /* k_thread_create does not return any error codes */
+    /* Casting to k_thread_entry_t should be fine since we just ignore the
+     * extra arguments being passed in */
+    k_thread_create(tid, threadStack, WOLFSSL_ZEPHYR_STACK_SZ,
+        (k_thread_entry_t)debug_stack_size_verbose_shim, (void *)&shim_args,
+        NULL, NULL, 5, 0, K_NO_WAIT);
+#else
+    /* k_thread_create does not return any error codes */
+    /* Casting to k_thread_entry_t should be fine since we just ignore the
+     * extra arguments being passed in */
+    k_thread_create(tid, threadStack, WOLFSSL_ZEPHYR_STACK_SZ,
+        (k_thread_entry_t)tf, args, NULL, NULL, 5, 0, K_NO_WAIT);
+
+#endif
+
+    err = k_thread_join(tid, K_FOREVER);
+    if (err != 0) {
+        printf("k_thread_join failed\n");
+        ret = MEMORY_E;
+        goto out;
+    }
+
+
+    for (i = 0; i < WOLFSSL_ZEPHYR_STACK_SZ; i++) {
+        if (myStack[i] != STACK_CHECK_VAL) {
+            break;
+        }
+    }
+
+#ifdef HAVE_STACK_SIZE_VERBOSE
+    printf("stack used = %lu\n", StackSizeCheck_stackSizeHWM > (WOLFSSL_ZEPHYR_STACK_SZ - i)
+        ? (unsigned long)StackSizeCheck_stackSizeHWM
+        : (unsigned long)(WOLFSSL_ZEPHYR_STACK_SZ - i));
+    StackSizeCheck_myStack = NULL;
+    StackSizeCheck_stackOffsetPointer = NULL;
+#else
+    printf("stack used = %lu\n", (unsigned long)(WOLFSSL_ZEPHYR_STACK_SZ - i));
+#endif
+
+out:
+    XFREE(tid, wolfsslThreadHeapHint, DYNAMIC_TYPE_TMP_BUFFER);
+    XFREE(threadStack, wolfsslThreadHeapHint,
+          DYNAMIC_TYPE_TMP_BUFFER);
+
+    return ret;
+}
+
+#define StackSizeCheck_launch(args, tf, threadId, stack_context)            \
+    ((void)(args), (void)(tf), (void)(threadId), (void)(stack_context),     \
+        (NOT_COMPILED_IN))
+
+#define StackSizeCheck_reap(threadId, stack_context)                        \
+    ((void)(threadId), (void)(stack_context), (NOT_COMPILED_IN))
+
+#elif defined(HAVE_PTHREAD)
 
 static WC_INLINE int StackSizeCheck(struct func_args* args, thread_func tf)
 {

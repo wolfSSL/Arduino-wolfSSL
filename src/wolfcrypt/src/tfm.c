@@ -1,6 +1,6 @@
 /* tfm.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -1669,6 +1669,33 @@ int fp_addmod_ct(fp_int *a, fp_int *b, fp_int *c, fp_int *d)
 
 #ifdef TFM_TIMING_RESISTANT
 
+/* The WC_PROTECT_ENCRYPTED_MEM ladder has no WC_NO_CACHE_RESISTANT variant, so
+ * it needs this helper even when cache resistance is off. */
+#if defined(WC_NO_PTR_INT_CAST) && (!defined(WC_NO_CACHE_RESISTANT) || \
+    defined(WC_PROTECT_ENCRYPTED_MEM))
+/* Copy a into r when copy is 1, in constant time.
+ * Used where the address of the operand cannot be derived from the secret
+ * bit, as on capability based targets.
+ *
+ * Not a drop in replacement for fp_copy(): it always writes FP_SIZE digits
+ * and does not consult r->size, so r must be a full fp_int and never an
+ * alt_fp_int, whose dp[] is only FP_SIZE_ECC digits under ALT_ECC_SIZE. Every
+ * caller below passes a local fp_int from the exptmod ladders, which is.
+ */
+static void fp_cond_copy(const fp_int* a, int copy, fp_int* r)
+{
+  fp_digit mask = (fp_digit)0 - (fp_digit)(copy != 0);
+  int      imask = 0 - (copy != 0);
+  int      i;
+
+  for (i = 0; i < FP_SIZE; i++) {
+    r->dp[i] ^= (r->dp[i] ^ a->dp[i]) & mask;
+  }
+  r->used ^= (r->used ^ a->used) & imask;
+  r->sign ^= (r->sign ^ a->sign) & imask;
+}
+#endif
+
 #ifdef WC_RSA_NONBLOCK
 
 #ifdef WC_RSA_NONBLOCK_TIME
@@ -1865,6 +1892,10 @@ int fp_exptmod_nb(exptModNb_t* nb, fp_int* G, fp_int* X, fp_int* P, fp_int* Y)
   case TFM_EXPTMOD_NB_SQR:
   #ifdef WC_NO_CACHE_RESISTANT
     err = fp_sqr(&nb->R[nb->y], &nb->R[nb->y]);
+  #elif defined(WC_NO_PTR_INT_CAST)
+    fp_cond_copy(&nb->R[0], nb->y^1, &nb->R[2]);
+    fp_cond_copy(&nb->R[1], nb->y,   &nb->R[2]);
+    err = fp_sqr(&nb->R[2], &nb->R[2]);
   #else
     fp_copy((fp_int*) ( ((wc_ptr_t)&nb->R[0] & wc_off_on_addr[nb->y^1]) +
                         ((wc_ptr_t)&nb->R[1] & wc_off_on_addr[nb->y]) ),
@@ -1882,6 +1913,10 @@ int fp_exptmod_nb(exptModNb_t* nb, fp_int* G, fp_int* X, fp_int* P, fp_int* Y)
   case TFM_EXPTMOD_NB_SQR_RED:
   #ifdef WC_NO_CACHE_RESISTANT
     err = fp_montgomery_reduce(&nb->R[nb->y], P, nb->mp);
+  #elif defined(WC_NO_PTR_INT_CAST)
+    err = fp_montgomery_reduce(&nb->R[2], P, nb->mp);
+    fp_cond_copy(&nb->R[2], nb->y^1, &nb->R[0]);
+    fp_cond_copy(&nb->R[2], nb->y,   &nb->R[1]);
   #else
     err = fp_montgomery_reduce(&nb->R[2], P, nb->mp);
     fp_copy(&nb->R[2],
@@ -2050,16 +2085,26 @@ static int _fp_exptmod_ct(fp_int * G, fp_int * X, int digits, fp_int * P,
     /* instead of using R[y^1] for mul, which leaks key bit to cache monitor,
      * use R[2] as temp, make sure address calc is constant, keep
      * &R[0] and &R[1] in cache */
+#ifdef WC_NO_PTR_INT_CAST
+    fp_cond_copy(&R[2], y,   &R[0]);
+    fp_cond_copy(&R[2], y^1, &R[1]);
+#else
     fp_copy(&R[2],
             (fp_int*) ( ((wc_ptr_t)&R[0] & wc_off_on_addr[y]) +
                         ((wc_ptr_t)&R[1] & wc_off_on_addr[y^1]) ) );
+#endif
 
     /* instead of using R[y] for sqr, which leaks key bit to cache monitor,
      * use R[2] as temp, make sure address calc is constant, keep
      * &R[0] and &R[1] in cache */
+#ifdef WC_NO_PTR_INT_CAST
+    fp_cond_copy(&R[0], y^1, &R[2]);
+    fp_cond_copy(&R[1], y,   &R[2]);
+#else
     fp_copy((fp_int*) ( ((wc_ptr_t)&R[0] & wc_off_on_addr[y^1]) +
                         ((wc_ptr_t)&R[1] & wc_off_on_addr[y]) ),
             &R[2]);
+#endif
     err = fp_sqr(&R[2], &R[2]);
     if (err != FP_OKAY) {
       WC_FREE_VAR_EX(R, NULL, DYNAMIC_TYPE_BIGINT);
@@ -2070,9 +2115,14 @@ static int _fp_exptmod_ct(fp_int * G, fp_int * X, int digits, fp_int * P,
       WC_FREE_VAR_EX(R, NULL, DYNAMIC_TYPE_BIGINT);
       return err;
     }
+#ifdef WC_NO_PTR_INT_CAST
+    fp_cond_copy(&R[2], y^1, &R[0]);
+    fp_cond_copy(&R[2], y,   &R[1]);
+#else
     fp_copy(&R[2],
             (fp_int*) ( ((wc_ptr_t)&R[0] & wc_off_on_addr[y^1]) +
                         ((wc_ptr_t)&R[1] & wc_off_on_addr[y]) ) );
+#endif
 #endif /* WC_NO_CACHE_RESISTANT */
   }
 
@@ -2204,9 +2254,14 @@ static int _fp_exptmod_ct(fp_int * G, fp_int * X, int digits, fp_int * P,
     /* instead of using R[y] for sqr, which leaks key bit to cache monitor,
      * use R[3] as temp, make sure address calc is constant, keep
      * &R[0] and &R[1] in cache */
+#ifdef WC_NO_PTR_INT_CAST
+    fp_cond_copy(&R[0], y^1, &R[3]);
+    fp_cond_copy(&R[1], y,   &R[3]);
+#else
     fp_copy((fp_int*) ( ((wc_ptr_t)&R[0] & wc_off_on_addr[y^1]) +
                         ((wc_ptr_t)&R[1] & wc_off_on_addr[y]) ),
             &R[3]);
+#endif
     err = fp_sqr(&R[3], &R[3]);
     if (err != FP_OKAY) {
       WC_FREE_VAR_EX(R, NULL, DYNAMIC_TYPE_BIGINT);
@@ -3969,6 +4024,10 @@ int fp_to_unsigned_bin_len(fp_int *a, unsigned char *b, int c)
   int j = 0;
   int x;
 
+  if (c < 0) {
+      return FP_VAL;
+  }
+
   for (x=c-1; x >= 0 && i < a->used; x--) {
      b[x] = (unsigned char)(a->dp[i] >> j);
      j += 8;
@@ -3989,6 +4048,10 @@ int fp_to_unsigned_bin_len(fp_int *a, unsigned char *b, int c)
 #else
   int     x;
    WC_DECLARE_VAR(t, fp_int, 1, 0);
+
+  if (c < 0) {
+      return FP_VAL;
+  }
 
    WC_ALLOC_VAR_EX(t, fp_int, 1, NULL, DYNAMIC_TYPE_BIGINT, return FP_MEM);
 
@@ -4071,7 +4134,7 @@ int fp_is_bit_set (fp_int *a, fp_digit b)
 {
     fp_digit i;
 
-    if (b > FP_MAX_BITS)
+    if (b >= FP_MAX_BITS)
         return FP_VAL;
 
     i = b/DIGIT_BIT;
@@ -4087,7 +4150,7 @@ int fp_set_bit (fp_int * a, fp_digit b)
 {
     fp_digit i;
 
-    if (b > FP_MAX_BITS)
+    if (b >= FP_MAX_BITS)
         return FP_VAL;
 
     i = b/DIGIT_BIT;
@@ -4540,9 +4603,9 @@ int mp_exptmod_nct (mp_int * G, mp_int * X, mp_int * P, mp_int * Y)
 
 
 /* compare two ints (signed)*/
-int mp_cmp (mp_int * a, mp_int * b)
+int mp_cmp (const mp_int * a, const mp_int * b)
 {
-  return fp_cmp(a, b);
+  return fp_cmp((mp_int *)a, (mp_int *)b);
 }
 
 /* compare a digit */
@@ -4835,6 +4898,13 @@ int fp_cnt_lsb(fp_int *a)
 
    /* scan lower digits until non-zero */
    for (x = 0; x < a->used && a->dp[x] == 0; x++) {}
+   /* All used digits are zero -- a non-normalized zero that fp_iszero() above
+    * did not catch. There is no set bit; return before reading dp[x] past the
+    * used digits (which, if also zero, would spin the scan-for-1 loop below
+    * forever). */
+   if (x == a->used) {
+      return 0;
+   }
    q = a->dp[x];
    x *= DIGIT_BIT;
 
@@ -5504,20 +5574,12 @@ int fp_gcd(fp_int *a, fp_int *b, fp_int *c)
    }
 
    /* either zero than gcd is the largest */
-   if (fp_iszero (a) == FP_YES && fp_iszero (b) == FP_NO) {
+   if (fp_iszero (a) == FP_YES) {
      fp_abs (b, c);
      return FP_OKAY;
    }
-   if (fp_iszero (a) == FP_NO && fp_iszero (b) == FP_YES) {
+   if (fp_iszero (b) == FP_YES) {
      fp_abs (a, c);
-     return FP_OKAY;
-   }
-
-   /* optimized.  At this point if a == 0 then
-    * b must equal zero too
-    */
-   if (fp_iszero (a) == FP_YES) {
-     fp_zero(c);
      return FP_OKAY;
    }
 

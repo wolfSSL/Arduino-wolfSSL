@@ -1,6 +1,6 @@
 /* pkcs7.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -19,17 +19,74 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
+/*
+ * PKCS#7 Build Options:
+ *
+ * Core:
+ * HAVE_PKCS7:               Enable PKCS#7 support                 default: off
+ * NO_PKCS7_STREAM:          Disable PKCS#7 streaming mode         default: off
+ * NO_PKCS7_ENCRYPTED_DATA:  Disable PKCS#7 EncryptedData type    default: off
+ * NO_PKCS7_COMPRESSED_DATA: Disable PKCS#7 CompressedData type   default: off
+ * WC_PKCS7_STREAM_DEBUG:    Enable PKCS#7 stream debug output    default: off
+ * WOLFSSL_PKCS7_MAX_DECOMPRESSION: Max decompression size        default: off
+ *
+ * Callbacks:
+ * HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK: Custom RSA raw sign callback default: off
+ * HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK: Custom ECC raw sign callback default: off
+ *
+ * Key Derivation:
+ * HAVE_X963_KDF:            Enable ANSI X9.63 KDF                 default: off
+ */
+
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
 #ifdef HAVE_PKCS7
 
 #include <wolfssl/wolfcrypt/pkcs7.h>
 #include <wolfssl/wolfcrypt/hash.h>
+#ifndef NO_HMAC
+    #include <wolfssl/wolfcrypt/hmac.h>
+#endif
 #ifndef NO_RSA
     #include <wolfssl/wolfcrypt/rsa.h>
 #endif
+#ifndef RSA_PSS_SALT_LEN_DEFAULT
+    #define RSA_PSS_SALT_LEN_DEFAULT (-1)
+#endif
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+    #if (defined(HAVE_FIPS) && \
+            (!defined(HAVE_FIPS_VERSION) || (HAVE_FIPS_VERSION < 2))) || \
+        (defined(HAVE_SELFTEST) && \
+            (!defined(HAVE_SELFTEST_VERSION) || (HAVE_SELFTEST_VERSION < 2)))
+        #ifndef WC_MGF1NONE
+            #define WC_MGF1NONE       0
+            #define WC_MGF1SHA1       26
+            #define WC_MGF1SHA224     4
+            #define WC_MGF1SHA256     1
+            #define WC_MGF1SHA384     2
+            #define WC_MGF1SHA512     3
+            #define WC_MGF1SHA512_224 5
+            #define WC_MGF1SHA512_256 6
+        #endif
+    #endif
+#endif
 #ifdef HAVE_ECC
     #include <wolfssl/wolfcrypt/ecc.h>
+#endif
+#if defined(WOLFSSL_HAVE_MLDSA) && !defined(WOLFSSL_MLDSA_NO_ASN1)
+    #include <wolfssl/wolfcrypt/wc_mldsa.h>
+    /* gates the ML-DSA SignedData support; see the design note below. */
+    #define WC_PKCS7_HAVE_MLDSA
+    /* ML-DSA SignedData signing and verification compile independently,
+     * mirroring the private-/public-key availability of the ML-DSA backend.
+     * Helpers shared by only one side are gated by these so they are never
+     * compiled unused (which would trip -Werror=unused-function). */
+    #if !defined(WOLFSSL_MLDSA_NO_SIGN) && defined(WOLFSSL_MLDSA_PRIVATE_KEY)
+        #define WC_PKCS7_MLDSA_SIGN
+    #endif
+    #if !defined(WOLFSSL_MLDSA_NO_VERIFY) && defined(WOLFSSL_MLDSA_PUBLIC_KEY)
+        #define WC_PKCS7_MLDSA_VERIFY
+    #endif
 #endif
 #ifdef HAVE_LIBZ
     #include <wolfssl/wolfcrypt/compress.h>
@@ -44,6 +101,8 @@
     #include <wolfcrypt/src/misc.c>
 #endif
 
+#include <wolfssl/wolfcrypt/wc_compat.h>
+
 /* direction for processing, encoding or decoding */
 typedef enum {
     WC_PKCS7_ENCODE,
@@ -55,6 +114,7 @@ typedef enum {
 /* holds information about the signers */
 struct PKCS7SignerInfo {
     int version;
+    int sidType;    /* CMS_ISSUER_AND_SERIAL_NUMBER or CMS_SKID */
     byte  *sid;
     word32 sidSz;
 };
@@ -69,6 +129,17 @@ struct PKCS7SignerInfo {
 #endif
 
 #ifndef NO_PKCS7_STREAM
+
+/* Hard upper bound on a single PKCS7 streaming buffer allocation. Guards
+ * wc_PKCS7_GrowStream against attacker-controlled ASN.1 lengths that were
+ * parsed with NO_USER_CHECK and would otherwise drive allocations up to
+ * around 2GB (e.g. via a forged RecipientInfo SET length). 16 MB is well above
+ * any legitimate RecipientInfo / encoded-attribute size but small enough
+ * that a forged length fails allocation on constrained targets and is
+ * rejected on larger ones. */
+#ifndef WOLFSSL_PKCS7_MAX_STREAM_ALLOC
+    #define WOLFSSL_PKCS7_MAX_STREAM_ALLOC (16 * 1024 * 1024)
+#endif
 
 #define MAX_PKCS7_STREAM_BUFFER 256
 struct PKCS7State {
@@ -101,6 +172,7 @@ struct PKCS7State {
     word32 nonceSz;  /* size of nonce stored */
     word32 aadSz;    /* size of additional AEAD data */
     word32 tagSz;    /* size of tag for AEAD */
+    word32 icvSz;    /* expected ICV/MAC size from AlgoID parameter */
     word32 contentSz;
     word32 currContIdx;   /* index of current content */
     word32 currContSz;    /* size of current content */
@@ -167,16 +239,28 @@ static void wc_PKCS7_ResetStream(wc_PKCS7* pkcs7)
     #endif
 
         /* free any buffers that may be allocated */
+        if (pkcs7->stream->aad != NULL && pkcs7->stream->aadSz > 0)
+            ForceZero(pkcs7->stream->aad, pkcs7->stream->aadSz);
         XFREE(pkcs7->stream->aad, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(pkcs7->stream->tag, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(pkcs7->stream->nonce, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(pkcs7->stream->buffer, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        /* stream->bufferPt holds the AuthEnvelopedData encryptedContent
+         * buffer across WANT_READ re-entries. wc_PKCS7_DecodeAuthEnveloped
+         * Data() only frees it on its own error paths; if the stream is torn
+         * down while a decode is still pending (e.g. wc_PKCS7_Free() called
+         * after a WANT_READ), it must be freed here or it leaks. */
+        XFREE(pkcs7->stream->bufferPt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        /* stream->key is always allocated with MAX_ENCRYPTED_KEY_SZ */
+        if (pkcs7->stream->key != NULL)
+            ForceZero(pkcs7->stream->key, MAX_ENCRYPTED_KEY_SZ);
         XFREE(pkcs7->stream->key, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
-        pkcs7->stream->aad    = NULL;
-        pkcs7->stream->tag    = NULL;
-        pkcs7->stream->nonce  = NULL;
-        pkcs7->stream->buffer = NULL;
-        pkcs7->stream->key    = NULL;
+        pkcs7->stream->aad      = NULL;
+        pkcs7->stream->tag      = NULL;
+        pkcs7->stream->nonce    = NULL;
+        pkcs7->stream->buffer   = NULL;
+        pkcs7->stream->bufferPt = NULL;
+        pkcs7->stream->key      = NULL;
 
         /* reset values, note that content and tmpCert are saved */
         pkcs7->stream->maxLen   = 0;
@@ -225,6 +309,16 @@ static void wc_PKCS7_FreeStream(wc_PKCS7* pkcs7)
 static int wc_PKCS7_GrowStream(wc_PKCS7* pkcs7, word32 newSz)
 {
     byte* pt;
+
+    /* Guard against attacker-controlled ASN.1 lengths reaching this
+     * allocation. Several callers parse lengths with NO_USER_CHECK and
+     * pass them here unvalidated (e.g. wc_PKCS7_ParseToRecipientInfoSet
+     * on a forged RecipientInfo SET header). */
+    if (newSz > WOLFSSL_PKCS7_MAX_STREAM_ALLOC) {
+        WOLFSSL_MSG("PKCS7 streaming allocation exceeds maximum");
+        return BUFFER_E;
+    }
+
     pt = (byte*)XMALLOC(newSz, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
     if (pt == NULL) {
         return MEMORY_E;
@@ -529,6 +623,11 @@ static int wc_SetContentType(int pkcs7TypeOID, byte* output, word32 outputSz)
     /* FirmwarePkgData (1.2.840.113549.1.9.16.1.16), RFC 4108 */
     static const byte firmwarePkgData[]    =
         { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x10 };
+#ifdef WOLFSSL_TSP
+    /* id-ct-TSTInfo (1.2.840.113549.1.9.16.1.4), RFC 3161 */
+    static const byte tstInfoData[]        =
+        { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04 };
+#endif
 #if defined(HAVE_LIBZ) && !defined(NO_PKCS7_COMPRESSED_DATA)
     /* id-ct-compressedData (1.2.840.113549.1.9.16.1.9), RFC 3274 */
     static const byte compressedData[]     =
@@ -599,6 +698,13 @@ static int wc_SetContentType(int pkcs7TypeOID, byte* output, word32 outputSz)
             typeSz = sizeof(firmwarePkgData);
             typeName = firmwarePkgData;
             break;
+
+#ifdef WOLFSSL_TSP
+        case TSTINFO_DATA:
+            typeSz = sizeof(tstInfoData);
+            typeName = tstInfoData;
+            break;
+#endif
 
 #if !defined(NO_PWDBASED) && !defined(NO_SHA)
         case PWRI_KEK_WRAP:
@@ -963,6 +1069,37 @@ static int wc_PKCS7_RecipientListVersionsAllZero(wc_PKCS7* pkcs7)
     return 1;
 }
 
+#if defined(WC_PKCS7_HAVE_MLDSA) && \
+    (defined(WOLFSSL_MLDSA_PUBLIC_KEY) || defined(WC_PKCS7_MLDSA_SIGN))
+/* forward declaration; defined alongside the other ML-DSA helpers below.
+ * Used by CheckPublicKeyDer (public key) and the sign-size/sign paths. */
+static int wc_PKCS7_MlDsaLevelFromOID(word32 publicKeyOID, byte* level);
+#endif
+
+/* Returns whether the parameters field of a CMS structural digest
+ * AlgorithmIdentifier (SignedData.digestAlgorithms / SignerInfo.digestAlgorithm)
+ * should be omitted (absent) rather than encoded as NULL.
+ *
+ * RFC 8702 requires the SHAKE128/SHAKE256 digest identifiers to have ABSENT
+ * parameters, so those are always forced absent. For the SHA-2 family RFC 5754
+ * says the parameters SHOULD be absent but receivers MUST accept both forms;
+ * to preserve wolfSSL's long-standing output and interoperability the caller's
+ * pkcs7->hashParamsAbsent preference (default: NULL) is honored there.
+ *
+ * This applies only to the CMS structural AlgorithmIdentifiers; the PKCS#1
+ * v1.5 DigestInfo used internally for RSA signatures keeps the NULL parameter
+ * that is conventional for that structure (RFC 8017) and is unaffected. */
+static byte wc_PKCS7_DigestParamsAbsent(const wc_PKCS7* pkcs7)
+{
+#if defined(WOLFSSL_SHA3) && \
+    (defined(WOLFSSL_SHAKE256) || defined(WOLFSSL_SHAKE128))
+    if (pkcs7->hashOID == SHAKE256h || pkcs7->hashOID == SHAKE128h) {
+        return 1;
+    }
+#endif
+    return pkcs7->hashParamsAbsent;
+}
+
 /* Verify RSA/ECC key is correctly formatted, used as sanity check after
  * import of key/cert.
  *
@@ -1019,6 +1156,11 @@ static int wc_PKCS7_CheckPublicKeyDer(wc_PKCS7* pkcs7, int keyOID,
 
     switch (keyOID) {
 #ifndef NO_RSA
+    #ifdef WC_RSA_PSS
+        case RSAPSSk:
+            /* RSA-PSS cert: public key is same RSA format as RSAk */
+            FALL_THROUGH;
+    #endif
         case RSAk:
             ret = wc_InitRsaKey_ex(rsa, pkcs7->heap, pkcs7->devId);
             if (ret != 0) {
@@ -1050,7 +1192,41 @@ static int wc_PKCS7_CheckPublicKeyDer(wc_PKCS7* pkcs7, int keyOID,
 
             break;
 #endif
+#if defined(WC_PKCS7_HAVE_MLDSA) && defined(WOLFSSL_MLDSA_PUBLIC_KEY)
+        case ML_DSA_44k:
+        case ML_DSA_65k:
+        case ML_DSA_87k:
+        {
+            /* Sanity check: decode the ML-DSA public key from its SPKI. */
+            byte level = 0;
+            wc_MlDsaKey* mldsa = (wc_MlDsaKey*)XMALLOC(sizeof(wc_MlDsaKey),
+                                    pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+            if (mldsa == NULL) {
+                ret = MEMORY_E;
+                break;
+            }
+            ret = wc_PKCS7_MlDsaLevelFromOID((word32)keyOID, &level);
+            if (ret == 0) {
+                ret = wc_MlDsaKey_Init(mldsa, pkcs7->heap, pkcs7->devId);
+            }
+            if (ret == 0) {
+                ret = wc_MlDsaKey_SetParams(mldsa, level);
+                if (ret == 0) {
+                    ret = wc_MlDsaKey_PublicKeyDecode(mldsa, key, keySz,
+                                                      &scratch);
+                }
+                wc_MlDsaKey_Free(mldsa);
+            }
+            XFREE(mldsa, pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+            break;
+        }
+#endif
     }
+
+    /* scratch is only read inside the (conditionally compiled) switch cases;
+     * mark it used so a build with none of them enabled (e.g. sign-only ML-DSA
+     * with RSA and ECC disabled) stays -Werror clean. */
+    (void)scratch;
 
 #ifdef WOLFSSL_SMALL_STACK
     #ifndef NO_RSA
@@ -1162,17 +1338,37 @@ int wc_PKCS7_InitWithCert(wc_PKCS7* pkcs7, byte* derCert, word32 derCertSz)
             return ret;
         }
 
-        if (dCert->pubKeySize > (MAX_RSA_INT_SZ + MAX_RSA_E_SZ) ||
-            dCert->serialSz > MAX_SN_SZ) {
-            WOLFSSL_MSG("Invalid size in certificate");
+        if (dCert->serialSz > MAX_SN_SZ) {
+            WOLFSSL_MSG("Invalid serial size in certificate");
             FreeDecodedCert(dCert);
             WC_FREE_VAR_EX(dCert, pkcs7->heap, DYNAMIC_TYPE_DCERT);
             return ASN_PARSE_E;
         }
 
-        XMEMCPY(pkcs7->publicKey, dCert->publicKey, dCert->pubKeySize);
-        pkcs7->publicKeySz = dCert->pubKeySize;
+        /* Store the signer public key only for RSA/ECC; it is consumed solely
+         * by the RSA/ECC raw-sign callback paths. PQC keys (e.g. ML-DSA) are
+         * large, never read back from here, and would overflow this RSA-sized
+         * buffer, so they are not stored. */
+        if (dCert->keyOID == RSAk || dCert->keyOID == RSAPSSk ||
+                dCert->keyOID == ECDSAk) {
+            /* guard the fixed-size buffer against an over-large key blob */
+            if (dCert->pubKeySize > (MAX_RSA_INT_SZ + MAX_RSA_E_SZ)) {
+                WOLFSSL_MSG("Invalid public key size in certificate");
+                FreeDecodedCert(dCert);
+                WC_FREE_VAR_EX(dCert, pkcs7->heap, DYNAMIC_TYPE_DCERT);
+                return ASN_PARSE_E;
+            }
+            XMEMCPY(pkcs7->publicKey, dCert->publicKey, dCert->pubKeySize);
+            pkcs7->publicKeySz = dCert->pubKeySize;
+        }
+        else {
+            pkcs7->publicKeySz = 0;
+        }
         pkcs7->publicKeyOID = dCert->keyOID;
+        /* Do not derive publicKeyOID from cert signatureOID: the cert's
+         * signature is how the cert was signed by its issuer; the signer
+         * chooses digestEncryptionAlgorithm (e.g. RSASSA-PSS vs PKCS#1 v1.5)
+         * via API / pkcs7->publicKeyOID set by the application. */
         XMEMCPY(pkcs7->issuerHash, dCert->issuerHash, KEYID_SIZE);
         pkcs7->issuer = dCert->issuerRaw;
         pkcs7->issuerSz = (word32)dCert->issuerRawLen;
@@ -1307,6 +1503,13 @@ static int wc_PKCS7_SignerInfoSetSID(wc_PKCS7* pkcs7, byte* in, int inSz)
 }
 
 
+#if !defined(NO_PKCS7_STREAM) && (!defined(NO_DES3) || !defined(NO_AES))
+/* defined later in this file; needed here to release a decrypt context left
+ * initialized by an abandoned streaming decode */
+static void wc_PKCS7_DecryptContentFree(wc_PKCS7* pkcs7, word32 encryptOID,
+    void* heap);
+#endif
+
 /* releases any memory allocated by a PKCS7 initializer */
 void wc_PKCS7_Free(wc_PKCS7* pkcs7)
 {
@@ -1314,6 +1517,28 @@ void wc_PKCS7_Free(wc_PKCS7* pkcs7)
         return;
 
 #ifndef NO_PKCS7_STREAM
+    /* A streaming EnvelopedData decode that was abandoned mid-message (e.g. it
+     * returned WC_PKCS7_WANT_READ_E and was never resumed) leaves the
+     * content-decryption context allocated by wc_PKCS7_DecryptContentInit().
+     * Release it before tearing down the stream so it is not leaked. Only the
+     * EnvelopedData decode path allocates decryptKey, and only there does the
+     * stream's first saved var hold the content cipher OID, so gate on a
+     * pending context: when decryptKey is NULL there is nothing to free and
+     * the (unrelated) saved var of another streaming decode must not be
+     * interpreted as a cipher OID. */
+#if !defined(NO_DES3) || !defined(NO_AES)
+    if (pkcs7->stream != NULL &&
+    #ifndef NO_AES
+            pkcs7->decryptKey.aes != NULL
+    #else
+            pkcs7->decryptKey.des3 != NULL
+    #endif
+       ) {
+        word32 encOID = 0;
+        wc_PKCS7_StreamGetVar(pkcs7, &encOID, NULL, NULL);
+        wc_PKCS7_DecryptContentFree(pkcs7, encOID, pkcs7->heap);
+    }
+#endif
     wc_PKCS7_FreeStream(pkcs7);
 #endif
 
@@ -1507,7 +1732,15 @@ typedef struct ESD {
     byte contentDigest[WC_MAX_DIGEST_SIZE + 2]; /* content only + ASN.1 heading */
     WC_BITFIELD contentDigestSet:1;
     byte contentAttribsDigest[WC_MAX_DIGEST_SIZE];
-    byte encContentDigest[MAX_ENCRYPTED_KEY_SZ];
+    /* Signature buffer, heap allocated and right-sized to the signature
+     * algorithm before signing (the size is obtained from
+     * wc_PKCS7_GetSignSize). A single allocation serves every algorithm
+     * (RSA/ECDSA/RSA-PSS/ML-DSA), so signature storage is not special-cased by
+     * type. encContentDigestSz is the actual signature length and
+     * encContentDigestBufSz is the allocated capacity. Freed in the encode
+     * cleanup path. */
+    byte*  encContentDigest;
+    word32 encContentDigestBufSz;
 
     byte outerSeq[MAX_SEQ_SZ];
         byte outerContent[MAX_EXP_SZ];
@@ -1529,22 +1762,32 @@ typedef struct ESD {
                         byte issuerSnSeq[MAX_SEQ_SZ];
                             byte issuerName[MAX_SEQ_SZ];
                             byte issuerSn[MAX_SN_SZ];
-                        /* OR subjectKeyIdentifier */
+                        /* OR subjectKeyIdentifier (implicit [0] header) */
                         byte issuerSKIDSeq[MAX_SEQ_SZ];
-                            byte issuerSKID[MAX_OCTET_STR_SZ];
                         byte signerDigAlgoId[MAX_ALGO_SZ];
+#if defined(WC_RSA_PSS)
+                        byte digEncAlgoId[128]; /* RSASSA-PSS needs full params */
+#else
                         byte digEncAlgoId[MAX_ALGO_SZ];
+#endif
                         byte signedAttribSet[MAX_SET_SZ];
-                            EncodedAttrib signedAttribs[7];
+                            /* Working attribute array. signedAttribs points at
+                             * the inline buffer for the common case (no heap use,
+                             * important for no-malloc/static-memory builds) and is
+                             * redirected to a heap allocation only when the
+                             * attribute count exceeds MAX_SIGNED_ATTRIBS_SZ.
+                             * signedAttribsCap holds the usable entry count. */
+                            EncodedAttrib signedAttribsInline[MAX_SIGNED_ATTRIBS_SZ];
+                            EncodedAttrib* signedAttribs;
                         byte signerDigest[MAX_OCTET_STR_SZ];
     word32 innerOctetsSz, innerContSeqSz, contentInfoSeqSz;
     word32 outerSeqSz, outerContentSz, innerSeqSz, versionSz, digAlgoIdSetSz,
            singleDigAlgoIdSz, certsSetSz;
     word32 signerInfoSetSz, signerInfoSeqSz, signerVersionSz,
-           issuerSnSeqSz, issuerNameSz, issuerSnSz, issuerSKIDSz,
+           issuerSnSeqSz, issuerNameSz, issuerSnSz,
            issuerSKIDSeqSz, signerDigAlgoIdSz, digEncAlgoIdSz, signerDigestSz;
     word32 encContentDigestSz, signedAttribsSz, signedAttribsCount,
-           signedAttribSetSz;
+           signedAttribSetSz, signedAttribsCap;
 } ESD;
 
 
@@ -1552,15 +1795,37 @@ static int EncodeAttributes(EncodedAttrib* ea, int eaSz,
                                             PKCS7Attrib* attribs, int attribsSz)
 {
     int i;
-    int maxSz = (int)min((word32)eaSz, (word32)attribsSz);
-    int allAttribsSz = 0;
+    int maxSz;
+    word32 allAttribsSz = 0;
+
+    if (eaSz < 0 || attribsSz < 0) {
+        return BAD_FUNC_ARG;
+    }
+
+    maxSz = (int)min((word32)eaSz, (word32)attribsSz);
 
     for (i = 0; i < maxSz; i++)
     {
         word32 attribSz = 0;
+        word32 boundSz = 0;
 
         ea[i].value = attribs[i].value;
         ea[i].valueSz = attribs[i].valueSz;
+
+        /* The valueSz and oidSz fields are application supplied and unbounded.
+         * Reject any attribute whose encoded size would overflow a word32
+         * before performing the size arithmetic below. Otherwise a large
+         * valueSz wraps the running total, producing an undersized allocation
+         * and a heap buffer overflow in FlattenEncodedAttribs(). The encoded
+         * SET and SEQUENCE headers add at most MAX_SET_SZ and MAX_SEQ_SZ bytes,
+         * so checking against those upper bounds bounds the real total. */
+        if (!WC_SAFE_SUM_WORD32(ea[i].valueSz, attribs[i].oidSz, boundSz) ||
+            !WC_SAFE_SUM_WORD32(boundSz, (word32)MAX_SET_SZ, boundSz) ||
+            !WC_SAFE_SUM_WORD32(boundSz, (word32)MAX_SEQ_SZ, boundSz)) {
+            WOLFSSL_MSG("PKCS7 attribute size overflow");
+            return BUFFER_E;
+        }
+
         attribSz += ea[i].valueSz;
         ea[i].valueSetSz = SetSet(attribSz, ea[i].valueSet);
         attribSz += ea[i].valueSetSz;
@@ -1571,9 +1836,18 @@ static int EncodeAttributes(EncodedAttrib* ea, int eaSz,
         attribSz += ea[i].valueSeqSz;
         ea[i].totalSz = attribSz;
 
-        allAttribsSz += (int)attribSz;
+        /* Keep the running total within positive int range so callers can
+         * distinguish a valid size (>= 0) from a negative error return. Bound
+         * against the build's actual int maximum rather than assuming 32-bit
+         * int, so the (int) cast below cannot overflow on narrow-int targets. */
+        if (attribSz > (word32)WC_MAX_SINT_OF(int) ||
+            allAttribsSz > (word32)WC_MAX_SINT_OF(int) - attribSz) {
+            WOLFSSL_MSG("PKCS7 attributes total size overflow");
+            return BUFFER_E;
+        }
+        allAttribsSz += attribSz;
     }
-    return allAttribsSz;
+    return (int)allAttribsSz;
 }
 
 
@@ -1676,7 +1950,16 @@ static int FlattenEncodedAttribs(wc_PKCS7* pkcs7, FlatAttrib** derArr, int rows,
     }
 
     for (i = 0; i < eaSz; i++) {
-        sz = ea[i].valueSeqSz + ea[i].oidSz + ea[i].valueSetSz + ea[i].valueSz;
+        /* Defense in depth: guard the size sum against word32 overflow so the
+         * allocation below can never be smaller than the XMEMCPY lengths.
+         * EncodeAttributes() rejects oversized attributes up front, but this
+         * keeps the allocation safe if reached with unchecked input. */
+        if (!WC_SAFE_SUM_WORD32(ea[i].valueSeqSz, ea[i].oidSz, sz) ||
+            !WC_SAFE_SUM_WORD32(sz, ea[i].valueSetSz, sz) ||
+            !WC_SAFE_SUM_WORD32(sz, ea[i].valueSz, sz)) {
+            WOLFSSL_MSG("PKCS7 attribute size overflow");
+            return BUFFER_E;
+        }
 
         output = (byte*)XMALLOC(sz, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
         if (output == NULL) {
@@ -1794,6 +2077,16 @@ static int wc_PKCS7_ImportRSA(wc_PKCS7* pkcs7, RsaKey* privKey)
             }
         #endif
         }
+    #ifdef HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK
+        else if (pkcs7->rsaSignRawDigestCb != NULL && pkcs7->publicKeySz > 0) {
+            /* When using raw sign callback (e.g., HSM/secure element), private
+             * key may not be available. Use public key from signer certificate
+             * for signature size calculation. */
+            idx = 0;
+            ret = wc_RsaPublicKeyDecode(pkcs7->publicKey, &idx, privKey,
+                                        pkcs7->publicKeySz);
+        }
+    #endif
         else if (pkcs7->devId == INVALID_DEVID) {
             ret = BAD_FUNC_ARG;
         }
@@ -1826,7 +2119,7 @@ static int wc_PKCS7_RsaSign(wc_PKCS7* pkcs7, byte* in, word32 inSz, ESD* esd)
     #endif
             {
                 ret = wc_RsaSSL_Sign(in, inSz, esd->encContentDigest,
-                                     sizeof(esd->encContentDigest),
+                                     esd->encContentDigestBufSz,
                                      privKey, pkcs7->rng);
             }
     #ifdef WOLFSSL_ASYNC_CRYPT
@@ -1874,6 +2167,16 @@ static int wc_PKCS7_ImportECC(wc_PKCS7* pkcs7, ecc_key* privKey)
             }
         #endif
         }
+    #ifdef HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK
+        else if (pkcs7->eccSignRawDigestCb != NULL && pkcs7->publicKeySz > 0) {
+            /* When using raw sign callback (e.g., HSM/secure element), private
+             * key may not be available. Use public key from signer certificate
+             * for signature size calculation. */
+            idx = 0;
+            ret = wc_EccPublicKeyDecode(pkcs7->publicKey, &idx, privKey,
+                                        pkcs7->publicKeySz);
+        }
+    #endif
         else if (pkcs7->devId == INVALID_DEVID) {
             ret = BAD_FUNC_ARG;
         }
@@ -1899,7 +2202,7 @@ static int wc_PKCS7_EcdsaSign(wc_PKCS7* pkcs7, byte* in, word32 inSz, ESD* esd)
 
     ret = wc_PKCS7_ImportECC(pkcs7, privKey);
     if (ret == 0) {
-        outSz = sizeof(esd->encContentDigest);
+        outSz = esd->encContentDigestBufSz;
     #ifdef WOLFSSL_ASYNC_CRYPT
         do {
             ret = wc_AsyncWait(ret, &privKey->asyncDev,
@@ -1925,6 +2228,121 @@ static int wc_PKCS7_EcdsaSign(wc_PKCS7* pkcs7, byte* in, word32 inSz, ESD* esd)
 
 #endif /* HAVE_ECC */
 
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+/* Map hash type to MGF1 identifier; local copy so PKCS7 does not depend on
+ * rsa.c when RSA is in a separate FIPS module (e.g. CAVP build). */
+static int pkcs7_hash2mgf(enum wc_HashType hType)
+{
+    switch (hType) {
+    case WC_HASH_TYPE_NONE:
+        return WC_MGF1NONE;
+    case WC_HASH_TYPE_SHA:
+#ifndef NO_SHA
+        return WC_MGF1SHA1;
+#else
+        break;
+#endif
+    case WC_HASH_TYPE_SHA224:
+#ifdef WOLFSSL_SHA224
+        return WC_MGF1SHA224;
+#else
+        break;
+#endif
+    case WC_HASH_TYPE_SHA256:
+#ifndef NO_SHA256
+        return WC_MGF1SHA256;
+#else
+        break;
+#endif
+    case WC_HASH_TYPE_SHA384:
+#ifdef WOLFSSL_SHA384
+        return WC_MGF1SHA384;
+#else
+        break;
+#endif
+    case WC_HASH_TYPE_SHA512:
+#ifdef WOLFSSL_SHA512
+        return WC_MGF1SHA512;
+#else
+        break;
+#endif
+    /* MGF1 only supports SHA-1 and SHA-2; other hashes fall through to WC_MGF1NONE */
+    case WC_HASH_TYPE_MD2:
+    case WC_HASH_TYPE_MD4:
+    case WC_HASH_TYPE_MD5:
+    case WC_HASH_TYPE_MD5_SHA:
+    case WC_HASH_TYPE_SHA3_224:
+    case WC_HASH_TYPE_SHA3_256:
+    case WC_HASH_TYPE_SHA3_384:
+    case WC_HASH_TYPE_SHA3_512:
+    case WC_HASH_TYPE_BLAKE2B:
+    case WC_HASH_TYPE_BLAKE2S:
+    case WC_HASH_TYPE_SHA512_224:
+    case WC_HASH_TYPE_SHA512_256:
+    case WC_HASH_TYPE_SHAKE128:
+    case WC_HASH_TYPE_SHAKE256:
+    case WC_HASH_TYPE_SM3:
+    default:
+        break;
+    }
+    return WC_MGF1NONE;
+}
+
+/* returns size of signature put into esd->encContentDigest, negative on error.
+ * Signs the digest (contentAttribsDigest) with RSA-PSS padding, like ECDSA. */
+static int wc_PKCS7_RsaPssSign(wc_PKCS7* pkcs7, byte* digest, word32 digestSz,
+                               ESD* esd)
+{
+    int ret;
+    word32 outSz;
+    WC_DECLARE_VAR(privKey, RsaKey, 1, 0);
+
+    if (pkcs7 == NULL || pkcs7->rng == NULL || digest == NULL || esd == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    WC_ALLOC_VAR_EX(privKey, RsaKey, 1, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER,
+        return MEMORY_E);
+
+    ret = wc_PKCS7_ImportRSA(pkcs7, privKey);
+    if (ret == 0) {
+        outSz = esd->encContentDigestBufSz;
+#ifdef WOLFSSL_ASYNC_CRYPT
+        do {
+            ret = wc_AsyncWait(ret, &privKey->asyncDev,
+                WC_ASYNC_FLAG_CALL_AGAIN);
+            if (ret >= 0)
+#endif
+            {
+                /* Salt length policy: use hash digest length (RFC 4055 typical).
+                 * RFC 3447 allows arbitrary salt lengths, but hash-length is the
+                 * most interoperable choice and matches OpenSSL's default.
+                 * Must agree with the saltLen encoded in
+                 * SignerInfo.signatureAlgorithm params above. */
+                int saltLen = wc_HashGetDigestSize(wc_OidGetHash(pkcs7->hashOID));
+                if (saltLen < 0) {
+                    ret = saltLen;
+                }
+                else {
+                    ret = wc_RsaPSS_Sign_ex(digest, digestSz,
+                        esd->encContentDigest, outSz,
+                        esd->hashType, pkcs7_hash2mgf(esd->hashType),
+                        saltLen, privKey, pkcs7->rng);
+                }
+            }
+#ifdef WOLFSSL_ASYNC_CRYPT
+        } while (ret == WC_NO_ERR_TRACE(WC_PENDING_E));
+#endif
+        /* wc_RsaPSS_Sign_ex returns signature length on success */
+    }
+
+    wc_FreeRsaKey(privKey);
+    WC_FREE_VAR_EX(privKey, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+
+    return ret;
+}
+#endif /* WC_RSA_PSS && !NO_RSA */
+
 /* returns encContentDigestSz based on the signature set to be used */
 static int wc_PKCS7_GetSignSize(wc_PKCS7* pkcs7)
 {
@@ -1934,6 +2352,9 @@ static int wc_PKCS7_GetSignSize(wc_PKCS7* pkcs7)
 
     #ifndef NO_RSA
         case RSAk:
+    #ifdef WC_RSA_PSS
+        case RSAPSSk:
+    #endif
         {
         #ifndef WOLFSSL_SMALL_STACK
             RsaKey  privKey[1];
@@ -1977,9 +2398,69 @@ static int wc_PKCS7_GetSignSize(wc_PKCS7* pkcs7)
         }
         break;
     #endif
+
+    #if defined(WC_PKCS7_HAVE_MLDSA) && !defined(WOLFSSL_MLDSA_NO_SIGN) && \
+        defined(WOLFSSL_MLDSA_PRIVATE_KEY)
+        case ML_DSA_44k:
+        case ML_DSA_65k:
+        case ML_DSA_87k:
+        {
+            /* ML-DSA signatures are a fixed size per parameter set, so the
+             * size is derived from the level alone - no private key or signing
+             * is required. */
+            byte level = 0;
+            wc_MlDsaKey* key = (wc_MlDsaKey*)XMALLOC(sizeof(wc_MlDsaKey),
+                pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+            if (key == NULL)
+                return MEMORY_E;
+
+            ret = wc_PKCS7_MlDsaLevelFromOID(pkcs7->publicKeyOID, &level);
+            if (ret == 0)
+                ret = wc_MlDsaKey_Init(key, pkcs7->heap, pkcs7->devId);
+            if (ret == 0) {
+                ret = wc_MlDsaKey_SetParams(key, level);
+                if (ret == 0)
+                    ret = wc_MlDsaKey_SigSize(key);
+                wc_MlDsaKey_Free(key);
+            }
+            XFREE(key, pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+        }
+        break;
+    #endif
     }
 
     return ret;
+}
+
+
+/* Number of default ("canned") signed attributes that
+ * wc_PKCS7_BuildSignedAttributes() will emit for the current
+ * pkcs7->defaultSignedAttribs selection. This is the single source of truth for
+ * that count: it must stay in lock step with the emission logic in
+ * wc_PKCS7_BuildSignedAttributes() below, and is used by PKCS7_EncodeSigned() to
+ * size the working attribute array to the exact count. */
+static word32 wc_PKCS7_GetDefaultSignedAttribCount(const wc_PKCS7* pkcs7)
+{
+    word32 cnt = 0;
+    word16 flags;
+
+    if (pkcs7 == NULL)
+        return 0;
+
+    flags = pkcs7->defaultSignedAttribs;
+    if (flags == WOLFSSL_NO_ATTRIBUTES)
+        return 0;
+
+    if ((flags & WOLFSSL_CONTENT_TYPE_ATTRIBUTE) || flags == 0)
+        cnt++;
+#ifndef NO_ASN_TIME
+    if ((flags & WOLFSSL_SIGNING_TIME_ATTRIBUTE) || flags == 0)
+        cnt++;
+#endif
+    if ((flags & WOLFSSL_MESSAGE_DIGEST_ATTRIBUTE) || flags == 0)
+        cnt++;
+
+    return cnt;
 }
 
 
@@ -1987,6 +2468,10 @@ static int wc_PKCS7_GetSignSize(wc_PKCS7* pkcs7)
  *
  * pkcs7 - pointer to initialized PKCS7 structure
  * esd   - pointer to initialized ESD structure, used for output
+ *
+ * The number of default attributes emitted here must match
+ * wc_PKCS7_GetDefaultSignedAttribCount(), which sizes the working array; the
+ * runtime bound-check below turns any drift into BUFFER_E rather than overflow.
  *
  * return 0 on success, negative on error */
 static int wc_PKCS7_BuildSignedAttributes(wc_PKCS7* pkcs7, ESD* esd,
@@ -1997,6 +2482,7 @@ static int wc_PKCS7_BuildSignedAttributes(wc_PKCS7* pkcs7, ESD* esd,
                     byte* signingTime, word32 signingTimeSz)
 {
     int hashSz;
+    int encAttribsSz;
 #ifdef NO_ASN_TIME
     PKCS7Attrib cannedAttribs[2];
 #else
@@ -2006,7 +2492,6 @@ static int wc_PKCS7_BuildSignedAttributes(wc_PKCS7* pkcs7, ESD* esd,
 #endif
     word32 idx    = 0;
     word32 atrIdx = 0;
-    word32 cannedAttribsCount;
 
     if (pkcs7 == NULL || esd == NULL || contentType == NULL ||
         contentTypeOid == NULL || messageDigestOid == NULL ||
@@ -2028,8 +2513,6 @@ static int wc_PKCS7_BuildSignedAttributes(wc_PKCS7* pkcs7, ESD* esd,
         if (timeSz < 0)
             return timeSz;
     #endif
-
-        cannedAttribsCount = sizeof(cannedAttribs)/sizeof(PKCS7Attrib);
 
         XMEMSET(&cannedAttribs[idx], 0, sizeof(cannedAttribs[idx]));
 
@@ -2062,10 +2545,19 @@ static int wc_PKCS7_BuildSignedAttributes(wc_PKCS7* pkcs7, ESD* esd,
             idx++;
         }
 
-        esd->signedAttribsCount += cannedAttribsCount;
-        esd->signedAttribsSz += (word32)EncodeAttributes(
-            &esd->signedAttribs[atrIdx], (int)idx, cannedAttribs,
-            (int)cannedAttribsCount);
+        /* the working array is sized for the canned count by PKCS7_EncodeSigned()
+         * via wc_PKCS7_GetDefaultSignedAttribCount(); bound-check here so a
+         * future drift between the two can never overflow it */
+        if (esd->signedAttribs == NULL ||
+            atrIdx + idx > esd->signedAttribsCap)
+            return BUFFER_E;
+
+        esd->signedAttribsCount += idx;
+        encAttribsSz = EncodeAttributes(&esd->signedAttribs[atrIdx],
+            (int)idx, cannedAttribs, (int)idx);
+        if (encAttribsSz < 0)
+            return encAttribsSz;
+        esd->signedAttribsSz += (word32)encAttribsSz;
         atrIdx += idx;
     } else {
         esd->signedAttribsCount = 0;
@@ -2074,10 +2566,22 @@ static int wc_PKCS7_BuildSignedAttributes(wc_PKCS7* pkcs7, ESD* esd,
 
     /* add custom signed attributes if set */
     if (pkcs7->signedAttribsSz > 0 && pkcs7->signedAttribs != NULL) {
+        /* esd->signedAttribs was allocated to hold all attributes, but guard
+         * against writing past it in case the working array was undersized */
+        word32 availableSpace = (esd->signedAttribsCap > atrIdx) ?
+                                (esd->signedAttribsCap - atrIdx) : 0;
+
+        if (esd->signedAttribs == NULL ||
+            pkcs7->signedAttribsSz > availableSpace)
+            return BUFFER_E;
+
         esd->signedAttribsCount += pkcs7->signedAttribsSz;
-        esd->signedAttribsSz += (word32)EncodeAttributes(
-            &esd->signedAttribs[atrIdx], (int)esd->signedAttribsCount,
-            pkcs7->signedAttribs, (int)pkcs7->signedAttribsSz);
+        encAttribsSz = EncodeAttributes(&esd->signedAttribs[atrIdx],
+            (int)esd->signedAttribsCount, pkcs7->signedAttribs,
+            (int)pkcs7->signedAttribsSz);
+        if (encAttribsSz < 0)
+            return encAttribsSz;
+        esd->signedAttribsSz += (word32)encAttribsSz;
     }
 
 #ifdef NO_ASN_TIME
@@ -2219,6 +2723,31 @@ static int wc_PKCS7_SignedDataGetEncAlgoId(wc_PKCS7* pkcs7, int* digEncAlgoId,
     }
 #endif /* HAVE_ECC */
 
+#ifdef WC_RSA_PSS
+    else if (pkcs7->publicKeyOID == RSAPSSk) {
+        algoType = oidSigType;
+        algoId = CTC_RSASSAPSS;
+        /* Hash/MGF/salt conveyed via PSS params in AlgorithmIdentifier */
+    }
+#endif
+#ifndef WC_RSA_PSS
+    else if (pkcs7->publicKeyOID == RSAPSSk) {
+        WOLFSSL_MSG("RSA-PSS requested but WC_RSA_PSS not compiled in");
+        return NOT_COMPILED_IN;
+    }
+#endif
+#ifdef WC_PKCS7_HAVE_MLDSA
+    else if (pkcs7->publicKeyOID == ML_DSA_44k ||
+             pkcs7->publicKeyOID == ML_DSA_65k ||
+             pkcs7->publicKeyOID == ML_DSA_87k) {
+        /* RFC 9882: the signatureAlgorithm is the ML-DSA OID itself (no hash
+         * prefix), and its parameters field MUST be absent. The OID value is
+         * shared between the key and signature OID tables. */
+        algoType = oidSigType;
+        algoId = (int)pkcs7->publicKeyOID;
+    }
+#endif
+
     if (algoId == 0) {
         WOLFSSL_MSG("Invalid signature algorithm type");
         return BAD_FUNC_ARG;
@@ -2319,6 +2848,184 @@ static int wc_PKCS7_BuildDigestInfo(wc_PKCS7* pkcs7, byte* flatSignedAttribs,
 }
 
 
+#ifdef WC_PKCS7_HAVE_MLDSA
+/*
+ * ML-DSA (FIPS 204) SignedData support, per RFC 9882.
+ *
+ * Unlike RSA/ECDSA, ML-DSA is used in CMS "pure" mode: the signature is
+ * computed over the complete message (the DER SET OF signed attributes, or the
+ * eContent when none are present) rather than a pre-computed digest, with an
+ * empty context string and absent signatureAlgorithm parameters.
+ *
+ * The signature itself is stored like every other algorithm's, in the single
+ * right-sized esd->encContentDigest buffer; the only ML-DSA-specific code is
+ * the small set of helpers below (message construction, key level mapping,
+ * sign and verify), which the shared encode/verify dispatchers call. Adding a
+ * future "pure" PQC scheme (SLH-DSA, FN-DSA) means providing equivalent
+ * helpers and adding the OID to the per-algorithm switch sites
+ * (wc_PKCS7_GetSignSize, wc_PKCS7_SignedDataGetEncAlgoId,
+ * wc_PKCS7_SetPublicKeyOID, wc_PKCS7_CheckPublicKeyDer and the sign/verify
+ * dispatchers) rather than reworking the encode/decode control flow.
+ */
+
+/* Map a public key OID to the corresponding ML-DSA parameter level.
+ * Returns 0 and sets *level on success, BAD_FUNC_ARG otherwise.
+ *
+ * Only the FIPS 204 final ML-DSA OIDs are handled; the pre-standard draft
+ * Dilithium OIDs (DILITHIUM_LEVEL2k/3k/5k) are intentionally not supported
+ * for CMS, as RFC 9882 is defined over final ML-DSA. */
+#if defined(WOLFSSL_MLDSA_PUBLIC_KEY) || defined(WC_PKCS7_MLDSA_SIGN)
+static int wc_PKCS7_MlDsaLevelFromOID(word32 publicKeyOID, byte* level)
+{
+    switch (publicKeyOID) {
+        case ML_DSA_44k:
+            *level = WC_ML_DSA_44;
+            return 0;
+        case ML_DSA_65k:
+            *level = WC_ML_DSA_65;
+            return 0;
+        case ML_DSA_87k:
+            *level = WC_ML_DSA_87;
+            return 0;
+        default:
+            return BAD_FUNC_ARG;
+    }
+}
+#endif
+
+/* Build the exact octet string that a "pure" PQC signature is computed over,
+ * per RFC 9882 Section 4:
+ *   - if signed attributes are present, the DER encoding of the SignedAttrs
+ *     SET OF (i.e. the [0] IMPLICIT attributes re-tagged to a universal SET);
+ *   - otherwise, the eContent of the SignedData directly.
+ *
+ * On success *outMsg / *outMsgSz reference the message to sign/verify. When
+ * signed attributes are present a buffer is allocated and *outAlloc is set to
+ * 1 (caller must XFREE *outMsg with DYNAMIC_TYPE_TMP_BUFFER); otherwise
+ * *outMsg points into pkcs7->content and *outAlloc is 0.
+ *
+ * attribs/attribsSz are the flattened attributes without the SET wrapper, as
+ * available on both the encode (flatSignedAttribs) and decode (signedAttrib)
+ * paths. */
+#if defined(WC_PKCS7_MLDSA_SIGN) || defined(WC_PKCS7_MLDSA_VERIFY)
+static int wc_PKCS7_BuildPureSigMessage(wc_PKCS7* pkcs7, const byte* attribs,
+        word32 attribsSz, byte** outMsg, word32* outMsgSz, int* outAlloc)
+{
+    *outMsg = NULL;
+    *outMsgSz = 0;
+    *outAlloc = 0;
+
+    if (attribsSz > 0) {
+        byte attribSet[MAX_SET_SZ];
+        word32 attribSetSz;
+        byte* msg;
+
+        if (attribs == NULL) {
+            return BAD_FUNC_ARG;
+        }
+
+        attribSetSz = SetSet(attribsSz, attribSet);
+
+        msg = (byte*)XMALLOC(attribSetSz + attribsSz, pkcs7->heap,
+                             DYNAMIC_TYPE_TMP_BUFFER);
+        if (msg == NULL) {
+            return MEMORY_E;
+        }
+
+        XMEMCPY(msg, attribSet, attribSetSz);
+        XMEMCPY(msg + attribSetSz, attribs, attribsSz);
+
+        *outMsg = msg;
+        *outMsgSz = attribSetSz + attribsSz;
+        *outAlloc = 1;
+    }
+    else {
+        /* No signed attributes: the signature is over the eContent directly,
+         * which must be present. ML-DSA "pure" Sign/Verify require a non-NULL
+         * message pointer (a zero-length eContent is still passed by pointer),
+         * so a missing eContent with no signed attributes is rejected here
+         * rather than failing later with the same error.
+         *
+         * Scope: the eContent is signed verbatim. Unlike the RSA/ECC digest
+         * path (wc_PKCS7_SignedDataGetDigest), this does not strip the ASN.1
+         * tag/length for legacy PKCS#7 ANY-typed content (contentIsPkcs7Type
+         * == 1). Only CMS (OCTET STRING) eContent is supported for the ML-DSA
+         * no-signed-attributes path; the common RFC 9882 case carries signed
+         * attributes and is unaffected. */
+        if (pkcs7->content == NULL) {
+            return BAD_FUNC_ARG;
+        }
+        *outMsg = pkcs7->content;
+        *outMsgSz = pkcs7->contentSz;
+    }
+
+    return 0;
+}
+#endif /* WC_PKCS7_MLDSA_SIGN || WC_PKCS7_MLDSA_VERIFY */
+
+#if !defined(WOLFSSL_MLDSA_NO_SIGN) && defined(WOLFSSL_MLDSA_PRIVATE_KEY)
+/* Sign the supplied message with the ML-DSA private key in pkcs7->privateKey,
+ * writing the signature into the shared esd->encContentDigest buffer (which the
+ * caller has sized to the signature length). Uses pure ML-DSA with an empty
+ * context string, per RFC 9882.
+ *
+ * Returns the signature length on success, negative on error. */
+static int wc_PKCS7_MlDsaSign(wc_PKCS7* pkcs7, const byte* msg, word32 msgSz,
+                              ESD* esd)
+{
+    int ret;
+    byte level = 0;
+    word32 idx = 0;
+    word32 sigSz;
+    wc_MlDsaKey* key;
+
+    if (pkcs7 == NULL || esd == NULL || msg == NULL ||
+            esd->encContentDigest == NULL ||
+            pkcs7->privateKey == NULL || pkcs7->privateKeySz == 0) {
+        return BAD_FUNC_ARG;
+    }
+
+    ret = wc_PKCS7_MlDsaLevelFromOID(pkcs7->publicKeyOID, &level);
+    if (ret != 0) {
+        return ret;
+    }
+
+    key = (wc_MlDsaKey*)XMALLOC(sizeof(wc_MlDsaKey), pkcs7->heap,
+                                DYNAMIC_TYPE_MLDSA);
+    if (key == NULL) {
+        return MEMORY_E;
+    }
+
+    ret = wc_MlDsaKey_Init(key, pkcs7->heap, pkcs7->devId);
+    if (ret == 0) {
+        ret = wc_MlDsaKey_SetParams(key, level);
+        if (ret == 0) {
+            /* FIPS locks ML-DSA private-key reads by default; unlock only for
+             * the decode of the caller-provided key, then re-lock. */
+            PRIVATE_KEY_UNLOCK();
+            ret = wc_MlDsaKey_PrivateKeyDecode(key, pkcs7->privateKey,
+                                               pkcs7->privateKeySz, &idx);
+            PRIVATE_KEY_LOCK();
+        }
+        if (ret == 0) {
+            /* RFC 9882: pure ML-DSA with an empty context string. */
+            sigSz = esd->encContentDigestBufSz;
+            ret = wc_MlDsaKey_SignCtx(key, NULL, 0, esd->encContentDigest,
+                                      &sigSz, msg, msgSz, pkcs7->rng);
+        }
+        wc_MlDsaKey_Free(key);
+    }
+    XFREE(key, pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+
+    if (ret == 0) {
+        return (int)sigSz;
+    }
+    return ret;
+}
+#endif /* !WOLFSSL_MLDSA_NO_SIGN && WOLFSSL_MLDSA_PRIVATE_KEY */
+#endif /* WC_PKCS7_HAVE_MLDSA */
+
+
 /* build SignedData signature over DigestInfo or content digest
  *
  * pkcs7 - pointer to initialized PKCS7 struct
@@ -2333,8 +3040,10 @@ static int wc_PKCS7_SignedDataBuildSignature(wc_PKCS7* pkcs7,
                                              ESD* esd)
 {
     int ret = 0;
+    int skipDigestInfo = 0;
 #if defined(HAVE_ECC) || \
-    (defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA))
+    (defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA)) || \
+    (defined(WC_RSA_PSS) && !defined(NO_RSA))
     int hashSz = 0;
 #endif
 #if defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA)
@@ -2350,16 +3059,29 @@ static int wc_PKCS7_SignedDataBuildSignature(wc_PKCS7* pkcs7,
         DYNAMIC_TYPE_TMP_BUFFER, return MEMORY_E);
     XMEMSET(digestInfo, 0, digestInfoSz);
 
-    ret = wc_PKCS7_BuildDigestInfo(pkcs7, flatSignedAttribs,
-                                   flatSignedAttribsSz, esd, digestInfo,
-                                   &digestInfoSz);
-    if (ret < 0) {
-        WC_FREE_VAR_EX(digestInfo, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
-        return ret;
+#ifdef WC_PKCS7_HAVE_MLDSA
+    /* ML-DSA signs the full message in pure mode (RFC 9882); it consumes no
+     * DigestInfo or content digest, so skip building one. */
+    if (pkcs7->publicKeyOID == ML_DSA_44k ||
+        pkcs7->publicKeyOID == ML_DSA_65k ||
+        pkcs7->publicKeyOID == ML_DSA_87k) {
+        skipDigestInfo = 1;
+    }
+#endif
+
+    if (!skipDigestInfo) {
+        ret = wc_PKCS7_BuildDigestInfo(pkcs7, flatSignedAttribs,
+                                       flatSignedAttribsSz, esd, digestInfo,
+                                       &digestInfoSz);
+        if (ret < 0) {
+            WC_FREE_VAR_EX(digestInfo, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            return ret;
+        }
     }
 
 #if defined(HAVE_ECC) || \
-    (defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA))
+    (defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA)) || \
+    (defined(WC_RSA_PSS) && !defined(NO_RSA))
     /* get digest size from hash type */
     hashSz = wc_HashGetDigestSize(esd->hashType);
     if (hashSz < 0) {
@@ -2381,9 +3103,13 @@ static int wc_PKCS7_SignedDataBuildSignature(wc_PKCS7* pkcs7,
                 /* user signing plain digest, build DigestInfo themselves */
                 ret = pkcs7->rsaSignRawDigestCb(pkcs7,
                            esd->contentAttribsDigest, hashSz,
-                           esd->encContentDigest, sizeof(esd->encContentDigest),
+                           esd->encContentDigest, esd->encContentDigestBufSz,
                            pkcs7->privateKey, pkcs7->privateKeySz, pkcs7->devId,
                            hashOID);
+                /* validate return value doesn't exceed buffer size */
+                if (ret > 0 && (word32)ret > esd->encContentDigestBufSz) {
+                    ret = BUFFER_E;
+                }
                 break;
             }
         #endif
@@ -2393,11 +3119,67 @@ static int wc_PKCS7_SignedDataBuildSignature(wc_PKCS7* pkcs7,
 
 #ifdef HAVE_ECC
         case ECDSAk:
+        #ifdef HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK
+            if (pkcs7->eccSignRawDigestCb != NULL) {
+                /* get hash OID */
+                int eccHashOID = wc_HashGetOID(esd->hashType);
+                if (eccHashOID < 0) {
+                    ret = eccHashOID;
+                    break;
+                }
+
+                /* user signing plain digest */
+                ret = pkcs7->eccSignRawDigestCb(pkcs7,
+                           esd->contentAttribsDigest, hashSz,
+                           esd->encContentDigest, esd->encContentDigestBufSz,
+                           pkcs7->privateKey, pkcs7->privateKeySz, pkcs7->devId,
+                           eccHashOID);
+                /* validate return value doesn't exceed buffer size */
+                if (ret > 0 && (word32)ret > esd->encContentDigestBufSz) {
+                    ret = BUFFER_E;
+                }
+                break;
+            }
+        #endif
             /* CMS with ECDSA does not sign DigestInfo structure
              * like PKCS#7 with RSA does */
             ret = wc_PKCS7_EcdsaSign(pkcs7, esd->contentAttribsDigest,
                                      (word32)hashSz, esd);
             break;
+#endif
+
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+        case RSAPSSk:
+            /* RSA-PSS signs the digest directly (no DigestInfo), like ECDSA */
+            ret = wc_PKCS7_RsaPssSign(pkcs7, esd->contentAttribsDigest,
+                                      (word32)hashSz, esd);
+            break;
+#endif
+
+#if defined(WC_PKCS7_HAVE_MLDSA) && !defined(WOLFSSL_MLDSA_NO_SIGN) && \
+    defined(WOLFSSL_MLDSA_PRIVATE_KEY)
+        case ML_DSA_44k:
+        case ML_DSA_65k:
+        case ML_DSA_87k:
+        {
+            /* RFC 9882: ML-DSA signs the complete message (the DER SET OF
+             * signed attributes, or the eContent when none are present) in
+             * pure mode, not a DigestInfo or content digest. */
+            byte*  msg = NULL;
+            word32 msgSz = 0;
+            int    msgAlloc = 0;
+
+            ret = wc_PKCS7_BuildPureSigMessage(pkcs7, flatSignedAttribs,
+                                               flatSignedAttribsSz, &msg,
+                                               &msgSz, &msgAlloc);
+            if (ret == 0) {
+                ret = wc_PKCS7_MlDsaSign(pkcs7, msg, msgSz, esd);
+                if (msgAlloc) {
+                    XFREE(msg, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+                }
+            }
+            break;
+        }
 #endif
 
         default:
@@ -2446,6 +3228,9 @@ static int wc_PKCS7_EncodeContentStreamHelper(wc_PKCS7* pkcs7, int cipherType,
             if (esd && esd->contentDigestSet != 1) {
                 ret = wc_HashUpdate(&esd->hash, esd->hashType,
                     contentData, (word32)contentDataSz);
+            }
+            else {
+                ret = 0;
             }
             break;
 
@@ -2499,10 +3284,10 @@ static int wc_PKCS7_EncodeContentStreamHelper(wc_PKCS7* pkcs7, int cipherType,
  * Returns 0 on success */
 #ifndef NO_AES
 static int wc_PKCS7_EncodeContentStream(wc_PKCS7* pkcs7, ESD* esd, Aes* aes,
-    byte* in, int inSz, byte* out, int cipherType)
+    const byte* in, int inSz, byte* out, int cipherType)
 #else
 static int wc_PKCS7_EncodeContentStream(wc_PKCS7* pkcs7, ESD* esd, void* aes,
-    byte* in, int inSz, byte* out, int cipherType)
+    const byte* in, int inSz, byte* out, int cipherType)
 #endif
 {
     int ret = 0;
@@ -2512,7 +3297,7 @@ static int wc_PKCS7_EncodeContentStream(wc_PKCS7* pkcs7, ESD* esd, void* aes,
     if (pkcs7->encodeStream) {
         int    sz;
         word32 totalSz = 0;
-        byte*  buf;
+        const byte* buf;
         byte*  encContentOut;
         byte*  contentData;
         word32 idx = 0, outIdx = 0;
@@ -2549,8 +3334,9 @@ static int wc_PKCS7_EncodeContentStream(wc_PKCS7* pkcs7, ESD* esd, void* aes,
 
         #ifdef ASN_BER_TO_DER
             if (pkcs7->getContentCb) {
-                contentDataRead = pkcs7->getContentCb(pkcs7,
-                                                      &buf, pkcs7->streamCtx);
+                contentDataRead =
+                    pkcs7->getContentCb(pkcs7, (byte **)(wc_ptr_t)&buf,
+                                        pkcs7->streamCtx);
 
                 if (buf == NULL) {
                     WOLFSSL_MSG("Get content callback returned null "
@@ -2732,8 +3518,11 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
     int idx = 0, ret = 0;
     int digEncAlgoId, digEncAlgoType;
     int keyIdSize;
+    int signNow = 0;
     byte* flatSignedAttribs = NULL;
     word32 flatSignedAttribsSz = 0;
+    word32 defaultAttribCap;
+    word32 neededCap;
 
     WC_DECLARE_VAR(esd, ESD, 1, 0);
 #ifdef ASN_BER_TO_DER
@@ -2744,7 +3533,10 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
 
     byte signingTime[MAX_TIME_STRING_SZ];
 
-    if (pkcs7 == NULL || pkcs7->hashOID == 0 ||
+    /* hashOID is unused on the degenerate (certs-only) path, so only require
+     * it when an actual signer is present */
+    if (pkcs7 == NULL ||
+        (pkcs7->hashOID == 0 && pkcs7->sidType != DEGENERATE_SID) ||
         outputSz == NULL) {
         WOLFSSL_MSG("PKCS7 struct / outputSz null, or hashOID is 0");
         return BAD_FUNC_ARG;
@@ -2754,14 +3546,45 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
         return BAD_FUNC_ARG;
     }
 
-    /* signature size varies with ECDSA, with a varying sign size the content
-     * hash must be known in order to create the surrounding ASN1 syntax
-     * properly before writing out the content and generating the hash on the
-     * fly and then creating the signature */
-    if (hashBuf == NULL && pkcs7->publicKeyOID == ECDSAk) {
+    /* signature size varies with ECDSA; RSA-PSS signs digest directly like
+     * ECDSA. For both, content hash must be known to build ASN.1 before signing.
+     * The degenerate (certs-only) path has no signer, so this does not apply
+     * even though InitWithCert may have parsed an ECDSA/RSA-PSS cert and left
+     * publicKeyOID set. */
+#if defined(HAVE_ECC) || defined(WC_RSA_PSS)
+    if (pkcs7->sidType != DEGENERATE_SID && hashBuf == NULL &&
+        (pkcs7->publicKeyOID == ECDSAk
+#ifdef WC_RSA_PSS
+         || pkcs7->publicKeyOID == RSAPSSk
+#endif
+        )) {
         WOLFSSL_MSG("Pre-calculated content hash is needed in this case");
         return BAD_FUNC_ARG;
     }
+#endif
+
+#ifdef WC_PKCS7_HAVE_MLDSA
+    /* ML-DSA signs in "pure" mode over the full message, not a pre-computed
+     * digest, so a caller-supplied content hash is not meaningful and would
+     * also undersize the signature buffer (it forces the immediate-sign path
+     * with the historical MAX_ENCRYPTED_KEY_SZ allocation). Reject it with a
+     * clear error rather than failing later in wc_MlDsaKey_SignCtx.
+     *
+     * Known limitation: wc_PKCS7_EncodeSignedData() pre-computes a content
+     * hash (passing a non-NULL hashBuf) for the detached-over-empty-content
+     * case (pkcs7->detached set with contentSz == 0, e.g. an SCEP CertRep
+     * PENDING/FAILURE). That specific combination is therefore unsupported for
+     * ML-DSA and returns BAD_FUNC_ARG here, whereas RSA/ECDSA support it.
+     * Detached-over-non-empty content and embedded ML-DSA SignedData both
+     * work. */
+    if (hashBuf != NULL &&
+        (pkcs7->publicKeyOID == ML_DSA_44k ||
+         pkcs7->publicKeyOID == ML_DSA_65k ||
+         pkcs7->publicKeyOID == ML_DSA_87k)) {
+        WOLFSSL_MSG("Pre-calculated content hash not supported for ML-DSA");
+        return BAD_FUNC_ARG;
+    }
+#endif
 
 #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
     keyIdSize = wc_HashGetDigestSize(wc_HashTypeConvert(HashIdAlg(
@@ -2888,13 +3711,13 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
         }
 
     } else if (pkcs7->sidType == CMS_SKID) {
-        /* SubjectKeyIdentifier */
-        esd->issuerSKIDSz = SetOctetString((word32)keyIdSize, esd->issuerSKID);
-        esd->issuerSKIDSeqSz = SetExplicit(0, esd->issuerSKIDSz +
+        /* SubjectKeyIdentifier is implicit [0] tagged, RFC 5652 uses IMPLICIT
+         * TAGS. The context tag replaces the OCTET STRING tag (0x80 len value)
+         * instead of an explicit [0] wrapper. */
+        esd->issuerSKIDSeqSz = SetImplicit(ASN_OCTET_STRING, 0,
                                            (word32)keyIdSize,
                                            esd->issuerSKIDSeq, 0);
-        signerInfoSz += (esd->issuerSKIDSz + esd->issuerSKIDSeqSz +
-                         (word32)keyIdSize);
+        signerInfoSz += (esd->issuerSKIDSeqSz + (word32)keyIdSize);
 
         /* version MUST be 3 */
         esd->signerVersionSz = (word32)SetMyVersion(3, esd->signerVersion, 0);
@@ -2908,7 +3731,7 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
     if (pkcs7->sidType != DEGENERATE_SID) {
         signerInfoSz += esd->signerVersionSz;
         esd->signerDigAlgoIdSz = SetAlgoIDEx(pkcs7->hashOID, esd->signerDigAlgoId,
-                                          oidHashType, 0, pkcs7->hashParamsAbsent);
+                                  oidHashType, 0, wc_PKCS7_DigestParamsAbsent(pkcs7));
         signerInfoSz += esd->signerDigAlgoIdSz;
 
         /* set signatureAlgorithm */
@@ -2918,9 +3741,76 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
             idx = ret;
             goto out;
         }
-        esd->digEncAlgoIdSz = SetAlgoIDEx(digEncAlgoId, esd->digEncAlgoId,
-                                        digEncAlgoType, 0, pkcs7->hashParamsAbsent);
+#if !defined(NO_RSA) && defined(WC_RSA_PSS)
+        if (digEncAlgoId == CTC_RSASSAPSS) {
+            /* Salt length policy: always encode as hash digest length.
+             * This is the common CMS/RFC 4055 profile and matches OpenSSL
+             * defaults.  The decoder (pssSaltLen) handles arbitrary values
+             * from external blobs.  A future pkcs7->pssSaltLen override for
+             * encode could be added here if custom salt lengths are needed. */
+            int saltLen = wc_HashGetDigestSize(wc_OidGetHash(pkcs7->hashOID));
+            if (saltLen < 0) {
+                idx = saltLen;
+                goto out;
+            }
+            esd->digEncAlgoIdSz = wc_EncodeRsaPssAlgoId(pkcs7->hashOID,
+                                (int)(word32)saltLen, esd->digEncAlgoId,
+                                (word32)sizeof(esd->digEncAlgoId));
+            if (esd->digEncAlgoIdSz == 0) {
+                idx = ASN_PARSE_E;
+                goto out;
+            }
+        } else
+#endif
+        {
+            esd->digEncAlgoIdSz = SetAlgoIDEx(digEncAlgoId, esd->digEncAlgoId,
+                                            digEncAlgoType, 0, pkcs7->hashParamsAbsent);
+        }
         signerInfoSz += esd->digEncAlgoIdSz;
+
+        /* Point the working attribute array at the inline buffer, sized for the
+         * actual attribute count: the user-supplied attributes plus the exact
+         * number of CMS auto-defaults that will be emitted for this
+         * pkcs7->defaultSignedAttribs selection. Only fall back to a heap
+         * allocation when more attributes are needed than fit inline, so the
+         * common case stays allocation-free. */
+        defaultAttribCap = wc_PKCS7_GetDefaultSignedAttribCount(pkcs7);
+        neededCap = defaultAttribCap + pkcs7->signedAttribsSz;
+
+        /* detect addition overflow */
+        if (neededCap < pkcs7->signedAttribsSz) {
+            idx = BUFFER_E;
+            goto out;
+        }
+
+        if (neededCap <= MAX_SIGNED_ATTRIBS_SZ) {
+            esd->signedAttribs    = esd->signedAttribsInline;
+            esd->signedAttribsCap = MAX_SIGNED_ATTRIBS_SZ;
+        }
+        else {
+        #ifdef WOLFSSL_NO_MALLOC
+            /* cannot grow beyond the inline array without a heap */
+            idx = BUFFER_E;
+            goto out;
+        #else
+            /* detect multiplication overflow */
+            if (neededCap > ((word32)WC_MAX_SINT_OF(int) /
+                             (word32)sizeof(EncodedAttrib))) {
+                idx = BUFFER_E;
+                goto out;
+            }
+            esd->signedAttribs = (EncodedAttrib*)XMALLOC(
+                neededCap * (word32)sizeof(EncodedAttrib),
+                pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            if (esd->signedAttribs == NULL) {
+                idx = MEMORY_E;
+                goto out;
+            }
+            esd->signedAttribsCap = neededCap;
+        #endif
+        }
+        XMEMSET(esd->signedAttribs, 0,
+            esd->signedAttribsCap * (word32)sizeof(EncodedAttrib));
 
         /* build up signed attributes, include contentType, signingTime, and
            messageDigest by default */
@@ -2953,17 +3843,53 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
             esd->signedAttribSetSz = 0;
         }
 
-        if (pkcs7->publicKeyOID != ECDSAk && hashBuf == NULL) {
+        /* Size and allocate the single signature buffer (one storage path for
+         * every algorithm). Deterministic-size algorithms (RSA and ML-DSA, when
+         * no caller hash is supplied) get their exact size from
+         * wc_PKCS7_GetSignSize() so the SignerInfo lengths can be reserved
+         * before the final signing pass, and the buffer is right-sized.
+         *
+         * ECDSA, RSA-PSS (which always requires a caller-supplied hash), and any
+         * other caller-supplied-hash case instead sign immediately
+         * and only learn the size afterwards; they allocate the historical
+         * maximum (MAX_ENCRYPTED_KEY_SZ) so no extra key import is needed just
+         * to size the buffer, and record the real length once signed.
+         *
+         * INVARIANT: for the reserve path the reserved length MUST equal the
+         * length the final signing pass produces, since the SignerInfo/SEQUENCE
+         * lengths are derived from it (enforced after the final signing pass). */
+        signNow = (pkcs7->publicKeyOID == ECDSAk) || (hashBuf != NULL);
+
+        if (!signNow) {
             ret = wc_PKCS7_GetSignSize(pkcs7);
-            esd->encContentDigestSz = (word32)ret;
+            if (ret <= 0) {
+                /* GetSignSize returns 0 for an unsupported signer key type */
+                idx = (ret < 0) ? ret : BAD_FUNC_ARG;
+                goto out;
+            }
+            esd->encContentDigestBufSz = (word32)ret;
+        }
+        else {
+            esd->encContentDigestBufSz = MAX_ENCRYPTED_KEY_SZ;
+        }
+
+        esd->encContentDigest = (byte*)XMALLOC(esd->encContentDigestBufSz,
+                                        pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+        if (esd->encContentDigest == NULL) {
+            idx = MEMORY_E;
+            goto out;
+        }
+
+        if (!signNow) {
+            esd->encContentDigestSz = esd->encContentDigestBufSz;
         }
         else {
             ret = wc_PKCS7_SignedDataBuildSignature(pkcs7, flatSignedAttribs,
                                             flatSignedAttribsSz, esd);
-        }
-        if (ret < 0) {
-            idx = ret;
-            goto out;
+            if (ret < 0) {
+                idx = ret;
+                goto out;
+            }
         }
 
         signerInfoSz += flatSignedAttribsSz + esd->signedAttribSetSz;
@@ -2994,7 +3920,7 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
 
     if (pkcs7->sidType != DEGENERATE_SID) {
         esd->singleDigAlgoIdSz = SetAlgoIDEx(pkcs7->hashOID, esd->singleDigAlgoId,
-                                      oidHashType, 0, pkcs7->hashParamsAbsent);
+                                  oidHashType, 0, wc_PKCS7_DigestParamsAbsent(pkcs7));
     }
     esd->digAlgoIdSetSz = SetSet(esd->singleDigAlgoIdSz, esd->digAlgoIdSet);
 
@@ -3225,13 +4151,11 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
                 esd->issuerSn, esd->issuerSnSz);
         idx += (int)esd->issuerSnSz;
     } else if (pkcs7->sidType == CMS_SKID) {
-        /* SubjectKeyIdentifier */
+        /* SubjectKeyIdentifier, the implicit [0] header directly precedes the
+         * raw key identifier value (no inner OCTET STRING header). */
         wc_PKCS7_WriteOut(pkcs7, (output2)? (output2 + idx) : NULL,
                 esd->issuerSKIDSeq, esd->issuerSKIDSeqSz);
         idx += (int)esd->issuerSKIDSeqSz;
-        wc_PKCS7_WriteOut(pkcs7, (output2)? (output2 + idx) : NULL,
-                esd->issuerSKID, esd->issuerSKIDSz);
-        idx += (int)esd->issuerSKIDSz;
 
         if (pkcs7->customSKID) {
             wc_PKCS7_WriteOut(pkcs7, (output2)? (output2 + idx) : NULL,
@@ -3297,12 +4221,27 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
     }
 
     if (hashBuf == NULL && pkcs7->sidType != DEGENERATE_SID) {
+        /* Only RSA (PKCS#1 v1.5) and ML-DSA reach this final signing pass.
+         * ECDSA and RSA-PSS both require a pre-supplied hash and sign earlier
+         * via the immediate-sign (signNow) path. The signature is now produced
+         * over the finalized attributes, and the size reserved during the
+         * sizing pass above is baked into the SignerInfo/SEQUENCE lengths. */
+        word32 reservedSigSz = esd->encContentDigestSz;
+
         /* Calculate the final hash and encrypt it. */
         WOLFSSL_MSG("Recreating signature with new hash");
         ret = wc_PKCS7_SignedDataBuildSignature(pkcs7, flatSignedAttribs,
                                                 flatSignedAttribsSz, esd);
         if (ret < 0) {
             idx = ret;
+            goto out;
+        }
+
+        /* Enforce the fixed-size invariant: a signature length that differs
+         * from the reserved size would corrupt the already-encoded lengths. */
+        if (esd->encContentDigestSz != reservedSigSz) {
+            WOLFSSL_MSG("Signature size changed between sizing and signing");
+            idx = BUFFER_E;
             goto out;
         }
     }
@@ -3349,6 +4288,23 @@ static int PKCS7_EncodeSigned(wc_PKCS7* pkcs7,
   out:
 
     XFREE(flatSignedAttribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+
+    /* free the working attribute array only if it was heap-allocated (i.e. it
+     * is not the inline buffer), and the heap-allocated signature buffer,
+     * before freeing esd. In small-stack builds esd is heap-allocated and may
+     * be NULL here. */
+    if (WC_VAR_OK(esd)) {
+        if (esd->signedAttribs != NULL &&
+            esd->signedAttribs != esd->signedAttribsInline) {
+            XFREE(esd->signedAttribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        }
+        esd->signedAttribs = NULL;
+
+        if (esd->encContentDigest != NULL) {
+            XFREE(esd->encContentDigest, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            esd->encContentDigest = NULL;
+        }
+    }
 
     WC_FREE_VAR_EX(esd, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
     WC_FREE_VAR_EX(signedDataOid, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
@@ -3520,29 +4476,51 @@ int wc_PKCS7_EncodeSignedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
         return BAD_FUNC_ARG;
     }
 
-    /* pre-calculate hash for ECC signatures */
-    if (pkcs7->publicKeyOID == ECDSAk) {
+    /* pre-calculate content hash for ECDSA and RSA-PSS (both sign digest
+     * directly). Skipped on the degenerate (certs-only) path: there is no
+     * signer to hash for, and hashOID is 0 so deriving a hash type would fail
+     * even though InitWithCert may have left publicKeyOID set to the cert's
+     * OID.
+     * A detached SignedData over empty content has no eContent to drive the
+     * normal content-hashing pass, so its messageDigest signed attribute is
+     * computed here as the hash of the empty content (e.g. an SCEP CertRep
+     * PENDING/FAILURE per RFC 8894). */
+    if (pkcs7->sidType != DEGENERATE_SID &&
+        (pkcs7->publicKeyOID == ECDSAk
+#ifdef WC_RSA_PSS
+         || pkcs7->publicKeyOID == RSAPSSk
+#endif
+         || (pkcs7->detached && pkcs7->contentSz == 0)
+        )) {
         int hashSz;
         enum wc_HashType hashType;
         byte hashBuf[WC_MAX_DIGEST_SIZE];
-        wc_HashAlg hash;
+        WC_DECLARE_VAR(hash, wc_HashAlg, 1, pkcs7->heap);
+
+        WC_ALLOC_VAR_EX(hash, wc_HashAlg, 1, pkcs7->heap, DYNAMIC_TYPE_HASHES,
+                        return MEMORY_E);
 
         /* get hash type and size, validate hashOID */
         hashType = wc_OidGetHash(pkcs7->hashOID);
         hashSz = wc_HashGetDigestSize(hashType);
-        if (hashSz < 0)
+        if (hashSz < 0) {
+            WC_FREE_VAR_EX(hash, pkcs7->heap, DYNAMIC_TYPE_HASHES);
             return hashSz;
+        }
 
         /* calculate hash for content */
-        ret = wc_HashInit(&hash, hashType);
+        ret = wc_HashInit(hash, hashType);
         if (ret == 0) {
-            ret = wc_HashUpdate(&hash, hashType,
-                            pkcs7->content, pkcs7->contentSz);
+            ret = wc_HashUpdate(hash, hashType,
+                            (pkcs7->content != NULL) ? pkcs7->content
+                                                     : (const byte*)"",
+                            (pkcs7->content != NULL) ? pkcs7->contentSz : 0);
             if (ret == 0) {
-                ret = wc_HashFinal(&hash, hashType, hashBuf);
+                ret = wc_HashFinal(hash, hashType, hashBuf);
             }
-            wc_HashFree(&hash, hashType);
+            wc_HashFree(hash, hashType);
         }
+        WC_FREE_VAR_EX(hash, pkcs7->heap, DYNAMIC_TYPE_HASHES);
         if (ret == 0) {
             ret = PKCS7_EncodeSigned(pkcs7, hashBuf, (word32)hashSz,
                 output, &outputSz, NULL, NULL);
@@ -3981,6 +4959,118 @@ int wc_PKCS7_SetRsaSignRawDigestCb(wc_PKCS7* pkcs7, CallbackRsaSignRawDigest cb)
 }
 #endif
 
+#endif /* NO_RSA */
+
+
+#ifdef HAVE_ECC
+
+#ifdef HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK
+/* register raw ECC sign digest callback */
+int wc_PKCS7_SetEccSignRawDigestCb(wc_PKCS7* pkcs7, CallbackEccSignRawDigest cb)
+{
+    if (pkcs7 == NULL || cb == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    pkcs7->eccSignRawDigestCb = cb;
+
+    return 0;
+}
+#endif
+
+#endif /* HAVE_ECC */
+
+
+#if !defined(NO_RSA) || defined(HAVE_ECC) || defined(WC_PKCS7_MLDSA_VERIFY)
+/* Check whether the given decoded certificate matches the SignerIdentifier
+ * (sid) field of the currently parsed SignerInfo. Per RFC 5652 Section 5.3,
+ * the sid selects which certificate's public key must be used to verify the
+ * signature. Returns 1 on match, 0 on no match or when the sid is not
+ * available for comparison. */
+static int wc_PKCS7_CertMatchesSignerInfo(wc_PKCS7* pkcs7, DecodedCert* dCert)
+{
+    PKCS7SignerInfo* signerInfo;
+
+    if (pkcs7 == NULL || dCert == NULL)
+        return 0;
+
+    signerInfo = pkcs7->signerInfo;
+    if (signerInfo == NULL || signerInfo->sid == NULL ||
+            signerInfo->sidSz == 0) {
+        /* No SID parsed, cannot perform an identity binding check. */
+        return 0;
+    }
+
+    if (signerInfo->sidType == CMS_ISSUER_AND_SERIAL_NUMBER) {
+        /* IssuerAndSerialNumber: SID blob stores the content of the outer
+         * SEQUENCE (issuer Name followed by INTEGER serialNumber). */
+        word32 idx = 0;
+        byte sidIssuerHash[KEYID_SIZE];
+        WC_DECLARE_VAR(sidSerial, mp_int, 1, pkcs7->heap);
+        WC_DECLARE_VAR(certSerial, mp_int, 1, pkcs7->heap);
+        int cmp;
+        int match = 0;
+
+        if (GetNameHash_ex(signerInfo->sid, &idx, sidIssuerHash,
+                (int)signerInfo->sidSz, dCert->signatureOID) < 0) {
+            return 0;
+        }
+        if (XMEMCMP(sidIssuerHash, dCert->issuerHash, KEYID_SIZE) != 0)
+            return 0;
+
+        WC_ALLOC_VAR_EX(sidSerial, mp_int, 1, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER,
+            { return 0; });
+        WC_ALLOC_VAR_EX(certSerial, mp_int, 1, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER,
+            { WC_FREE_VAR_EX(sidSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+              return 0; });
+
+        if (mp_init(sidSerial) != MP_OKAY) {
+            WC_FREE_VAR_EX(sidSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            WC_FREE_VAR_EX(certSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            return 0;
+        }
+        if (mp_init(certSerial) != MP_OKAY) {
+            mp_clear(sidSerial);
+            WC_FREE_VAR_EX(sidSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            WC_FREE_VAR_EX(certSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            return 0;
+        }
+
+        if (GetInt(sidSerial, signerInfo->sid, &idx, signerInfo->sidSz) == 0 &&
+                mp_read_unsigned_bin(certSerial, dCert->serial,
+                                     (word32)dCert->serialSz) == MP_OKAY) {
+            cmp = mp_cmp(sidSerial, certSerial);
+            if (cmp == MP_EQ)
+                match = 1;
+        }
+
+        mp_clear(sidSerial);
+        mp_clear(certSerial);
+        WC_FREE_VAR_EX(sidSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+        WC_FREE_VAR_EX(certSerial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+        return match;
+    }
+    else if (signerInfo->sidType == CMS_SKID) {
+        /* SubjectKeyIdentifier: SID blob is the raw SKID octet string
+         * content. Normalize the same way the certificate side does so
+         * that comparisons between SHA-1 SKIDs and other lengths match. */
+        byte sidKid[KEYID_SIZE];
+
+        if (GetHashId(signerInfo->sid, (int)signerInfo->sidSz, sidKid,
+                      HashIdAlg(dCert->signatureOID)) != 0) {
+            return 0;
+        }
+        if (XMEMCMP(sidKid, dCert->extSubjKeyId, KEYID_SIZE) == 0)
+            return 1;
+        return 0;
+    }
+
+    return 0;
+}
+#endif /* !NO_RSA || HAVE_ECC || WC_PKCS7_MLDSA_VERIFY */
+
+#ifndef NO_RSA
+
 /* returns size of signature put into out, negative on error */
 static int wc_PKCS7_RsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
                               byte* hash, word32 hashSz)
@@ -4000,8 +5090,7 @@ static int wc_PKCS7_RsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
     byte digest[MAX_PKCS7_DIGEST_SZ];
 #endif
     RsaKey key[1];
-    DecodedCert stack_dCert;
-    DecodedCert* dCert = &stack_dCert;
+    DecodedCert dCert[1];
 #endif
 
     if (pkcs7 == NULL || sig == NULL || hash == NULL) {
@@ -4059,6 +5148,31 @@ static int wc_PKCS7_RsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
             continue;
         }
 
+        /* If the SignerInfo sid was parsed, only try the certificate whose
+         * identity matches it. This binds the verifying public key to the
+         * signer identity advertised in the CMS message and prevents signer
+         * confusion when multiple certificates are embedded. */
+        if (pkcs7->signerInfo != NULL && pkcs7->signerInfo->sid != NULL &&
+                !wc_PKCS7_CertMatchesSignerInfo(pkcs7, dCert)) {
+            FreeDecodedCert(dCert);
+            wc_FreeRsaKey(key);
+            continue;
+        }
+
+        /* Defense in depth: the sid-matched cert must actually carry an
+         * RSA-family key before we feed its SPKI to the RSA key decoder.
+         * Rejecting here avoids depending on wc_RsaPublicKeyDecode to reject
+         * wrong-type SPKIs. */
+        if (dCert->keyOID != RSAk
+        #ifdef WC_RSA_PSS
+                && dCert->keyOID != RSAPSSk
+        #endif
+                ) {
+            FreeDecodedCert(dCert);
+            wc_FreeRsaKey(key);
+            continue;
+        }
+
         if (wc_RsaPublicKeyDecode(dCert->publicKey, &scratch, key,
                                   dCert->pubKeySize) < 0) {
             WOLFSSL_MSG("ASN RSA key decode error");
@@ -4104,6 +5218,162 @@ static int wc_PKCS7_RsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
     return ret;
 }
 
+#if defined(WC_RSA_PSS)
+/* returns 0 when signature verifies, negative on error */
+static int wc_PKCS7_RsaPssVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
+                                  byte* hash, word32 hashSz)
+{
+    int ret = 0, i;
+    word32 scratch = 0, verified = 0;
+    word32 pkSz;
+    int saltLen, verify;
+    enum wc_HashType hashType;
+    int hashDigSz, mgf;
+    /* wc_RsaPSS_Verify_ex output is PSS-encoded message (RSA_PSS_PAD_SZ +
+     * saltLen + 2*hLen bytes), which can exceed MAX_PKCS7_DIGEST_SZ.
+     * Use MAX_ENCRYPTED_KEY_SZ (512) to cover RSA keys up to 4096-bit. */
+    WC_DECLARE_VAR(digest, byte, MAX_ENCRYPTED_KEY_SZ, 0);
+    WC_DECLARE_VAR(key, RsaKey, 1, 0);
+    WC_DECLARE_VAR(dCert, DecodedCert, 1, 0);
+
+    if (pkcs7 == NULL || sig == NULL || hash == NULL)
+        return BAD_FUNC_ARG;
+
+    /* Use SignerInfo.signatureAlgorithm params when decoded; else digestAlgo */
+    if (pkcs7->pssParamsPresent)
+        hashType = (enum wc_HashType)pkcs7->pssHashType;
+    else
+        hashType = wc_OidGetHash(pkcs7->hashOID);
+    hashDigSz = wc_HashGetDigestSize(hashType);
+    if (hashDigSz < 0)
+        return ASN_PARSE_E;
+    if (hashSz != (word32)hashDigSz)
+        return ASN_PARSE_E;
+    mgf = pkcs7->pssParamsPresent
+        ? pkcs7->pssMgf : pkcs7_hash2mgf(hashType);
+    if (mgf == WC_MGF1NONE)
+        return ASN_PARSE_E;
+
+    WC_ALLOC_VAR_EX(digest, byte, MAX_ENCRYPTED_KEY_SZ, pkcs7->heap,
+        DYNAMIC_TYPE_TMP_BUFFER, return MEMORY_E);
+    WC_ALLOC_VAR_EX(key, RsaKey, 1, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER,
+        { WC_FREE_VAR_EX(digest, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+          return MEMORY_E; });
+    WC_ALLOC_VAR_EX(dCert, DecodedCert, 1, pkcs7->heap, DYNAMIC_TYPE_DCERT,
+        { WC_FREE_VAR_EX(digest, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+          WC_FREE_VAR_EX(key, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+          return MEMORY_E; });
+
+    XMEMSET(digest, 0, MAX_ENCRYPTED_KEY_SZ);
+
+    for (i = 0; i < MAX_PKCS7_CERTS; i++) {
+        if (pkcs7->certSz[i] == 0)
+            continue;
+
+        scratch = 0;
+        ret = wc_InitRsaKey_ex(key, pkcs7->heap, pkcs7->devId);
+        if (ret != 0)
+            break;
+
+        InitDecodedCert(dCert, pkcs7->cert[i], pkcs7->certSz[i], pkcs7->heap);
+        ret = ParseCert(dCert, CA_TYPE, NO_VERIFY, 0);
+        if (ret < 0) {
+            FreeDecodedCert(dCert);
+            wc_FreeRsaKey(key);
+            continue;
+        }
+
+        /* Only try the certificate identified by the SignerInfo sid (see
+         * matching comment in wc_PKCS7_RsaVerify). */
+        if (pkcs7->signerInfo != NULL && pkcs7->signerInfo->sid != NULL &&
+                !wc_PKCS7_CertMatchesSignerInfo(pkcs7, dCert)) {
+            FreeDecodedCert(dCert);
+            wc_FreeRsaKey(key);
+            continue;
+        }
+
+        /* Defense in depth: reject non-RSA SPKIs before key decode. RSA
+         * rsaEncryption certs (keyOID=RSAk) are accepted for PSS signatures
+         * per RFC 8017 - a RSASSA-PSS cert is not required. */
+        if (dCert->keyOID != RSAk && dCert->keyOID != RSAPSSk) {
+            FreeDecodedCert(dCert);
+            wc_FreeRsaKey(key);
+            continue;
+        }
+
+        pkSz = dCert->pubKeySize;
+        if (pkSz > (MAX_RSA_INT_SZ + MAX_RSA_E_SZ))
+            pkSz = (MAX_RSA_INT_SZ + MAX_RSA_E_SZ);
+
+        if (wc_RsaPublicKeyDecode(dCert->publicKey, &scratch, key,
+                                  pkSz) < 0) {
+            FreeDecodedCert(dCert);
+            wc_FreeRsaKey(key);
+            continue;
+        }
+
+        saltLen = pkcs7->pssParamsPresent
+                      ? pkcs7->pssSaltLen : RSA_PSS_SALT_LEN_DEFAULT;
+
+        /* wc_RsaPSS_Verify_ex returns PSS encoded message length, not
+         * the recovered hash. Must then call wc_RsaPSS_CheckPadding_ex
+         * to verify the PSS padding against the expected hash. */
+        verify = wc_RsaPSS_Verify_ex(sig, (word32)sigSz, digest,
+                                     MAX_ENCRYPTED_KEY_SZ,
+                                     hashType, mgf, saltLen, key);
+        if (verify > 0) {
+            /* wc_RsaPSS_CheckPadding_ex signature varies across
+             * FIPS / selftest versions; match the pattern in asn.c */
+        #if (defined(HAVE_SELFTEST) && \
+             (!defined(HAVE_SELFTEST_VERSION) || \
+              (HAVE_SELFTEST_VERSION < 2))) || \
+            (defined(HAVE_FIPS) && defined(HAVE_FIPS_VERSION) && \
+             (HAVE_FIPS_VERSION < 2))
+            ret = wc_RsaPSS_CheckPadding_ex(hash, hashSz, digest,
+                                            (word32)verify, hashType,
+                                            saltLen);
+        #elif (defined(HAVE_SELFTEST) && \
+               (HAVE_SELFTEST_VERSION == 2)) || \
+              (defined(HAVE_FIPS) && defined(HAVE_FIPS_VERSION) && \
+               (HAVE_FIPS_VERSION == 2))
+            ret = wc_RsaPSS_CheckPadding_ex(hash, hashSz, digest,
+                                            (word32)verify, hashType,
+                                            saltLen, 0);
+        #else
+            ret = wc_RsaPSS_CheckPadding_ex2(hash, hashSz, digest,
+                                            (word32)verify, hashType,
+                                            saltLen,
+                                            mp_count_bits(&key->n),
+                                            pkcs7->heap);
+        #endif
+        }
+        else {
+            ret = verify;
+        }
+
+        FreeDecodedCert(dCert);
+        wc_FreeRsaKey(key);
+
+        if (ret == 0) {
+            verified = 1;
+            pkcs7->verifyCert   = pkcs7->cert[i];
+            pkcs7->verifyCertSz = pkcs7->certSz[i];
+            break;
+        }
+        ret = 0;
+    }
+
+    if (verified == 0)
+        ret = SIG_VERIFY_E;
+
+    WC_FREE_VAR_EX(digest, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+    WC_FREE_VAR_EX(key, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+    WC_FREE_VAR_EX(dCert, pkcs7->heap, DYNAMIC_TYPE_DCERT);
+
+    return ret;
+}
+#endif /* WC_RSA_PSS */
+
 #endif /* NO_RSA */
 
 
@@ -4123,13 +5393,18 @@ static int wc_PKCS7_EcdsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
 #else
     byte digest[MAX_PKCS7_DIGEST_SZ];
     ecc_key key[1];
-    DecodedCert stack_dCert;
-    DecodedCert* dCert = &stack_dCert;
+    DecodedCert dCert[1];
 #endif
     word32 idx = 0;
 
     if (pkcs7 == NULL || sig == NULL)
         return BAD_FUNC_ARG;
+
+    /* Check hash length */
+    if ((hashSz > WC_MAX_DIGEST_SIZE) ||
+        (hashSz < WC_MIN_DIGEST_SIZE_FOR_VERIFY)) {
+        return BAD_LENGTH_E;
+    }
 
 #ifdef WOLFSSL_SMALL_STACK
     digest = (byte*)XMALLOC(MAX_PKCS7_DIGEST_SZ, pkcs7->heap,
@@ -4174,10 +5449,34 @@ static int wc_PKCS7_EcdsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
         }
 
         InitDecodedCert(dCert, pkcs7->cert[i], pkcs7->certSz[i], pkcs7->heap);
+
+        /* This allows the user to not error out in the case of extensions that
+         * we are not aware of. */
+#ifdef WC_ASN_UNKNOWN_EXT_CB
+        if (pkcs7->unknownExtCallback != NULL)
+            wc_SetUnknownExtCallback(dCert, pkcs7->unknownExtCallback);
+#endif
+
         /* not verifying, only using this to extract public key */
         ret = ParseCert(dCert, CA_TYPE, NO_VERIFY, 0);
         if (ret < 0) {
             WOLFSSL_MSG("ASN ECC cert parse error");
+            FreeDecodedCert(dCert);
+            wc_ecc_free(key);
+            continue;
+        }
+
+        /* Only try the certificate identified by the SignerInfo sid (see
+         * matching comment in wc_PKCS7_RsaVerify). */
+        if (pkcs7->signerInfo != NULL && pkcs7->signerInfo->sid != NULL &&
+                !wc_PKCS7_CertMatchesSignerInfo(pkcs7, dCert)) {
+            FreeDecodedCert(dCert);
+            wc_ecc_free(key);
+            continue;
+        }
+
+        /* Defense in depth: reject non-ECDSA SPKIs before key decode. */
+        if (dCert->keyOID != ECDSAk) {
             FreeDecodedCert(dCert);
             wc_ecc_free(key);
             continue;
@@ -4233,23 +5532,167 @@ static int wc_PKCS7_EcdsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
 #endif /* HAVE_ECC */
 
 
+#if defined(WC_PKCS7_HAVE_MLDSA) && !defined(WOLFSSL_MLDSA_NO_VERIFY) && \
+    defined(WOLFSSL_MLDSA_PUBLIC_KEY)
+/* Verify a "pure" ML-DSA SignedData signature (RFC 9882) over the supplied
+ * message (the DER SET OF signed attributes, or the eContent when none are
+ * present). Tries each certificate in the bundle, mirroring the RSA/ECDSA
+ * verify helpers, and uses an empty context string.
+ *
+ * returns 0 on success, negative on error */
+static int wc_PKCS7_MlDsaVerify(wc_PKCS7* pkcs7, byte* sig, int sigSz,
+                                const byte* msg, word32 msgSz)
+{
+    int ret = 0, i;
+    int res = 0;
+    int verified = 0;
+    byte level = 0;
+    /* wc_MlDsaKey embeds full key buffers (several KB), so it is always heap
+     * allocated rather than placed on the stack even in non-WOLFSSL_SMALL_STACK
+     * builds, to keep the stack footprint small on constrained targets. This
+     * matches the ML-DSA key handling in asn.c. */
+    wc_MlDsaKey* key = NULL;
+    WC_DECLARE_VAR(dCert, DecodedCert, 1, 0);
+    word32 idx;
+
+    if (pkcs7 == NULL || sig == NULL || msg == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    key = (wc_MlDsaKey*)XMALLOC(sizeof(wc_MlDsaKey), pkcs7->heap,
+                                DYNAMIC_TYPE_MLDSA);
+    if (key == NULL) {
+        return MEMORY_E;
+    }
+
+    WC_ALLOC_VAR_EX(dCert, DecodedCert, 1, pkcs7->heap, DYNAMIC_TYPE_DCERT,
+        { XFREE(key, pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+          return MEMORY_E; });
+
+    /* loop over certs received in certificates set, try to find one
+     * that will validate signature */
+    for (i = 0; i < MAX_PKCS7_CERTS; i++) {
+
+        verified = 0;
+        idx = 0;
+
+        if (pkcs7->certSz[i] == 0)
+            continue;
+
+        ret = wc_MlDsaKey_Init(key, pkcs7->heap, pkcs7->devId);
+        if (ret != 0) {
+            /* Hard internal failure (e.g. MEMORY_E): return it directly so it
+             * is not masked as SIG_VERIFY_E by the post-loop check. */
+            XFREE(key, pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+            WC_FREE_VAR_EX(dCert, pkcs7->heap, DYNAMIC_TYPE_DCERT);
+            return ret;
+        }
+
+        InitDecodedCert(dCert, pkcs7->cert[i], pkcs7->certSz[i], pkcs7->heap);
+
+#ifdef WC_ASN_UNKNOWN_EXT_CB
+        if (pkcs7->unknownExtCallback != NULL)
+            wc_SetUnknownExtCallback(dCert, pkcs7->unknownExtCallback);
+#endif
+
+        /* not verifying, only using this to extract public key */
+        ret = ParseCert(dCert, CA_TYPE, NO_VERIFY, 0);
+        if (ret < 0) {
+            WOLFSSL_MSG("ASN ML-DSA cert parse error");
+            FreeDecodedCert(dCert);
+            wc_MlDsaKey_Free(key);
+            continue;
+        }
+
+        /* Only try the certificate identified by the SignerInfo sid. */
+        if (pkcs7->signerInfo != NULL && pkcs7->signerInfo->sid != NULL &&
+                !wc_PKCS7_CertMatchesSignerInfo(pkcs7, dCert)) {
+            FreeDecodedCert(dCert);
+            wc_MlDsaKey_Free(key);
+            continue;
+        }
+
+        /* Defense in depth: reject SPKIs that are not the expected ML-DSA
+         * type before attempting the key decode. */
+        if (dCert->keyOID != pkcs7->publicKeyOID ||
+                wc_PKCS7_MlDsaLevelFromOID(dCert->keyOID, &level) != 0) {
+            FreeDecodedCert(dCert);
+            wc_MlDsaKey_Free(key);
+            continue;
+        }
+
+        ret = wc_MlDsaKey_SetParams(key, level);
+        if (ret == 0) {
+            ret = wc_MlDsaKey_PublicKeyDecode(key, dCert->publicKey,
+                                              dCert->pubKeySize, &idx);
+        }
+        if (ret < 0) {
+            /* Try the next candidate cert on any decode error. A hard failure
+             * (e.g. MEMORY_E) is intentionally masked as SIG_VERIFY_E by the
+             * post-loop check, matching the RSA/ECC verify helpers. */
+            WOLFSSL_MSG("ASN ML-DSA key decode error");
+            FreeDecodedCert(dCert);
+            wc_MlDsaKey_Free(key);
+            continue;
+        }
+
+        /* RFC 9882: pure ML-DSA with an empty context string. */
+        res = 0;
+        ret = wc_MlDsaKey_VerifyCtx(key, sig, (word32)sigSz, NULL, 0,
+                                    msg, msgSz, &res);
+
+        if (ret == 0 && res == 1) {
+            /* found signer that successfully verified signature */
+            verified = 1;
+            XMEMCPY(pkcs7->issuerSubjKeyId, dCert->extSubjKeyId, KEYID_SIZE);
+            pkcs7->verifyCert   = pkcs7->cert[i];
+            pkcs7->verifyCertSz = pkcs7->certSz[i];
+        }
+
+        wc_MlDsaKey_Free(key);
+        FreeDecodedCert(dCert);
+
+        if (ret == 0 && res == 1) {
+            break;
+        }
+    }
+
+    if (verified == 0) {
+        ret = SIG_VERIFY_E;
+    }
+
+    XFREE(key, pkcs7->heap, DYNAMIC_TYPE_MLDSA);
+    WC_FREE_VAR_EX(dCert, pkcs7->heap, DYNAMIC_TYPE_DCERT);
+
+    return ret;
+}
+
+#endif /* WC_PKCS7_HAVE_MLDSA && !WOLFSSL_MLDSA_NO_VERIFY &&
+        * WOLFSSL_MLDSA_PUBLIC_KEY */
+
+
 /* build SignedData digest, both in PKCS#7 DigestInfo format and
  * as plain digest for CMS.
  *
- * pkcs7          - pointer to initialized PKCS7 struct
- * signedAttrib   - signed attributes
- * signedAttribSz - size of signedAttrib, octets
- * pkcs7Digest    - [OUT] PKCS#7 DigestInfo
- * pkcs7DigestSz  - [IN/OUT] size of pkcs7Digest
- * plainDigest    - [OUT] pointer to plain digest, offset into pkcs7Digest
- * plainDigestSz  - [OUT] size of digest at plainDigest
+ * pkcs7            - pointer to initialized PKCS7 struct
+ * signedAttrib     - signed attributes
+ * signedAttribSz   - size of signedAttrib, octets
+ * pkcs7Digest      - [OUT] PKCS#7 DigestInfo
+ * pkcs7DigestSz    - [IN/OUT] size of pkcs7Digest
+ * plainDigest      - [OUT] pointer to plain digest, offset into pkcs7Digest
+ * plainDigestSz    - [OUT] size of digest at plainDigest
+ * hashParamsAbsent - if non-zero, omit the NULL parameters in the DigestInfo
+ *                    AlgorithmIdentifier; if zero, include them. This is the
+ *                    DigestInfo encoding (RFC 8017), which is independent of
+ *                    the SignerInfo digestAlgorithm parameters (RFC 5652/5754).
  *
  * returns 0 on success, negative on error */
 static int wc_PKCS7_BuildSignedDataDigest(wc_PKCS7* pkcs7, byte* signedAttrib,
                                       word32 signedAttribSz, byte* pkcs7Digest,
                                       word32* pkcs7DigestSz, byte** plainDigest,
                                       word32* plainDigestSz,
-                                      const byte* hashBuf, word32 hashBufSz)
+                                      const byte* hashBuf, word32 hashBufSz,
+                                      byte hashParamsAbsent)
 {
     int ret = 0, digIdx = 0;
     word32 attribSetSz = 0, hashSz = 0;
@@ -4260,8 +5703,7 @@ static int wc_PKCS7_BuildSignedDataDigest(wc_PKCS7* pkcs7, byte* signedAttrib,
     byte algoId[MAX_ALGO_SZ];
     word32 digestInfoSeqSz, digestStrSz, algoIdSz;
     WC_DECLARE_VAR(digestInfo, byte, MAX_PKCS7_DIGEST_SZ, 0);
-
-    wc_HashAlg hash;
+    WC_DECLARE_VAR(hash, wc_HashAlg, 1, pkcs7 ? pkcs7->heap : NULL);
     enum wc_HashType hashType;
 
     /* check arguments */
@@ -4291,6 +5733,9 @@ static int wc_PKCS7_BuildSignedDataDigest(wc_PKCS7* pkcs7, byte* signedAttrib,
 
     WC_ALLOC_VAR_EX(digestInfo, byte, MAX_PKCS7_DIGEST_SZ, pkcs7->heap,
         DYNAMIC_TYPE_TMP_BUFFER, return MEMORY_E);
+    WC_ALLOC_VAR_EX(hash, wc_HashAlg, 1, pkcs7->heap, DYNAMIC_TYPE_HASHES,
+        { WC_FREE_VAR_EX(digestInfo, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+          return MEMORY_E; });
 
     XMEMSET(pkcs7Digest, 0, *pkcs7DigestSz);
     XMEMSET(digest,      0, WC_MAX_DIGEST_SIZE);
@@ -4302,9 +5747,10 @@ static int wc_PKCS7_BuildSignedDataDigest(wc_PKCS7* pkcs7, byte* signedAttrib,
         XMEMCPY(digest, hashBuf, hashBufSz);
     }
     else {
-        ret = wc_HashInit(&hash, hashType);
+        ret = wc_HashInit(hash, hashType);
         if (ret < 0) {
             WC_FREE_VAR_EX(digestInfo, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            WC_FREE_VAR_EX(hash, pkcs7->heap, DYNAMIC_TYPE_HASHES);
             return ret;
         }
 
@@ -4312,27 +5758,29 @@ static int wc_PKCS7_BuildSignedDataDigest(wc_PKCS7* pkcs7, byte* signedAttrib,
             attribSetSz = SetSet(signedAttribSz, attribSet);
 
             /* calculate digest */
-            ret = wc_HashUpdate(&hash, hashType, attribSet, attribSetSz);
+            ret = wc_HashUpdate(hash, hashType, attribSet, attribSetSz);
             if (ret == 0)
-                ret = wc_HashUpdate(&hash, hashType, signedAttrib, signedAttribSz);
+                ret = wc_HashUpdate(hash, hashType, signedAttrib, signedAttribSz);
             if (ret == 0)
-                ret = wc_HashFinal(&hash, hashType, digest);
+                ret = wc_HashFinal(hash, hashType, digest);
         } else {
-            ret = wc_HashUpdate(&hash, hashType, pkcs7->content, pkcs7->contentSz);
+            ret = wc_HashUpdate(hash, hashType, pkcs7->content, pkcs7->contentSz);
             if (ret == 0)
-                ret = wc_HashFinal(&hash, hashType, digest);
+                ret = wc_HashFinal(hash, hashType, digest);
         }
 
-        wc_HashFree(&hash, hashType);
+        wc_HashFree(hash, hashType);
         if (ret < 0) {
             WC_FREE_VAR_EX(digestInfo, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            WC_FREE_VAR_EX(hash, pkcs7->heap, DYNAMIC_TYPE_HASHES);
             return ret;
         }
     }
 
-    /* Set algoID, match whatever was input to match either NULL or absent */
+    /* Set algoID, using the requested DigestInfo parameter encoding (NULL
+     * present or absent) so the caller can try both against the signature. */
     algoIdSz = SetAlgoIDEx(pkcs7->hashOID, algoId, oidHashType,
-                            0, pkcs7->hashParamsAbsent);
+                            0, hashParamsAbsent);
 
     digestStrSz = SetOctetString(hashSz, digestStr);
     digestInfoSeqSz = SetSequence(algoIdSz + digestStrSz + hashSz,
@@ -4355,6 +5803,7 @@ static int wc_PKCS7_BuildSignedDataDigest(wc_PKCS7* pkcs7, byte* signedAttrib,
     *plainDigestSz = hashSz;
 
     WC_FREE_VAR_EX(digestInfo, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+    WC_FREE_VAR_EX(hash, pkcs7->heap, DYNAMIC_TYPE_HASHES);
     return 0;
 }
 
@@ -4379,7 +5828,7 @@ static int wc_PKCS7_VerifyContentMessageDigest(wc_PKCS7* pkcs7,
     word32 idx = 0;
     word32 contentIdx = 0;
     byte* content = NULL;
-    byte* digestBuf = NULL;
+    const byte* digestBuf = NULL;
     WC_DECLARE_VAR(digest, byte, MAX_PKCS7_DIGEST_SZ, 0);
     PKCS7DecodedAttrib* attrib;
     enum wc_HashType hashType;
@@ -4391,11 +5840,10 @@ static int wc_PKCS7_VerifyContentMessageDigest(wc_PKCS7* pkcs7,
     if (pkcs7 == NULL)
         return BAD_FUNC_ARG;
 
-    if ((pkcs7->content == NULL || pkcs7->contentSz == 0) &&
-        (hashBuf == NULL || hashSz == 0)) {
-        WOLFSSL_MSG("SignedData bundle has no content or hash to verify");
-        return BAD_FUNC_ARG;
-    }
+    /* An absent eContent with no caller-supplied hash is valid: the content
+     * is empty, so the messageDigest attribute is verified against the hash of
+     * zero-length content below (e.g. an SCEP CertRep PENDING/FAILURE per
+     * RFC 8894). Stripping a non-empty eContent still fails this comparison. */
 
     /* lookup messageDigest attribute */
     attrib = findAttrib(pkcs7, mdOid, sizeof(mdOid));
@@ -4432,7 +5880,14 @@ static int wc_PKCS7_VerifyContentMessageDigest(wc_PKCS7* pkcs7,
         content = pkcs7->content;
         contentLen = (int)pkcs7->contentSz;
 
-        if (pkcs7->contentIsPkcs7Type == 1) {
+        /* An absent eContent is hashed as empty content. Guard against a
+         * NULL content pointer paired with a non-zero size: hash zero-length
+         * content rather than dereferencing NULL or reading past the empty
+         * literal used at the wc_Hash call below. */
+        if (content == NULL)
+            contentLen = 0;
+
+        if (content != NULL && pkcs7->contentIsPkcs7Type == 1) {
             /* Content follows PKCS#7 RFC, which defines type as ANY. CMS
              * mandates OCTET_STRING which has already been stripped off.
              * For PKCS#7 message digest calculation, digest is calculated
@@ -4450,8 +5905,10 @@ static int wc_PKCS7_VerifyContentMessageDigest(wc_PKCS7* pkcs7,
             }
         }
 
-        ret = wc_Hash(hashType, content + contentIdx, (word32)contentLen, digest,
-                      MAX_PKCS7_DIGEST_SZ);
+        ret = wc_Hash(hashType,
+                      (content != NULL) ? content + contentIdx
+                                        : (const byte*)"",
+                      (word32)contentLen, digest, MAX_PKCS7_DIGEST_SZ);
         if (ret < 0) {
             WOLFSSL_MSG("Error hashing PKCS7 content for verification");
             WC_FREE_VAR_EX(digest, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
@@ -4468,7 +5925,7 @@ static int wc_PKCS7_VerifyContentMessageDigest(wc_PKCS7* pkcs7,
     } else {
 
         /* user passed in pre-computed hash */
-        digestBuf = (byte*)hashBuf;
+        digestBuf = (const byte*)hashBuf;
         digestSz  = (int)hashSz;
     }
 
@@ -4528,11 +5985,13 @@ static int wc_PKCS7_SignedDataVerifySignature(wc_PKCS7* pkcs7, byte* sig,
         }
     }
 
-    /* build hash to verify against */
+    /* build hash to verify against, mirroring the SignerInfo digestAlgorithm
+     * parameter encoding as parsed */
     ret = wc_PKCS7_BuildSignedDataDigest(pkcs7, signedAttrib,
                                          signedAttribSz, pkcs7Digest,
                                          &pkcs7DigestSz, &plainDigest,
-                                         &plainDigestSz, hashBuf, hashSz);
+                                         &plainDigestSz, hashBuf, hashSz,
+                                         pkcs7->hashParamsAbsent);
     if (ret < 0) {
         WC_FREE_VAR_EX(pkcs7Digest, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
         return ret;
@@ -4553,6 +6012,23 @@ static int wc_PKCS7_SignedDataVerifySignature(wc_PKCS7* pkcs7, byte* sig,
 
         if (!haveCert) {
             WOLFSSL_MSG("No certificates in bundle to verify signature");
+
+#if defined(WC_PKCS7_HAVE_MLDSA)
+            /* ML-DSA (RFC 9882) signs the complete message in pure mode, not a
+             * digest. The stored plainDigest/pkcs7Digest is therefore not
+             * enough for an external verifier to reconstruct and check the
+             * signature, so reject here instead of returning unusable material
+             * via PKCS7_SIGNEEDS_CHECK. */
+            if (pkcs7->publicKeyOID == ML_DSA_44k ||
+                pkcs7->publicKeyOID == ML_DSA_65k ||
+                pkcs7->publicKeyOID == ML_DSA_87k) {
+                WOLFSSL_MSG("ML-DSA external verify without a certificate in "
+                            "the bundle is not supported");
+                WC_FREE_VAR_EX(pkcs7Digest, pkcs7->heap,
+                    DYNAMIC_TYPE_TMP_BUFFER);
+                return BAD_FUNC_ARG;
+            }
+#endif
 
             /* store signature */
             XFREE(pkcs7->signature, pkcs7->heap, DYNAMIC_TYPE_SIGNATURE);
@@ -4608,14 +6084,47 @@ static int wc_PKCS7_SignedDataVerifySignature(wc_PKCS7* pkcs7, byte* sig,
 
 #ifndef NO_RSA
         case RSAk:
+            /* Try the DigestInfo built with the SignerInfo digestAlgorithm
+             * parameter encoding as parsed. */
             ret = wc_PKCS7_RsaVerify(pkcs7, sig, (int)sigSz, pkcs7Digest,
                                      pkcs7DigestSz);
             if (ret < 0) {
+                /* Some signers place the raw digest (no DigestInfo) in the
+                 * signature. */
                 WOLFSSL_MSG("PKCS#7 verification failed, trying CMS");
                 ret = wc_PKCS7_RsaVerify(pkcs7, sig, (int)sigSz, plainDigest,
                                          plainDigestSz);
             }
+            if (ret < 0) {
+                /* The DigestInfo AlgorithmIdentifier inside a PKCS#1 v1.5
+                 * signature (RFC 8017) is encoded independently of the
+                 * SignerInfo digestAlgorithm parameters (RFC 5652/5754): a
+                 * signer may omit the NULL in one and include it in the other
+                 * (e.g. Go's crypto/rsa signs a NULL-present DigestInfo while
+                 * omitting the NULL in the SignerInfo). Rebuild the DigestInfo
+                 * with the opposite parameter encoding and try once more. This
+                 * overwrites pkcs7Digest/plainDigest, so it must run after the
+                 * plain-digest attempt above. */
+                WOLFSSL_MSG("PKCS#7 verification failed, trying flipped params");
+                ret = wc_PKCS7_BuildSignedDataDigest(pkcs7, signedAttrib,
+                                            signedAttribSz, pkcs7Digest,
+                                            &pkcs7DigestSz, &plainDigest,
+                                            &plainDigestSz, hashBuf, hashSz,
+                                            (byte)(!pkcs7->hashParamsAbsent));
+                if (ret == 0) {
+                    ret = wc_PKCS7_RsaVerify(pkcs7, sig, (int)sigSz, pkcs7Digest,
+                                             pkcs7DigestSz);
+                }
+            }
             break;
+
+    #ifdef WC_RSA_PSS
+        /* RSA-PSS signs the raw hash (plainDigest), not DigestInfo */
+        case RSAPSSk:
+            ret = wc_PKCS7_RsaPssVerify(pkcs7, sig, (int)sigSz, plainDigest,
+                                       plainDigestSz);
+            break;
+    #endif
 #endif
 
 #ifdef HAVE_ECC
@@ -4623,6 +6132,31 @@ static int wc_PKCS7_SignedDataVerifySignature(wc_PKCS7* pkcs7, byte* sig,
             ret = wc_PKCS7_EcdsaVerify(pkcs7, sig, (int)sigSz, plainDigest,
                                        plainDigestSz);
             break;
+#endif
+
+#if defined(WC_PKCS7_HAVE_MLDSA) && !defined(WOLFSSL_MLDSA_NO_VERIFY) && \
+    defined(WOLFSSL_MLDSA_PUBLIC_KEY)
+        case ML_DSA_44k:
+        case ML_DSA_65k:
+        case ML_DSA_87k:
+        {
+            /* RFC 9882: ML-DSA verifies over the complete message, not a
+             * digest. Rebuild the same octet string that was signed. */
+            byte*  msg = NULL;
+            word32 msgSz = 0;
+            int    msgAlloc = 0;
+
+            ret = wc_PKCS7_BuildPureSigMessage(pkcs7, signedAttrib,
+                                               signedAttribSz, &msg, &msgSz,
+                                               &msgAlloc);
+            if (ret == 0) {
+                ret = wc_PKCS7_MlDsaVerify(pkcs7, sig, (int)sigSz, msg, msgSz);
+                if (msgAlloc) {
+                    XFREE(msg, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+                }
+            }
+            break;
+        }
 #endif
 
         default:
@@ -4662,6 +6196,13 @@ static int wc_PKCS7_SetPublicKeyOID(wc_PKCS7* pkcs7, int sigOID)
             pkcs7->publicKeyOID = RSAk;
             break;
 
+    #ifdef WC_RSA_PSS
+        /* CTC_RSASSAPSS and RSAPSSk are the same OID value */
+        case CTC_RSASSAPSS:
+            pkcs7->publicKeyOID = RSAPSSk;
+            break;
+    #endif
+
         /* if sigOID is already RSAk */
         case RSAk:
             pkcs7->publicKeyOID = (word32)sigOID;
@@ -4696,6 +6237,16 @@ static int wc_PKCS7_SetPublicKeyOID(wc_PKCS7* pkcs7, int sigOID)
 
         /* if sigOID is already ECDSAk */
         case ECDSAk:
+            pkcs7->publicKeyOID = (word32)sigOID;
+            break;
+    #endif
+
+    #ifdef WC_PKCS7_HAVE_MLDSA
+        /* RFC 9882: the ML-DSA signatureAlgorithm OID is the key OID itself
+         * (CTC_ML_DSA_* and ML_DSA_*k share the same OID sum value). */
+        case ML_DSA_44k:
+        case ML_DSA_65k:
+        case ML_DSA_87k:
             pkcs7->publicKeyOID = (word32)sigOID;
             break;
     #endif
@@ -4844,7 +6395,7 @@ static int wc_PKCS7_ParseSignerInfo(wc_PKCS7* pkcs7, byte* in, word32 inSz,
 
     WOLFSSL_ENTER("wc_PKCS7_ParseSignerInfo");
     /* require a signer if degenerate case not allowed */
-    if (inSz == 0 && pkcs7->noDegenerate == 1) {
+    if (pkcs7->noDegenerate == 1 && (inSz == 0 || degenerate == 1)) {
         WOLFSSL_MSG("Set to not allow degenerate cases");
         return PKCS7_NO_SIGNER_E;
     }
@@ -4876,11 +6427,16 @@ static int wc_PKCS7_ParseSignerInfo(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 ret = ASN_PARSE_E;
 
             if (ret == 0) {
+                pkcs7->signerInfo->sidType = CMS_ISSUER_AND_SERIAL_NUMBER;
                 ret = wc_PKCS7_SignerInfoSetSID(pkcs7, in + idx, length);
                 idx += (word32)length;
             }
 
         } else if (ret == 0 && version == 3) {
+            /* Default: SignerInfo version 3 carries SubjectKeyIdentifier.
+             * May be overridden below if the parser instead finds a
+             * SEQUENCE (IssuerAndSerialNumber fallback). */
+            pkcs7->signerInfo->sidType = CMS_SKID;
             /* Get the sequence of SubjectKeyIdentifier */
             if (idx + 1 > inSz)
                 ret = BUFFER_E;
@@ -4923,6 +6479,12 @@ static int wc_PKCS7_ParseSignerInfo(wc_PKCS7* pkcs7, byte* in, word32 inSz,
 
                     if (ret == 0 && GetSequence(in, &idx, &length, inSz) < 0)
                         ret = ASN_PARSE_E;
+
+                    if (ret == 0) {
+                        /* v3 carrying IssuerAndSerialNumber fallback */
+                        pkcs7->signerInfo->sidType =
+                                CMS_ISSUER_AND_SERIAL_NUMBER;
+                    }
                 }
             }
 
@@ -4971,9 +6533,64 @@ static int wc_PKCS7_ParseSignerInfo(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             idx += (word32)length;
         }
 
-        /* Get digestEncryptionAlgorithm - key type or signature type */
-        if (ret == 0 && GetAlgoId(in, &idx, &sigOID, oidIgnoreType, inSz) < 0) {
-            ret = ASN_PARSE_E;
+        /* Get digestEncryptionAlgorithm (signatureAlgorithm) - parse manually
+         * so we can decode id-RSASSA-PSS parameters in all builds. */
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+        pkcs7->pssParamsPresent = 0;
+#endif
+        if (ret == 0) {
+            int algoSeqLen = 0;
+            word32 algoContentStart = 0;
+            if (GetSequence(in, &idx, &algoSeqLen, (word32)inSz) < 0) {
+                ret = ASN_PARSE_E;
+            }
+            else {
+                algoContentStart = idx; /* first byte of AlgorithmIdentifier content */
+                if (GetObjectId(in, &idx, &sigOID, oidSigType, inSz) < 0) {
+                    ret = ASN_PARSE_E;
+                }
+                /* Only parse params when still inside the AlgorithmIdentifier;
+                 * when optional params are absent, idx is already past the sequence. */
+                else if (algoContentStart + (word32)algoSeqLen > idx) {
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+                    word32 paramsStart = idx;
+#endif
+                    byte paramTag;
+                    int paramLen = 0;
+                    if (GetASNTag(in, &idx, &paramTag, inSz) != 0 ||
+                        GetLength(in, &idx, &paramLen, inSz) < 0) {
+                        ret = ASN_PARSE_E;
+                    }
+                    else {
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+                        if ((word32)sigOID == (word32)CTC_RSASSAPSS &&
+                            paramTag == (ASN_SEQUENCE | ASN_CONSTRUCTED)) {
+                            word32 tlvLen = (idx - paramsStart) +
+                                            (word32)paramLen;
+                            enum wc_HashType pssHash = WC_HASH_TYPE_SHA;
+                            int pssMgfVal = 0, pssSalt = 0;
+                            if (paramsStart + tlvLen > (word32)inSz) {
+                                return ASN_PARSE_E;
+                            }
+                            ret = wc_DecodeRsaPssParams(in + paramsStart, tlvLen,
+                                                        &pssHash, &pssMgfVal,
+                                                        &pssSalt);
+                            if (ret == 0) {
+                                pkcs7->pssSaltLen = pssSalt;
+                                pkcs7->pssHashType = (int)pssHash;
+                                pkcs7->pssMgf = pssMgfVal;
+                                pkcs7->pssParamsPresent = 1;
+                            }
+                            else {
+                                WOLFSSL_MSG("RSASSA-PSS parameters invalid - failing parse");
+                                return ASN_PARSE_E;
+                            }
+                        }
+#endif
+                        idx += (word32)paramLen;
+                    }
+                }
+            }
         }
 
         /* store public key type based on digestEncryptionAlgorithm */
@@ -5049,6 +6666,13 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                             pkcs7->stream->expected, &msg, idx)) != 0) {
             break;
         }
+        /* re-sync totalRd baseline to the fresh idx. Without this, a byte
+         * that wc_PKCS7_AddDataToStream() already charged to totalRd while
+         * buffering (growing stream->length) gets charged again below when
+         * this loop switches to reading directly from "in" starting at
+         * that same position, since *tmpIdx would still hold a position
+         * from before the buffered run started. */
+        *tmpIdx = *idx;
 
         msgSz = (pkcs7->stream->length > 0)? pkcs7->stream->length:inSz;
 
@@ -5181,6 +6805,17 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
 
                     /* grow content buffer */
                     contBufSz = pkcs7->stream->accumContSz;
+                    /* Reject before the word32 add wraps and yields a tiny alloc for an oversized copy. */
+                    if (pkcs7->stream->expected >
+                            WOLFSSL_PKCS7_MAX_STREAM_ALLOC -
+                            pkcs7->stream->accumContSz) {
+                        WOLFSSL_MSG("PKCS7 accumulated content size too large");
+                        if (tempBuf != NULL) {
+                            XFREE(tempBuf, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                        }
+                        ret = BUFFER_E;
+                        break;
+                    }
                     pkcs7->stream->accumContSz += pkcs7->stream->expected;
 
                     pkcs7->stream->content =
@@ -5191,7 +6826,6 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                         WOLFSSL_MSG("failed to grow content buffer.");
                             if (tempBuf != NULL) {
                         XFREE(tempBuf, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
-                        tempBuf = NULL;
                             }
                         ret = MEMORY_E;
                         break;
@@ -5205,7 +6839,6 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                                                        pkcs7->stream->expected);
                         if (tempBuf != NULL) {
                             XFREE(tempBuf, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
-                            tempBuf = NULL;
                         }
                     }
                 }
@@ -5271,8 +6904,10 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
     word32 certIdx, certIdx2;
     byte degenerate = 0;
     byte detached = 0;
+    byte noContent = 0;
     byte tag = 0;
     word16 contentIsPkcs7Type = 0;
+    byte noDegenerate = 0;
 #ifdef ASN_BER_TO_DER
     byte* der;
 #endif
@@ -5447,7 +7082,6 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             if (ret == 0 && GetMyVersion(pkiMsg, &idx, &version, pkiMsgSz) < 0)
                 ret = ASN_PARSE_E;
 
-
             /* version 1 follows RFC 2315 */
             /* version 3 follows RFC 4108 */
             if (ret == 0 && (version != 1 && version != 3)) {
@@ -5601,6 +7235,7 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             if ((encapContentInfoLen != 0) &&
                 ((word32)encapContentInfoLen - contentTypeSz == 0)) {
                 ret = ASN_PARSE_E;
+                noContent = 1;
             #ifndef NO_PKCS7_STREAM
                 pkcs7->stream->noContent = 1;
             #endif
@@ -5621,6 +7256,14 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
              * OCTET_STRING will be next. If so, we use the length retrieved
              * there. PKCS#7 spec defines ANY as eContent type. In this case
              * we fall back and save this content length for use later */
+            if (ret == 0 && localIdx >= pkiMsgSz) {
+                /* Truncated input: don't dereference past the buffer.
+                 * Break out of the switch directly so the degenerate-
+                 * recovery path below cannot mask this error. */
+                ret = BUFFER_E;
+                break;
+            }
+
             if (ret == 0 && pkiMsg[localIdx] != ASN_INDEF_LENGTH) {
                 if (GetLength_ex(pkiMsg, &localIdx, &length, pkiMsgSz,
                         NO_USER_CHECK) <= 0) {
@@ -5665,6 +7308,15 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                  * this as start of content. */
                 localIdx = start;
                 pkcs7->contentIsPkcs7Type = 1;
+
+                #ifndef NO_PKCS7_STREAM
+                    /* Set streaming variables for PKCS#7 type content.
+                     * length contains the size from [0] EXPLICIT wrapper */
+                    pkcs7->stream->multi         = 0;
+                    pkcs7->stream->currContIdx   = localIdx;
+                    pkcs7->stream->currContSz    = (word32)length;
+                    pkcs7->stream->currContRmnSz = (word32)length;
+                #endif
             }
             else {
                 /* CMS eContent OCTET_STRING */
@@ -5754,7 +7406,6 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                 idx = localIdx;
             }
             else {
-
                 /* If either pkcs7->content and pkcs7->contentSz are set
                  * (detached signature where user has set content explicitly
                  * into pkcs7->content/contentSz) OR pkcs7->hashBuf and
@@ -5765,6 +7416,16 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                     ((pkcs7->content != NULL && pkcs7->contentSz != 0) ||
                      (hashBuf != NULL && hashSz > 0)) ) {
                     WOLFSSL_MSG("Trying to process as detached signature");
+                    detached = 1;
+                }
+
+                /* eContent genuinely absent and no external content/hash
+                 * supplied: verify as a detached signature over empty content.
+                 * The messageDigest signed attribute is checked against the
+                 * hash of zero-length content downstream, so a stripped
+                 * non-empty eContent still fails. */
+                if (!degenerate && !detached && noContent) {
+                    WOLFSSL_MSG("Processing as detached signature, no content");
                     detached = 1;
                 }
 
@@ -5854,7 +7515,7 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
 
             /* copy content to pkcs7->contentDynamic */
             if (keepContent && pkcs7->stream->content &&
-                                            pkcs7->stream->contentSz >0) {
+                                            pkcs7->stream->contentSz > 0) {
                 pkcs7->contentDynamic = (byte*)XMALLOC(pkcs7->stream->contentSz,
                                               pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 if (pkcs7->contentDynamic == NULL) {
@@ -5868,18 +7529,38 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                 pkcs7->content   = pkcs7->contentDynamic;
             }
 
-            /* check if bundle has more elements or footer, if not, set content
-             * to pkcs7->content and hash to pkcs7->hash.
+            /* expect data length to be enough to check set and seq of certs,
+             * but never request more than the bundle has left. The old code
+             * unconditionally requested this much and silently treated a
+             * short read here as a successful degenerate end, which also
+             * accepted a truncated bundle. Capping the request lets stage
+             * 4/5/6's existing bounds checks and noDegenerate enforcement
+             * run instead: a genuine short degenerate end (empty signerInfos
+             * SET) still parses and succeeds, while anything truncated or
+             * malformed fails there with a real parse error.
              */
-            if (ret == 0 && pkcs7->stream->maxLen > 0 &&
-                    (pkcs7->stream->maxLen - pkcs7->stream->totalRd)
-                                                < ASN_TAG_SZ + MAX_LENGTH_SZ) {
-
-                ret = 0;
-                break;
-            }
-            /* expect data length to be enough to check set and seq of certs */
             pkcs7->stream->expected = (ASN_TAG_SZ + MAX_LENGTH_SZ) * 2;
+            if (!pkcs7->stream->indefLen) {
+                /* cap to what can actually still show up: bytes already
+                 * buffered (stream->length) plus whatever the outer
+                 * length still allows past totalRd. Matches the same
+                 * (maxLen - totalRd) + length expression used at every
+                 * other stage in this function. For indefinite-length
+                 * (BER) bundles maxLen is only a running estimate, so
+                 * this cap does not apply. */
+                if (pkcs7->stream->totalRd >= pkcs7->stream->maxLen) {
+                    if (pkcs7->stream->expected > pkcs7->stream->length) {
+                        pkcs7->stream->expected = pkcs7->stream->length;
+                    }
+                }
+                else if (pkcs7->stream->expected >
+                        (pkcs7->stream->maxLen - pkcs7->stream->totalRd) +
+                            pkcs7->stream->length) {
+                    pkcs7->stream->expected =
+                        (pkcs7->stream->maxLen - pkcs7->stream->totalRd) +
+                            pkcs7->stream->length;
+                }
+            }
 
         #else
             /* Break out before content because it can be optional in degenerate
@@ -6020,6 +7701,11 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             }
 
             maxIdx = idx + pkcs7->stream->expected;
+
+            /* re-sync totalRd baseline to the fresh idx, same as STAGE6
+             * does; otherwise it can still hold a stale position left
+             * over from stage 3's internal stream buffer. */
+            stateIdx = idx;
         #endif /* !NO_PKCS7_STREAM */
 
             if (pkiMsg2 == NULL || pkiMsg2Sz == 0) {
@@ -6038,6 +7724,10 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             if (ret == 0 && GetASNTag(pkiMsg2, &localIdx, &tag, pkiMsg2Sz) == 0
                     && tag == (ASN_CONSTRUCTED | ASN_CONTEXT_SPECIFIC | 0)) {
                 idx++;
+
+                if (localIdx >= pkiMsg2Sz) {
+                    ret = BUFFER_E;
+                }
 
                 /* if certificates set has indefinite length, try to get
                  * the first certificate length of the set.
@@ -6058,9 +7748,13 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
 
                         WOLFSSL_MSG("certificate set found");
 
-                        /* adjust cert length */
-                        length += (int)(localIdx - certIdx);
-                        idx = certIdx;
+                        if (!WC_SAFE_SUM_SIGNED(int, length,
+                                    (int)(localIdx - certIdx), length)) {
+                            ret = ASN_PARSE_E;
+                        }
+                        else {
+                            idx = certIdx;
+                        }
                     }
                 }
                 /* in case certificates set has definite length  */
@@ -6121,6 +7815,11 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             pkiMsg2Sz = (pkcs7->stream->length > 0)? pkcs7->stream->length:
                                                                         srcSz;
 
+            /* re-sync totalRd baseline to the fresh idx, same as STAGE4
+             * and STAGE6 do; otherwise it can still hold a stale position
+             * left over from STAGE4's internal stream buffer. */
+            stateIdx = idx;
+
             wc_PKCS7_StreamGetVar(pkcs7, &pkiMsg2Sz, 0, &length);
 
             /* restore content */
@@ -6173,7 +7872,11 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                             ret = ASN_PARSE_E;
 
                         cert = &pkiMsg2[idx];
-                        certSz += (int)(certIdx - idx);
+                        if (!WC_SAFE_SUM_SIGNED(int, certSz,
+                                    (int)(certIdx - idx), certSz)) {
+                            ret = BUFFER_E;
+                            break;
+                        }
                         if (certSz > length) {
                             ret = BUFFER_E;
                             break;
@@ -6185,6 +7888,7 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
         #endif
                     version = pkcs7->version;
                     contentIsPkcs7Type = pkcs7->contentIsPkcs7Type;
+                    noDegenerate = (byte)pkcs7->noDegenerate;
 
                     if (ret == 0) {
                         byte isDynamic = (byte)pkcs7->isDynamic;
@@ -6226,6 +7930,10 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                         /* Restore content is PKCS#7 flag */
                         pkcs7->contentIsPkcs7Type = (contentIsPkcs7Type != 0);
 
+                        /* Restore degenerate case policy, it is checked
+                         * against the signerInfos set in later stages */
+                        pkcs7->noDegenerate = (noDegenerate != 0);
+
                     #ifndef NO_PKCS7_STREAM
                         pkcs7->stream = stream;
                     #endif
@@ -6241,6 +7949,19 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                     if (ret == 0 && MAX_PKCS7_CERTS > 0) {
                         int sz = 0;
                         int i;
+                        /* Absolute end of the certificate set within pkiMsg2.
+                         * idx is the start of the set, so the set spans
+                         * [idx, idx + length). In non-streaming mode idx is the
+                         * absolute offset into the message; in streaming mode it
+                         * is typically 0 (the set was copied to a standalone
+                         * buffer). Bounding the loop with the relative length
+                         * alone stops short by idx bytes in non-streaming mode
+                         * and can drop the last certificate. Clamp to pkiMsg2Sz
+                         * to guard against overflow/over-long length (reads stay
+                         * bounded by the certIdx + 1 < pkiMsg2Sz check below). */
+                        word32 certSetEnd = idx + (word32)length;
+                        if (certSetEnd < idx || certSetEnd > pkiMsg2Sz)
+                            certSetEnd = pkiMsg2Sz;
 
                         pkcs7->cert[0]   = cert;
                         pkcs7->certSz[0] = (word32)certSz;
@@ -6248,7 +7969,7 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
 
                         for (i = 1; i < MAX_PKCS7_CERTS &&
                                 certIdx + 1 < pkiMsg2Sz &&
-                                certIdx + 1 < (word32)length; i++) {
+                                certIdx + 1 < certSetEnd; i++) {
                             localIdx = certIdx;
 
                             if (ret == 0 && GetASNTag(pkiMsg2, &certIdx, &tag,
@@ -6371,6 +8092,10 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                 word32 sz = (word32)pkcs7->stream->cntIdfCnt * ASN_INDEF_END_SZ;
                 localIdx = idx;
                 for (i = 0; i < sz; i++) {
+                    if (localIdx + i >= pkiMsg2Sz) {
+                        ret = ASN_PARSE_E;
+                        break;
+                    }
                     if (pkiMsg2[localIdx + i] == 0)
                         continue;
                     else {
@@ -6403,6 +8128,41 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             if (ret == 0 && GetSet_ex(pkiMsg2, &idx, &length, maxIdx,
                         NO_USER_CHECK) < 0)
                 ret = ASN_PARSE_E;
+
+        #ifndef NO_PKCS7_STREAM
+            /* claimed signerInfos content must fit in what can still
+             * arrive, or stage 7 stalls on WANT_READ_E forever */
+            if (ret == 0 && !pkcs7->stream->indefLen) {
+                word32 avail;
+                if (pkcs7->stream->length > 0) {
+                    avail = pkcs7->stream->length - idx;
+                    if (pkcs7->stream->totalRd < pkcs7->stream->maxLen) {
+                        avail += pkcs7->stream->maxLen -
+                                 pkcs7->stream->totalRd;
+                    }
+                }
+                else {
+                    word32 used = pkcs7->stream->totalRd +
+                                  (idx - stateIdx);
+                    avail = (used < pkcs7->stream->maxLen) ?
+                            pkcs7->stream->maxLen - used : 0;
+                }
+                if ((word32)length > avail) {
+                    ret = ASN_PARSE_E;
+                }
+            }
+        #endif
+
+            /* Update degenerate flag based on if signerInfos SET is empty.
+             * The earlier degenerate check at digestAlgorithms is an early
+             * optimization, but depending on degenerate case may not be
+             * detected until here. */
+            if (ret == 0) {
+                degenerate = (length == 0) ? 1 : 0;
+            #ifndef NO_PKCS7_STREAM
+                pkcs7->stream->degenerate = (degenerate != 0);
+            #endif
+            }
 
             if (ret != 0)
                 break;
@@ -6493,6 +8253,9 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
 
                     idx += (word32)length;
                 }
+                else if (ret == 0) {
+                    ret = ASN_PARSE_E;
+                }
 
                 pkcs7->content = content;
                 pkcs7->contentSz = (word32)contentSz;
@@ -6531,11 +8294,16 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             /* make sure that terminating zero's follow */
             if ((ret == WC_NO_ERR_TRACE(PKCS7_SIGNEEDS_CHECK) || ret >= 0) &&
                     pkcs7->stream->indefLen == 1) {
-                word32 i;
-                for (i = 0; i < 3 * ASN_INDEF_END_SZ; i++) {
-                    if (pkiMsg2[idx + i] != 0) {
-                        ret = ASN_PARSE_E;
-                        break;
+                if (idx + (3 * ASN_INDEF_END_SZ) > pkiMsg2Sz) {
+                    ret = ASN_PARSE_E;
+                }
+                else {
+                    word32 i;
+                    for (i = 0; i < 3 * ASN_INDEF_END_SZ; i++) {
+                        if (pkiMsg2[idx + i] != 0) {
+                            ret = ASN_PARSE_E;
+                            break;
+                        }
                     }
                 }
             }
@@ -6931,7 +8699,7 @@ static int wc_PKCS7_KariParseRecipCert(WC_PKCS7_KARI* kari, const byte* cert,
 
     /* decode certificate */
     if (cert != NULL) {
-        InitDecodedCert(kari->decoded, (byte*)cert, certSz, kari->heap);
+        InitDecodedCert(kari->decoded, cert, certSz, kari->heap);
         kari->decodedInit = 1;
         ret = ParseCert(kari->decoded, CA_TYPE, NO_VERIFY, 0);
         if (ret < 0)
@@ -7185,6 +8953,9 @@ static int wc_PKCS7_KariGenerateKEK(WC_PKCS7_KARI* kari, WC_RNG* rng,
     secret = (byte*)XMALLOC(secretSz, kari->heap, DYNAMIC_TYPE_PKCS7);
     if (secret == NULL)
         return MEMORY_E;
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    wc_MemZero_Add("wc_PKCS7_KariGenerateKEK secret", secret, secretSz);
+#endif
 
 #if defined(ECC_TIMING_RESISTANT) && (!defined(HAVE_FIPS) || \
     (!defined(HAVE_FIPS_VERSION) || (HAVE_FIPS_VERSION != 2))) && \
@@ -7220,6 +8991,7 @@ static int wc_PKCS7_KariGenerateKEK(WC_PKCS7_KARI* kari, WC_RNG* rng,
     }
 
     if (ret != 0) {
+        ForceZero(secret, secretSz);
         XFREE(secret, kari->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
     }
@@ -7232,7 +9004,7 @@ static int wc_PKCS7_KariGenerateKEK(WC_PKCS7_KARI* kari, WC_RNG* rng,
             kdfType = WC_HASH_TYPE_SHA;
             break;
     #endif
-    #ifndef WOLFSSL_SHA224
+    #ifdef WOLFSSL_SHA224
         case dhSinglePass_stdDH_sha224kdf_scheme:
             kdfType = WC_HASH_TYPE_SHA224;
             break;
@@ -7254,6 +9026,7 @@ static int wc_PKCS7_KariGenerateKEK(WC_PKCS7_KARI* kari, WC_RNG* rng,
     #endif
         default:
             WOLFSSL_MSG("Unsupported key agreement algorithm");
+            ForceZero(secret, secretSz);
             XFREE(secret, kari->heap, DYNAMIC_TYPE_PKCS7);
             return BAD_FUNC_ARG;
     };
@@ -7266,6 +9039,7 @@ static int wc_PKCS7_KariGenerateKEK(WC_PKCS7_KARI* kari, WC_RNG* rng,
     ret = NOT_COMPILED_IN;
 #endif
 
+    ForceZero(secret, secretSz);
     XFREE(secret, kari->heap, DYNAMIC_TYPE_PKCS7);
     return ret;
 }
@@ -7738,7 +9512,7 @@ int wc_PKCS7_AddRecipient_KTRI(wc_PKCS7* pkcs7, const byte* cert, word32 certSz,
         return ret;
     }
 
-    InitDecodedCert(decoded, (byte*)cert, certSz, pkcs7->heap);
+    InitDecodedCert(decoded, cert, certSz, pkcs7->heap);
     ret = ParseCert(decoded, CA_TYPE, NO_VERIFY, 0);
     if (ret < 0) {
         FreeDecodedCert(decoded);
@@ -7824,7 +9598,11 @@ int wc_PKCS7_AddRecipient_KTRI(wc_PKCS7* pkcs7, const byte* cert, word32 certSz,
     pkcs7->publicKeyOID = decoded->keyOID;
 
     /* KeyEncryptionAlgorithmIdentifier, only support RSA now */
-    if (pkcs7->publicKeyOID != RSAk) {
+    if (pkcs7->publicKeyOID != RSAk
+#ifdef WC_RSA_PSS
+        && pkcs7->publicKeyOID != RSAPSSk
+#endif
+    ) {
         FreeDecodedCert(decoded);
         WC_FREE_VAR_EX(serial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
         WC_FREE_VAR_EX(keyAlgArray, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
@@ -7834,8 +9612,7 @@ int wc_PKCS7_AddRecipient_KTRI(wc_PKCS7* pkcs7, const byte* cert, word32 certSz,
         return ALGO_ID_E;
     }
 
-    keyEncAlgSz = (int)SetAlgoID((int)pkcs7->publicKeyOID, keyAlgArray,
-                                 oidKeyType, 0);
+    keyEncAlgSz = (int)SetAlgoID(RSAk, keyAlgArray, oidKeyType, 0);
     if (keyEncAlgSz == 0) {
         FreeDecodedCert(decoded);
         WC_FREE_VAR_EX(serial, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
@@ -8066,11 +9843,13 @@ int wc_PKCS7_WriteOut(wc_PKCS7* pkcs7, byte* output, const byte* input,
 
 
 /* encrypt content using encryptOID algo */
-static int wc_PKCS7_EncryptContent(wc_PKCS7* pkcs7, int encryptOID, byte* key,
-                                   int keySz,
-                                   byte* iv, int ivSz, byte* aad, word32 aadSz,
-                                   byte* authTag, word32 authTagSz, byte* in,
-                                   int inSz, byte* out)
+static int wc_PKCS7_EncryptContent(wc_PKCS7* pkcs7, int encryptOID,
+                                   const byte* key, int keySz,
+                                   const byte* iv, int ivSz,
+                                   const byte* aad, word32 aadSz,
+                                   byte* authTag, word32 authTagSz,
+                                   const byte* in, int inSz,
+                                   byte* out)
 {
     int ret;
 #ifndef NO_AES
@@ -8300,7 +10079,8 @@ static int wc_PKCS7_EncryptContent(wc_PKCS7* pkcs7, int encryptOID, byte* key,
 
 
 static int wc_PKCS7_DecryptContentInit(wc_PKCS7* pkcs7, word32 encryptOID,
-    byte* key, word32 keySz, byte* iv, int ivSz, int devId, void* heap)
+    const byte* key, word32 keySz, const byte* iv, int ivSz,
+    int devId, void* heap)
 {
     int ret;
 #ifndef NO_AES
@@ -8445,8 +10225,8 @@ static int wc_PKCS7_DecryptContentInit(wc_PKCS7* pkcs7, word32 encryptOID,
 /* Only does decryption of content using encryptOID algo and already set keys
  * returns 0 on success */
 static int wc_PKCS7_DecryptContentEx(wc_PKCS7* pkcs7, word32 encryptOID,
-    byte* iv, int ivSz, byte* aad, word32 aadSz, byte* authTag,
-    word32 authTagSz, byte* in, int inSz, byte* out)
+    const byte* iv, int ivSz, const byte* aad, word32 aadSz,
+    const byte* authTag, word32 authTagSz, const byte* in, int inSz, byte* out)
 {
     int ret;
 
@@ -8629,16 +10409,21 @@ static void wc_PKCS7_DecryptContentFree(wc_PKCS7* pkcs7, word32 encryptOID,
  * returns 0 on success
  */
 static int wc_PKCS7_DecryptContent(wc_PKCS7* pkcs7, word32 encryptOID,
-        byte* key, word32 keySz, byte* iv, int ivSz, byte* aad, word32 aadSz,
-        byte* authTag, word32 authTagSz, byte* in, int inSz, byte* out,
-        int devId, void* heap)
+        const byte* key, word32 keySz, const byte* iv, int ivSz,
+        const byte* aad, word32 aadSz, const byte* authTag, word32 authTagSz,
+        const byte* in, int inSz, byte* out, int devId, void* heap)
 {
     int ret;
 
     if (pkcs7->decryptionCb != NULL) {
-        return pkcs7->decryptionCb(pkcs7, (int)encryptOID, iv, ivSz,
-                                      aad, aadSz, authTag, authTagSz, in,
-                                      inSz, out, pkcs7->decryptionCtx);
+        /* unsafe casts needed for backward compatibility of
+         * CallbackDecryptContent.
+         */
+        return pkcs7->decryptionCb(pkcs7, (int)encryptOID, (byte *)(wc_ptr_t)iv,
+                                   ivSz, (byte *)(wc_ptr_t)aad, aadSz,
+                                   (byte *)(wc_ptr_t)authTag, authTagSz,
+                                   (byte *)(wc_ptr_t)in, inSz, out,
+                                   pkcs7->decryptionCtx);
     }
 
     ret = wc_PKCS7_DecryptContentInit(pkcs7, encryptOID, key, keySz, iv, ivSz,
@@ -8960,15 +10745,15 @@ static int wc_PKCS7_PwriKek_KeyWrap(wc_PKCS7* pkcs7, const byte* kek,
 
     if (ret == 0) {
         /* encrypt, normal */
-        ret = wc_PKCS7_EncryptContent(pkcs7, algID, (byte*)kek, (int)kekSz,
-                                    (byte*)iv, (int)ivSz, NULL, 0, NULL, 0, out,
+        ret = wc_PKCS7_EncryptContent(pkcs7, algID, kek, (int)kekSz,
+                                    iv, (int)ivSz, NULL, 0, NULL, 0, out,
                                     outLen, out);
     }
 
     if (ret == 0) {
         /* encrypt again, using last ciphertext block as IV */
         lastBlock = out + (((outLen / blockSz) - 1) * blockSz);
-        ret = wc_PKCS7_EncryptContent(pkcs7, algID, (byte*)kek, (int)kekSz,
+        ret = wc_PKCS7_EncryptContent(pkcs7, algID, kek, (int)kekSz,
                                       lastBlock, blockSz, NULL, 0, NULL, 0, out,
                                       outLen, out);
     }
@@ -8994,9 +10779,10 @@ static int wc_PKCS7_PwriKek_KeyUnWrap(wc_PKCS7* pkcs7, const byte* kek,
                                       word32 ivSz, word32 algID)
 {
     int blockSz, cekLen, ret;
-    byte* tmpIv     = NULL;
-    byte* lastBlock = NULL;
+    const byte* tmpIv     = NULL;
+    const byte* lastBlock = NULL;
     byte* outTmp    = NULL;
+    byte  fail      = 0;
 
     if (pkcs7 == NULL || kek == NULL || in == NULL ||
         out == NULL || iv == NULL) {
@@ -9026,26 +10812,26 @@ static int wc_PKCS7_PwriKek_KeyUnWrap(wc_PKCS7* pkcs7, const byte* kek,
     }
 
     /* use block out[n-1] as IV to decrypt block out[n] */
-    lastBlock = (byte*)in + inSz - blockSz;
+    lastBlock = in + inSz - blockSz;
     tmpIv = lastBlock - blockSz;
 
     /* decrypt last block */
-    ret = wc_PKCS7_DecryptContent(pkcs7, algID, (byte*)kek, kekSz, tmpIv,
+    ret = wc_PKCS7_DecryptContent(pkcs7, algID, kek, kekSz, tmpIv,
             blockSz, NULL, 0, NULL, 0, lastBlock, blockSz,
             outTmp + inSz - blockSz, pkcs7->devId, pkcs7->heap);
 
     if (ret == 0) {
         /* using last decrypted block as IV, decrypt [0 ... n-1] blocks */
         lastBlock = outTmp + inSz - blockSz;
-        ret = wc_PKCS7_DecryptContent(pkcs7, algID, (byte*)kek, kekSz,
-                lastBlock, blockSz, NULL, 0, NULL, 0, (byte*)in,
+        ret = wc_PKCS7_DecryptContent(pkcs7, algID, kek, kekSz,
+                lastBlock, blockSz, NULL, 0, NULL, 0, in,
                 (int)inSz - blockSz, outTmp, pkcs7->devId, pkcs7->heap);
     }
 
     if (ret == 0) {
         /* decrypt using original kek and iv */
-        ret = wc_PKCS7_DecryptContent(pkcs7, algID, (byte*)kek, kekSz,
-                (byte*)iv, (int)ivSz, NULL, 0, NULL, 0, outTmp, (int)inSz,
+        ret = wc_PKCS7_DecryptContent(pkcs7, algID, kek, kekSz,
+                iv, (int)ivSz, NULL, 0, NULL, 0, outTmp, (int)inSz,
                 outTmp, pkcs7->devId, pkcs7->heap);
     }
 
@@ -9058,25 +10844,18 @@ static int wc_PKCS7_PwriKek_KeyUnWrap(wc_PKCS7* pkcs7, const byte* kek,
     cekLen = outTmp[0];
 
     /* verify length */
-    if ((word32)cekLen > inSz) {
-        ForceZero(outTmp, inSz);
-        XFREE(outTmp, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
-        return BAD_FUNC_ARG;
-    }
-
+    fail |= ctMaskGT(cekLen, (int)inSz - 4);
     /* verify check bytes */
-    if ((outTmp[1] ^ outTmp[4]) != 0xFF ||
-        (outTmp[2] ^ outTmp[5]) != 0xFF ||
-        (outTmp[3] ^ outTmp[6]) != 0xFF) {
+    fail |= ctMaskNotEq((int)(outTmp[1] ^ outTmp[4]), 0xFF);
+    fail |= ctMaskNotEq((int)(outTmp[2] ^ outTmp[5]), 0xFF);
+    fail |= ctMaskNotEq((int)(outTmp[3] ^ outTmp[6]), 0xFF);
+    /* verify length */
+    fail |= ctMaskGT(cekLen, (int)outSz);
+
+    if (fail) {
         ForceZero(outTmp, inSz);
         XFREE(outTmp, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
         return BAD_FUNC_ARG;
-    }
-
-    if (outSz < (word32)cekLen) {
-        ForceZero(outTmp, inSz);
-        XFREE(outTmp, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
-        return BUFFER_E;
     }
 
     XMEMCPY(out, outTmp + 4, outTmp[0]);
@@ -9206,6 +10985,7 @@ int wc_PKCS7_AddRecipient_PWRI(wc_PKCS7* pkcs7, byte* passwd, word32 pLen,
                                     (word32)kekKeySz);
     if (ret < 0) {
         XFREE(recip, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(kek, (word32)kekKeySz);
         XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
@@ -9217,6 +10997,7 @@ int wc_PKCS7_AddRecipient_PWRI(wc_PKCS7* pkcs7, byte* passwd, word32 pLen,
                                    tmpIv, (word32)kekBlockSz, encryptOID);
     if (ret < 0) {
         XFREE(recip, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(kek, (word32)kekKeySz);
         XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
@@ -9241,6 +11022,7 @@ int wc_PKCS7_AddRecipient_PWRI(wc_PKCS7* pkcs7, byte* passwd, word32 pLen,
     ret = wc_SetContentType(PWRI_KEK_WRAP, keyEncAlgoId, sizeof(keyEncAlgoId));
     if (ret <= 0) {
         XFREE(recip, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(kek, (word32)kekKeySz);
         XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
@@ -9272,6 +11054,7 @@ int wc_PKCS7_AddRecipient_PWRI(wc_PKCS7* pkcs7, byte* passwd, word32 pLen,
     ret = wc_SetContentType(kdfOID, kdfAlgoId, sizeof(kdfAlgoId));
     if (ret <= 0) {
         XFREE(recip, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(kek, (word32)kekKeySz);
         XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
@@ -9297,6 +11080,7 @@ int wc_PKCS7_AddRecipient_PWRI(wc_PKCS7* pkcs7, byte* passwd, word32 pLen,
     if (totalSz > MAX_RECIP_SZ) {
         WOLFSSL_MSG("CMS Recipient output buffer too small");
         XFREE(recip, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(kek, (word32)kekKeySz);
         XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return BUFFER_E;
@@ -9334,7 +11118,7 @@ int wc_PKCS7_AddRecipient_PWRI(wc_PKCS7* pkcs7, byte* passwd, word32 pLen,
     XMEMCPY(recip->recip + idx, encryptedKey, encryptedKeySz);
     idx += encryptedKeySz;
 
-    ForceZero(kek, (word32)kekBlockSz);
+    ForceZero(kek, (word32)kekKeySz);
     ForceZero(encryptedKey, encryptedKeySz);
     XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
     XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
@@ -9710,6 +11494,10 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     if (pkcs7->singleCert != NULL && pkcs7->singleCertSz > 0) {
         switch (pkcs7->publicKeyOID) {
         #ifndef NO_RSA
+        #ifdef WC_RSA_PSS
+            case RSAPSSk:
+                FALL_THROUGH;
+        #endif
             case RSAk:
                 ret = wc_PKCS7_AddRecipient_KTRI(pkcs7, pkcs7->singleCert,
                                                  pkcs7->singleCertSz, 0);
@@ -9803,6 +11591,7 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
         ret = wc_PKCS7_PadData(pkcs7->content, pkcs7->contentSz, plain,
                                (word32)encryptedOutSz, (word32)blockSz);
         if (ret < 0) {
+            ForceZero(plain, (word32)encryptedOutSz);
             XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
             wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
             return ret;
@@ -9817,6 +11606,8 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
         encryptedContent = (byte*)XMALLOC((word32)encryptedOutSz, pkcs7->heap,
                                           DYNAMIC_TYPE_PKCS7);
         if (encryptedContent == NULL) {
+            if (plain != NULL)
+                ForceZero(plain, (word32)encryptedOutSz);
             XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
             wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
             return MEMORY_E;
@@ -9833,6 +11624,8 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
 
     if (contentEncAlgoSz == 0) {
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        if (plain != NULL)
+            ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
         return BAD_FUNC_ARG;
@@ -9872,6 +11665,8 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
             encryptedContent = (byte*)XMALLOC(streamSz, pkcs7->heap,
                                               DYNAMIC_TYPE_PKCS7);
             if (encryptedContent == NULL) {
+                if (plain != NULL)
+                    ForceZero(plain, (word32)encryptedOutSz);
                 XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
                 return MEMORY_E;
@@ -9918,6 +11713,8 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     ) {
         WOLFSSL_MSG("Pkcs7_encrypt output buffer too small");
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        if (plain != NULL)
+            ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
         wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
         return BUFFER_E;
@@ -9981,6 +11778,8 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     if (ret != 0) {
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
 
+        if (plain != NULL)
+            ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
 
         wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
@@ -10027,6 +11826,8 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
         idx += encryptedOutSz;
     }
 
+    if (plain != NULL)
+        ForceZero(plain, (word32)encryptedOutSz);
     XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
 
     XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
@@ -10035,6 +11836,93 @@ int wc_PKCS7_EncodeEnvelopedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
 }
 
 #ifndef NO_RSA
+#if !defined(NO_HMAC) && !defined(NO_SHA256)
+/* Bleichenbacher padding-oracle mitigation for PKCS#7/CMS KTRI: produce a
+ * WC_SHA256_DIGEST_SIZE-byte pseudo-random CEK derived from a fresh
+ * random seed and the encrypted-key ciphertext. The output is random per
+ * call (driven by the RNG seed); deriving via HMAC of the ciphertext
+ * simply gives the same value within one call regardless of where it is
+ * referenced. Called unconditionally so the work is in the timing path
+ * regardless of RSA padding validity. */
+static int wc_PKCS7_KtriFakeCEK(wc_PKCS7* pkcs7, const byte* encryptedKey,
+                                word32 encryptedKeySz, byte* out)
+{
+    int ret;
+    byte seed[WC_SHA256_DIGEST_SIZE];
+    WC_RNG* rng = NULL;
+    int ownRng = 0;
+    WC_DECLARE_VAR(localRng, WC_RNG, 1, pkcs7->heap);
+    WC_DECLARE_VAR(hmac, Hmac, 1, pkcs7->heap);
+
+    if (pkcs7 == NULL || encryptedKey == NULL || out == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    WC_ALLOC_VAR_EX(hmac, Hmac, 1, pkcs7->heap, DYNAMIC_TYPE_HMAC,
+                    return MEMORY_E);
+
+    /* Prefer a caller-provided RNG to avoid paying a DRBG init/reseed cost
+     * on every decrypt (and to keep the timing envelope flatter on FIPS /
+     * HW-RNG builds). Fall back to a one-shot RNG when pkcs7->rng is not
+     * set. */
+    if (pkcs7->rng != NULL) {
+        rng = pkcs7->rng;
+    }
+    else {
+        WC_ALLOC_VAR_EX(localRng, WC_RNG, 1, pkcs7->heap, DYNAMIC_TYPE_RNG,
+                        WC_FREE_VAR_EX(hmac, pkcs7->heap, DYNAMIC_TYPE_HMAC);
+                        return MEMORY_E);
+        ret = wc_InitRng_ex(localRng, pkcs7->heap, pkcs7->devId);
+        if (ret != 0) {
+            WC_FREE_VAR_EX(localRng, pkcs7->heap, DYNAMIC_TYPE_RNG);
+            WC_FREE_VAR_EX(hmac, pkcs7->heap, DYNAMIC_TYPE_HMAC);
+            return ret;
+        }
+        rng = localRng;
+        ownRng = 1;
+    }
+
+    ret = wc_RNG_GenerateBlock(rng, seed, (word32)sizeof(seed));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    /* seed will be used as an HMAC key to derive the fallback CEK. Register
+     * it immediately after generation; both exits below ForceZero+Check it. */
+    wc_MemZero_Add("wc_PKCS7_KtriFakeCEK seed", seed, sizeof(seed));
+#endif
+
+    if (ownRng) {
+        wc_FreeRng(localRng);
+        WC_FREE_VAR_EX(localRng, pkcs7->heap, DYNAMIC_TYPE_RNG);
+    }
+
+    if (ret != 0) {
+        ForceZero(seed, sizeof(seed));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Check(seed, sizeof(seed));
+#endif
+        WC_FREE_VAR_EX(hmac, pkcs7->heap, DYNAMIC_TYPE_HMAC);
+        return ret;
+    }
+
+    ret = wc_HmacInit(hmac, pkcs7->heap, pkcs7->devId);
+    if (ret == 0) {
+        ret = wc_HmacSetKey(hmac, WC_SHA256, seed, (word32)sizeof(seed));
+        if (ret == 0) {
+            ret = wc_HmacUpdate(hmac, encryptedKey, encryptedKeySz);
+        }
+        if (ret == 0) {
+            ret = wc_HmacFinal(hmac, out);
+        }
+        wc_HmacFree(hmac);
+    }
+    ForceZero(seed, sizeof(seed));
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    wc_MemZero_Check(seed, sizeof(seed));
+#endif
+    WC_FREE_VAR_EX(hmac, pkcs7->heap, DYNAMIC_TYPE_HMAC);
+    return ret;
+}
+#endif /* !NO_HMAC && !NO_SHA256 */
+
 /* decode KeyTransRecipientInfo (ktri), return 0 on success, <0 on error */
 static int wc_PKCS7_DecryptKtri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                                word32* idx, byte* decryptedKey,
@@ -10051,7 +11939,9 @@ static int wc_PKCS7_DecryptKtri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
     word32 pkiMsgSz = inSz;
     byte   tag;
 
-
+#ifndef WC_NO_RSA_OAEP
+    word32 outKeySz = 0;
+#endif
 #ifndef NO_PKCS7_STREAM
     word32 tmpIdx = *idx;
 #endif
@@ -10210,15 +12100,17 @@ static int wc_PKCS7_DecryptKtri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 if (GetLength(pkiMsg, idx, &length, pkiMsgSz) < 0)
                     return ASN_PARSE_E;
 
-                if ((word32)keyIdSize > pkiMsgSz - (*idx))
+                /* Validate SKID container is within buffer */
+                if ((word32)length > pkiMsgSz - (*idx))
                     return BUFFER_E;
 
                 /* if we found correct recipient, SKID will match */
-                if (XMEMCMP(pkiMsg + (*idx), pkcs7->issuerSubjKeyId,
+                if (length == keyIdSize &&
+                        XMEMCMP(pkiMsg + (*idx), pkcs7->issuerSubjKeyId,
                             (word32)keyIdSize) == 0) {
                     *recipFound = 1;
                 }
-                (*idx) += (word32)keyIdSize;
+                (*idx) += (word32)length;
             }
 
             if (GetAlgoId(pkiMsg, idx, &encOID, oidKeyType, pkiMsgSz) < 0)
@@ -10358,8 +12250,8 @@ static int wc_PKCS7_DecryptKtri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             #ifndef WC_NO_RSA_OAEP
                     }
                     else {
-                        word32 outLen = (word32)wc_RsaEncryptSize(privKey);
-                        outKey = (byte*)XMALLOC(outLen, pkcs7->heap,
+                        outKeySz = (word32)wc_RsaEncryptSize(privKey);
+                        outKey = (byte*)XMALLOC(outKeySz, pkcs7->heap,
                                                     DYNAMIC_TYPE_TMP_BUFFER);
                         if (!outKey) {
                             WOLFSSL_MSG("Failed to allocate out key buffer");
@@ -10373,9 +12265,9 @@ static int wc_PKCS7_DecryptKtri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                         }
 
                         keySz = wc_RsaPrivateDecrypt_ex(encryptedKey,
-                                (word32)encryptedKeySz, outKey, outLen, privKey,
-                                WC_RSA_OAEP_PAD,
-                                WC_HASH_TYPE_SHA, WC_MGF1SHA1, NULL, 0);
+                                    (word32)encryptedKeySz, outKey, outKeySz,
+                                    privKey, WC_RSA_OAEP_PAD, WC_HASH_TYPE_SHA,
+                                    WC_MGF1SHA1, NULL, 0);
                     }
             #endif
                 }
@@ -10390,30 +12282,177 @@ static int wc_PKCS7_DecryptKtri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             }
             wc_FreeRsaKey(privKey);
 
+        #if !defined(NO_HMAC) && !defined(NO_SHA256)
+            {
+                /* Bleichenbacher padding-oracle mitigation: always compute
+                 * a pseudo-random fallback CEK so timing and error
+                 * behaviour do not depend on RSA padding validity. On
+                 * unwrap failure we substitute the fallback and let
+                 * content decryption fail indistinguishably from "unwrap
+                 * succeeded but CEK is wrong". */
+                byte fakeKey[WC_SHA256_DIGEST_SIZE];
+                int  fakeRet;
+            #ifdef WOLFSSL_CHECK_MEM_ZERO
+                /* Register fakeKey from declaration (baseline-zeroed so it is
+                 * defined). It will hold the fallback content-encryption key.
+                 * Both exits below ForceZero+Check it. */
+                XMEMSET(fakeKey, 0, sizeof(fakeKey));
+                wc_MemZero_Add("wc_PKCS7_DecryptKtri fakeKey", fakeKey,
+                               sizeof(fakeKey));
+            #endif
+                fakeRet = wc_PKCS7_KtriFakeCEK(pkcs7, encryptedKey,
+                                               (word32)encryptedKeySz,
+                                               fakeKey);
+
+                if (fakeRet != 0) {
+                    /* Fallback generation failed (e.g. RNG/HMAC error).
+                     * Return the fallback-generation status, which does
+                     * not depend on RSA padding validity, rather than the
+                     * RSA status which would re-open the oracle. */
+                    ForceZero(fakeKey, sizeof(fakeKey));
+                #ifdef WOLFSSL_CHECK_MEM_ZERO
+                    wc_MemZero_Check(fakeKey, sizeof(fakeKey));
+                #endif
+                    /* In the non-OAEP path RSA is decrypted in-place via
+                     * wc_RsaPrivateDecryptInline, so encryptedKey holds
+                     * the (possibly valid) plaintext CEK. Zero it before
+                     * free. */
+                    ForceZero(encryptedKey, (word32)encryptedKeySz);
+                    XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_WOLF_BIGINT);
+                    WC_FREE_VAR_EX(privKey, pkcs7->heap,
+                        DYNAMIC_TYPE_TMP_BUFFER);
+                #ifndef WC_NO_RSA_OAEP
+                    if (encOID == RSAESOAEPk) {
+                        if (outKey != NULL) {
+                            ForceZero(outKey, outKeySz);
+                            XFREE(outKey, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+                        }
+                    }
+                #endif
+                    return fakeRet;
+                }
+
+                /* Constant-time select between fake and real CEK. On RSA
+                 * failure outKey may be NULL or keySz may be <= 0; in
+                 * both cases the mask selects fakeKey for every byte.
+                 *
+                 * To avoid data-dependent branches that leak realLen,
+                 * copy the real key into a fixed-size zero-padded buffer
+                 * first, then select byte-by-byte in constant time. */
+                {
+                    word32 i;
+                    byte   useFake;
+                    int    realLen = keySz;
+                    byte   realPad[WC_SHA256_DIGEST_SIZE];
+
+                    XMEMSET(realPad, 0, sizeof(realPad));
+                #ifdef WOLFSSL_CHECK_MEM_ZERO
+                    /* realPad holds the real (padded) content-encryption
+                     * key selected in constant time. */
+                    wc_MemZero_Add("wc_PKCS7_DecryptKtri realPad", realPad,
+                                   sizeof(realPad));
+                #endif
+                    /* Constant-time copy: avoid data-dependent branches
+                     * that could leak whether RSA padding was valid.
+                     * When outKey is NULL (inline RSA failure), use
+                     * encryptedKey as a safe readable source; the mask
+                     * will zero out all bytes anyway.  Both encryptedKey
+                     * and outKey (when non-NULL) are at least
+                     * sizeof(realPad) bytes for any RSA key size.
+                     *
+                     * Use constant-time pointer selection to avoid
+                     * branching on outKey nullity, which would leak
+                     * whether RSA PKCS#1 v1.5 padding was valid. */
+                    {
+                        byte haveSrc = ctMaskGTE(realLen, 1);
+                        const byte* srcTbl[2];
+                        const byte* src;
+                        word32 j = 0;
+                        word32 safeJ = 0;
+
+                        /* Select source without integer pointer synthesis.
+                         * Some safety-oriented compilers (e.g. Fil-C) treat
+                         * int-to-pointer reconstruction as a null-object
+                         * pointer on dereference. */
+                        srcTbl[0] = encryptedKey;
+                        srcTbl[1] = outKey;
+                        src = srcTbl[haveSrc & 1];
+
+                        /* safeJ is clamped to max(0, realLen-1): it
+                         * only advances while the next index would
+                         * still be inside realLen, so src[safeJ] is
+                         * always in bounds.  Bytes at j >= realLen are
+                         * masked to zero by inBounds anyway. */
+                        for (j = 0; j < (word32)sizeof(realPad); j++) {
+                            byte inBounds = ctMaskLT((int)j, realLen);
+                            byte advance = ctMaskLT((int)(safeJ + 1),
+                                                    realLen);
+                            realPad[j] = src[safeJ] & haveSrc & inBounds;
+                            safeJ += (word32)(advance & 1);
+                        }
+                    }
+                    useFake = ctMaskLT(realLen, 1); /* 0xFF if realLen<=0 */
+
+                    for (i = 0; i < (word32)sizeof(fakeKey); i++) {
+                        decryptedKey[i] = ctMaskSel(useFake, fakeKey[i],
+                                                    realPad[i]);
+                    }
+                    /* Report the real key size on success; on RSA
+                     * failure (realLen <= 0) report sizeof(fakeKey).
+                     * Constant-time select avoids branching on RSA
+                     * padding validity. */
+                    *decryptedKeySz = (word32)ctMaskSelInt(useFake,
+                                        (int)sizeof(fakeKey), realLen);
+                    ForceZero(realPad, sizeof(realPad));
+                #ifdef WOLFSSL_CHECK_MEM_ZERO
+                    wc_MemZero_Check(realPad, sizeof(realPad));
+                #endif
+                }
+                ForceZero(fakeKey, sizeof(fakeKey));
+                #ifdef WOLFSSL_CHECK_MEM_ZERO
+                wc_MemZero_Check(fakeKey, sizeof(fakeKey));
+                #endif
+                /* In the non-OAEP path RSA is decrypted in-place via
+                 * wc_RsaPrivateDecryptInline, so encryptedKey holds the
+                 * plaintext CEK after the unwrap. Zero it before free. */
+                ForceZero(encryptedKey, (word32)encryptedKeySz);
+            }
+        #else /* NO_HMAC || NO_SHA256: mitigation unavailable */
+            #if !defined(WOLFSSL_NO_KTRI_ORACLE_WARNING)
+                #warning "PKCS7 KTRI Bleichenbacher mitigation requires HMAC " \
+                    "and SHA256; build without them leaves the RSA unwrap " \
+                    "error path observable to callers. " \
+                    "Define WOLFSSL_NO_KTRI_ORACLE_WARNING to silence."
+            #endif
+
             if (keySz <= 0 || outKey == NULL) {
                 ForceZero(encryptedKey, (word32)encryptedKeySz);
                 XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_WOLF_BIGINT);
                 WC_FREE_VAR_EX(privKey, pkcs7->heap,
                     DYNAMIC_TYPE_TMP_BUFFER);
-        #ifndef WC_NO_RSA_OAEP
+            #ifndef WC_NO_RSA_OAEP
                 if (encOID == RSAESOAEPk) {
-                    if (!outKey) {
+                    if (outKey) {
+                        ForceZero(outKey, outKeySz);
                         XFREE(outKey, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
                     }
                 }
-        #endif
+            #endif
                 return keySz;
-            } else {
+            }
+            else {
                 *decryptedKeySz = (word32)keySz;
                 XMEMCPY(decryptedKey, outKey, (word32)keySz);
                 ForceZero(encryptedKey, (word32)encryptedKeySz);
             }
+        #endif /* !NO_HMAC && !NO_SHA256 */
 
             XFREE(encryptedKey, pkcs7->heap, DYNAMIC_TYPE_WOLF_BIGINT);
             WC_FREE_VAR_EX(privKey, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
         #ifndef WC_NO_RSA_OAEP
             if (encOID == RSAESOAEPk) {
-                if (!outKey) {
+                if (outKey) {
+                    ForceZero(outKey, outKeySz);
                     XFREE(outKey, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
                 }
             }
@@ -10493,6 +12532,14 @@ static int wc_PKCS7_KariGetOriginatorIdentifierOrKey(WC_PKCS7_KARI* kari,
         return ASN_PARSE_E;
 
     if (GetLength(pkiMsg, idx, &length, pkiMsgSz) < 0)
+        return ASN_PARSE_E;
+
+    /* BIT STRING must have at least unused-bits byte + 1 byte of content */
+    if (length < 2)
+        return ASN_PARSE_E;
+
+    /* Validate BIT STRING content is within input buffer */
+    if (*idx > pkiMsgSz || (word32)length > pkiMsgSz - *idx)
         return ASN_PARSE_E;
 
     if (GetASNTag(pkiMsg, idx, &tag, pkiMsgSz) < 0)
@@ -10966,12 +13013,30 @@ static int wc_PKCS7_DecryptOri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             if (GetASNObjectId(pkiMsg, idx, &oriOIDSz, pkiMsgSz) != 0)
                 return ASN_PARSE_E;
 
+            if (oriOIDSz <= 0 || (word32)oriOIDSz > MAX_OID_SZ) {
+                WOLFSSL_MSG("ORI oriType OID too large");
+                return ASN_PARSE_E;
+            }
+
             XMEMCPY(oriOID, pkiMsg + *idx, (word32)oriOIDSz);
             *idx += (word32)oriOIDSz;
+
+            /* Validate OID did not consume more than the SEQUENCE declared */
+            if ((*idx - tmpIdx) > (word32)seqSz) {
+                WOLFSSL_MSG("ORI oriType OID exceeds SEQUENCE boundary");
+                return ASN_PARSE_E;
+            }
 
             /* get oriValue, increment idx */
             oriValue = pkiMsg + *idx;
             oriValueSz = (word32)seqSz - (*idx - tmpIdx);
+
+            /* Validate oriValue region is within input buffer */
+            if (*idx > pkiMsgSz || oriValueSz > pkiMsgSz - *idx) {
+                WOLFSSL_MSG("ORI oriValue exceeds input buffer");
+                return ASN_PARSE_E;
+            }
+
             *idx += oriValueSz;
 
             /* pass oriOID and oriValue to user callback, expect back
@@ -11023,6 +13088,9 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
 
     int ret = 0, length, saltSz, iterations, blockSz, kekKeySz;
     int hashOID = WC_SHA; /* default to SHA1 */
+    int keyLen = 0;
+    int keyLenPresent = 0;
+    word32 pbkdf2End = 0;
     word32 kdfAlgoId, pwriEncAlgoId, keyEncAlgoId, cekSz;
     byte* pkiMsg = in;
     word32 pkiMsgSz = inSz;
@@ -11069,6 +13137,7 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             /* get KDF params SEQ */
             if (GetSequence(pkiMsg, idx, &length, pkiMsgSz) < 0)
                 return ASN_PARSE_E;
+            pbkdf2End = *idx + (word32)length;
 
             /* get KDF salt OCTET STRING */
             if (GetASNTag(pkiMsg, idx, &tag, pkiMsgSz) < 0)
@@ -11092,6 +13161,44 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             if (GetMyVersion(pkiMsg, idx, &iterations, pkiMsgSz) < 0) {
                 XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return ASN_PARSE_E;
+            }
+
+            /* optional keyLength - validated below once kekKeySz is known */
+            if (*idx < pbkdf2End && pkiMsg[*idx] == ASN_INTEGER) {
+                if (GetShortInt(pkiMsg, idx, &keyLen, pbkdf2End) < 0) {
+                    XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                    return ASN_PARSE_E;
+                }
+                keyLenPresent = 1;
+            }
+
+            /* optional prf; default hmacWithSHA1 keeps hashOID at WC_SHA */
+            if (*idx < pbkdf2End &&
+                    pkiMsg[*idx] == (ASN_SEQUENCE | ASN_CONSTRUCTED)) {
+                word32 prfOid = 0;
+                if (GetAlgoId(pkiMsg, idx, &prfOid, oidHmacType,
+                                                            pbkdf2End) < 0) {
+                    XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                    return ASN_PARSE_E;
+                }
+                switch ((int)prfOid) {
+                #ifdef WOLFSSL_SHA224
+                    case HMAC_SHA224_OID: hashOID = WC_SHA224; break;
+                #endif
+                #ifndef NO_SHA256
+                    case HMAC_SHA256_OID: hashOID = WC_SHA256; break;
+                #endif
+                #ifdef WOLFSSL_SHA384
+                    case HMAC_SHA384_OID: hashOID = WC_SHA384; break;
+                #endif
+                #ifdef WOLFSSL_SHA512
+                    case HMAC_SHA512_OID: hashOID = WC_SHA512; break;
+                #endif
+                    default:
+                        /* unknown id (incl. explicit hmacWithSHA1) - keep
+                         * default WC_SHA; MAC unwrap fails if mismatched */
+                        break;
+                }
             }
 
             /* get KeyEncAlgoId SEQ */
@@ -11126,6 +13233,13 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 return kekKeySz;
             }
 
+            /* RFC 8018: when present, PBKDF2 keyLength must equal the
+             * derived key length expected by the encryption algorithm */
+            if (keyLenPresent && keyLen != kekKeySz) {
+                XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                return ASN_PARSE_E;
+            }
+
             /* get block cipher IV, stored in OPTIONAL parameter of AlgoID */
             if (GetASNTag(pkiMsg, idx, &tag, pkiMsgSz) < 0) {
                 XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
@@ -11149,6 +13263,12 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 return ASN_PARSE_E;
             }
 
+            /* Validate IV is within input buffer */
+            if (*idx > pkiMsgSz || (word32)length > pkiMsgSz - *idx) {
+                XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                return ASN_PARSE_E;
+            }
+
             XMEMCPY(tmpIv, pkiMsg + (*idx), (word32)length);
             *idx += (word32)length;
 
@@ -11164,6 +13284,12 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             }
 
             if (GetLength(pkiMsg, idx, &length, pkiMsgSz) < 0) {
+                XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                return ASN_PARSE_E;
+            }
+
+            /* Validate EncryptedKey is within input buffer */
+            if (*idx > pkiMsgSz || (word32)length > pkiMsgSz - *idx) {
                 XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return ASN_PARSE_E;
             }
@@ -11190,6 +13316,7 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                                   iterations, kek, (word32)kekKeySz);
             if (ret < 0) {
                 XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(kek, (word32)kekKeySz);
                 XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 XFREE(cek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return ASN_PARSE_E;
@@ -11202,7 +13329,9 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                                              pwriEncAlgoId);
             if (ret < 0) {
                 XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(kek, (word32)kekKeySz);
                 XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(cek, cekSz);
                 XFREE(cek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return ret;
             }
@@ -11211,7 +13340,9 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             if (*decryptedKeySz < cekSz) {
                 WOLFSSL_MSG("Decrypted key buffer too small for CEK");
                 XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(kek, (word32)kekKeySz);
                 XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(cek, cekSz);
                 XFREE(cek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return BUFFER_E;
             }
@@ -11220,7 +13351,9 @@ static int wc_PKCS7_DecryptPwri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             *decryptedKeySz = cekSz;
 
             XFREE(salt, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            ForceZero(kek, (word32)kekKeySz);
             XFREE(kek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            ForceZero(cek, cekSz);
             XFREE(cek, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
 
             /* mark recipFound, since we only support one RecipientInfo for now */
@@ -11254,7 +13387,7 @@ static int wc_PKCS7_DecryptKekri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
     byte* keyId = NULL;
     const byte* datePtr = NULL;
     byte  dateFormat, tag;
-    word32 keyIdSz, kekIdSz, keyWrapOID, localIdx;
+    word32 keyIdSz, kekIdSz, kekIdEnd, keyWrapOID, localIdx;
 
     int ret = 0;
     byte* pkiMsg    = in;
@@ -11280,6 +13413,11 @@ static int wc_PKCS7_DecryptKekri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 return ASN_PARSE_E;
 
             kekIdSz = (word32)length;
+            kekIdEnd = *idx + kekIdSz;
+
+            /* Validate KEKIdentifier boundary is within input buffer */
+            if (kekIdEnd < *idx || kekIdEnd > pkiMsgSz)
+                return ASN_PARSE_E;
 
             if (GetASNTag(pkiMsg, idx, &tag, pkiMsgSz) < 0)
                 return ASN_PARSE_E;
@@ -11290,6 +13428,10 @@ static int wc_PKCS7_DecryptKekri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             if (GetLength(pkiMsg, idx, &length, pkiMsgSz) < 0)
                 return ASN_PARSE_E;
 
+            /* Validate keyIdentifier is within input buffer */
+            if (*idx > pkiMsgSz || (word32)length > pkiMsgSz - *idx)
+                return ASN_PARSE_E;
+
             /* save keyIdentifier and length */
             keyId = pkiMsg + *idx;
             keyIdSz = (word32)length;
@@ -11297,13 +13439,15 @@ static int wc_PKCS7_DecryptKekri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
 
             /* may have OPTIONAL GeneralizedTime */
             localIdx = *idx;
-            if ((*idx < kekIdSz) && GetASNTag(pkiMsg, &localIdx, &tag,
+            if ((*idx < kekIdEnd) && GetASNTag(pkiMsg, &localIdx, &tag,
                         pkiMsgSz) == 0 && tag == ASN_GENERALIZED_TIME) {
-                if (wc_GetDateInfo(pkiMsg + *idx, (int)pkiMsgSz, &datePtr,
-                        &dateFormat, &dateLen) != 0) {
+                if (wc_GetDateInfo(pkiMsg + *idx, (int)(pkiMsgSz - *idx),
+                        &datePtr, &dateFormat, &dateLen) != 0) {
                     return ASN_PARSE_E;
                 }
-                *idx += (word32)(dateLen + 1);
+                /* datePtr points to the start of the date value
+                 * within pkiMsg; advance past the full TLV. */
+                *idx = (word32)(datePtr - pkiMsg) + (word32)dateLen;
             }
 
             if (*idx > pkiMsgSz) {
@@ -11312,7 +13456,7 @@ static int wc_PKCS7_DecryptKekri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
 
             /* may have OPTIONAL OtherKeyAttribute */
             localIdx = *idx;
-            if ((*idx < kekIdSz) && GetASNTag(pkiMsg, &localIdx, &tag,
+            if ((*idx < kekIdEnd) && GetASNTag(pkiMsg, &localIdx, &tag,
                             pkiMsgSz) == 0 && tag == (ASN_SEQUENCE |
                             ASN_CONSTRUCTED)) {
                 if (GetSequence(pkiMsg, idx, &length, pkiMsgSz) < 0)
@@ -11339,6 +13483,10 @@ static int wc_PKCS7_DecryptKekri(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 return ASN_PARSE_E;
 
             if (GetLength(pkiMsg, idx, &length, pkiMsgSz) < 0)
+                return ASN_PARSE_E;
+
+            /* Validate EncryptedKey is within input buffer */
+            if (*idx > pkiMsgSz || (word32)length > pkiMsgSz - *idx)
                 return ASN_PARSE_E;
 
             #ifndef NO_AES
@@ -12094,6 +14242,22 @@ static int wc_PKCS7_ParseToRecipientInfoSet(wc_PKCS7* pkcs7, byte* in,
                         NO_USER_CHECK) < 0)
                 ret = ASN_PARSE_E;
 
+            /* GetSet_ex is called with NO_USER_CHECK, which skips the
+             * (idx + length > maxIdx) bounds check in GetLength_ex. In
+             * non-streaming mode, validate the SET length against the
+             * remaining input buffer; in streaming mode the length flows
+             * into pkcs7->stream->expected and then wc_PKCS7_GrowStream,
+             * where it is capped by WOLFSSL_PKCS7_MAX_STREAM_ALLOC. */
+            if (ret == 0 && length < 0)
+                ret = ASN_PARSE_E;
+        #ifdef NO_PKCS7_STREAM
+            if (ret == 0 &&
+                    (*idx > pkiMsgSz ||
+                     (word32)length > pkiMsgSz - *idx)) {
+                ret = ASN_PARSE_E;
+            }
+        #endif
+
             if (ret < 0)
                 break;
 
@@ -12206,7 +14370,12 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
     byte* encryptedContent = NULL;
     int explicitOctet = 0;
     word32 localIdx = 0;
-    byte   tag = 0;
+    byte tag = 0;
+    byte padCheck = 0;
+    int padIndex;
+    word32 peekIdx = 0;
+    int innerSz = 0;
+    byte innerTag = 0;
 
     if (pkcs7 == NULL)
         return BAD_FUNC_ARG;
@@ -12247,6 +14416,11 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                                                        DYNAMIC_TYPE_PKCS7);
             if (decryptedKey == NULL)
                 return MEMORY_E;
+            XMEMSET(decryptedKey, 0, MAX_ENCRYPTED_KEY_SZ);
+        #ifdef WOLFSSL_CHECK_MEM_ZERO
+            wc_MemZero_Add("wc_PKCS7 decryptedKey", decryptedKey,
+                            MAX_ENCRYPTED_KEY_SZ);
+        #endif
             wc_PKCS7_ChangeState(pkcs7, WC_PKCS7_ENV_2);
             tmpIdx = idx;
             recipientSetSz = (word32)ret;
@@ -12441,6 +14615,12 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 break;
             }
         #else
+            /* ensure IV bytes are within the input buffer before copying */
+            if (length < 0 || (word32)length > pkiMsgSz ||
+                    idx > pkiMsgSz - (word32)length) {
+                ret = BUFFER_E;
+                break;
+            }
             ret = 0;
         #endif
 
@@ -12466,6 +14646,41 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 ret = ASN_PARSE_E;
             }
 
+            /* A definite-length constructed [0] wrapping a single
+             * definite-length OCTET STRING (as emitted by Go's crypto/pkcs7,
+             * e.g. micromdm/scep) is not BER-fragmented content. Unwrap the
+             * inner OCTET STRING and decode it like the primitive [0] case so
+             * the fragmented-OCTET-STRING loop, which expects an indefinite
+             * EOC terminator, is not entered. The inner length is parsed with
+             * NO_USER_CHECK because the full ciphertext may not be buffered
+             * yet in streaming mode; the size equality below validates it. The
+             * equality is computed in word32: innerSz is >= 0 here (from the
+             * GetLength_ex check) but NO_USER_CHECK lets it reach INT_MAX, so a
+             * signed addition could overflow (undefined behavior) on crafted
+             * input. Unsigned arithmetic is well-defined and, for the valid
+             * innerSz range, does not wrap. */
+            if (ret == 0 && explicitOctet && encryptedContentTotalSz > 0) {
+                peekIdx = idx;
+                if (GetASNTag(pkiMsg, &peekIdx, &innerTag, pkiMsgSz) == 0 &&
+                        innerTag == ASN_OCTET_STRING &&
+                        GetLength_ex(pkiMsg, &peekIdx, &innerSz, pkiMsgSz,
+                                     NO_USER_CHECK) >= 0 &&
+                        (word32)innerSz + (peekIdx - idx) ==
+                        (word32)encryptedContentTotalSz) {
+                    idx = peekIdx;
+                    encryptedContentTotalSz = innerSz;
+                    explicitOctet = 0;
+                }
+            }
+
+        #ifdef NO_PKCS7_STREAM
+            if (ret == 0 && encryptedContentTotalSz > (int)(pkiMsgSz - idx)) {
+                /* In non-streaming mode, ensure the content fits in the buffer.
+                 * Streaming mode handles this via AddDataToStream. */
+                ret = BUFFER_E;
+            }
+        #endif
+
             if (ret != 0)
                 break;
 
@@ -12481,10 +14696,18 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
             wc_PKCS7_StreamStoreVar(pkcs7, encOID, expBlockSz, explicitOctet);
 
             if (explicitOctet) {
-                /* initialize decryption state in preparation */
+                /* initialize decryption state in preparation. Use
+                 * contentSz (blockKeySz from the content algorithm) as
+                 * the AES key size rather than aadSz (the unwrapped CEK
+                 * length): the two are equal for well-formed messages,
+                 * but using blockKeySz avoids BAD_FUNC_ARG on crafted
+                 * messages where the CEK length does not match the
+                 * content cipher, which would otherwise be a
+                 * distinguishable error. */
                 if (pkcs7->decryptionCb == NULL) {
                     ret = wc_PKCS7_DecryptContentInit(pkcs7, encOID,
-                        pkcs7->stream->aad, pkcs7->stream->aadSz,
+                        pkcs7->stream->aad,
+                        (word32)pkcs7->stream->contentSz,
                         pkcs7->stream->tmpIv, expBlockSz,
                         pkcs7->devId, pkcs7->heap);
                     if (ret != 0)
@@ -12641,6 +14864,18 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                             break;
                         }
                     }
+                #ifdef NO_PKCS7_STREAM
+                    /* Non-streaming has no resume path. If an error was flagged
+                     * (e.g. a definite-length constructed [0] whose OCTET
+                     * STRINGs were consumed without an indefinite EOC
+                     * terminator, so the scan ran off the end of the buffer)
+                     * stop here instead of re-reading past the end forever.
+                     * The streaming build breaks on error above; this is the
+                     * equivalent exit for the non-streaming loop. */
+                    if (ret != 0) {
+                        break;
+                    }
+                #endif
                 #ifndef NO_PKCS7_STREAM
                     pkcs7->stream->expected = MAX_OCTET_STR_SZ;
                     if ((ret = wc_PKCS7_StreamEndCase(pkcs7, &localIdx,
@@ -12676,6 +14911,13 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 }
                 wc_PKCS7_DecryptContentFree(pkcs7, encOID, pkcs7->heap);
             } else {
+                word32 tmpSum;
+                if (!WC_SAFE_SUM_WORD32(idx, (word32)encryptedContentTotalSz, tmpSum) ||
+                    tmpSum > pkiMsgSz) {
+                    ret = BUFFER_E;
+                    break;
+                }
+
                 pkcs7->cachedEncryptedContentSz =
                     (word32)encryptedContentTotalSz;
                 pkcs7->totalEncryptedContentSz =
@@ -12700,10 +14942,27 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
             /* use cached content */
             encryptedContent = pkcs7->cachedEncryptedContent;
             encryptedContentSz = (int)pkcs7->cachedEncryptedContentSz;
+
+            if (encryptedContentSz <= 0) {
+                ret = BUFFER_E;
+                break;
+            }
+
             padLen = encryptedContent[encryptedContentSz-1];
 
-            /* copy plaintext to output */
-            if (padLen > encryptedContentSz) {
+            /* Constant-time padding check */
+            padCheck |= ctMaskEq(padLen, 0);
+            padCheck |= ctMaskGT(padLen, expBlockSz);
+            padCheck |= ctMaskGT(padLen, encryptedContentSz);
+            padCheck |= ctMaskGT(expBlockSz, encryptedContentSz);
+            for (padIndex = encryptedContentSz < expBlockSz ? 0 :
+                     encryptedContentSz - expBlockSz;
+                 padIndex < encryptedContentSz; padIndex++) {
+                byte inPad = ctMaskGTE(padIndex,
+                                       encryptedContentSz - (int)padLen);
+                padCheck |= inPad & (encryptedContent[padIndex] ^ padLen);
+            }
+            if (padCheck != 0) {
                 ret = BUFFER_E;
                 break;
             }
@@ -12743,8 +15002,13 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
 
             ret = (int)pkcs7->totalEncryptedContentSz - padLen;
         #ifndef NO_PKCS7_STREAM
-            pkcs7->stream->aad = NULL;
-            pkcs7->stream->aadSz = 0;
+            /* decryptedKey (just freed) is the same buffer stream->aad
+             * aliases. Null the stream handle so ResetStream doesn't
+             * double-free it. */
+            if (pkcs7->stream != NULL) {
+                pkcs7->stream->aad = NULL;
+                pkcs7->stream->aadSz = 0;
+            }
             wc_PKCS7_ResetStream(pkcs7);
         #endif
             wc_PKCS7_ChangeState(pkcs7, WC_PKCS7_START);
@@ -12757,6 +15021,16 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
 
 #ifndef NO_PKCS7_STREAM
     if (ret < 0 && ret != WC_NO_ERR_TRACE(WC_PKCS7_WANT_READ_E)) {
+        /* stream->aad aliases the MAX_ENCRYPTED_KEY_SZ decryptedKey
+         * buffer in this flow. ResetStream only zeros aadSz bytes, so
+         * explicitly zero and release the full buffer here to satisfy
+         * WOLFSSL_CHECK_MEM_ZERO and avoid leaking key material. */
+        if (pkcs7->stream != NULL && pkcs7->stream->aad != NULL) {
+            ForceZero(pkcs7->stream->aad, MAX_ENCRYPTED_KEY_SZ);
+            XFREE(pkcs7->stream->aad, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            pkcs7->stream->aad = NULL;
+            pkcs7->stream->aadSz = 0;
+        }
         wc_PKCS7_ResetStream(pkcs7);
         wc_PKCS7_ChangeState(pkcs7, WC_PKCS7_START);
         if (pkcs7->cachedEncryptedContent != NULL) {
@@ -12767,6 +15041,9 @@ int wc_PKCS7_DecodeEnvelopedData(wc_PKCS7* pkcs7, byte* in,
         }
     }
 #else
+    if (ret < 0) {
+        wc_PKCS7_ChangeState(pkcs7, WC_PKCS7_START);
+    }
     if (decryptedKey != NULL && ret < 0) {
         ForceZero(decryptedKey, MAX_ENCRYPTED_KEY_SZ);
         XFREE(decryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
@@ -13027,6 +15304,10 @@ int wc_PKCS7_EncodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* output,
     if (pkcs7->singleCert != NULL && pkcs7->singleCertSz > 0) {
         switch (pkcs7->publicKeyOID) {
         #ifndef NO_RSA
+        #ifdef WC_RSA_PSS
+            case RSAPSSk:
+                FALL_THROUGH;
+        #endif
             case RSAk:
                 ret = wc_PKCS7_AddRecipient_KTRI(pkcs7, pkcs7->singleCert,
                                                  pkcs7->singleCertSz, 0);
@@ -13143,18 +15424,26 @@ int wc_PKCS7_EncodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* output,
             contentTypeAttrib.valueSz = pkcs7->contentTypeSz;
         }
 
-        authAttribsSz += (word32)EncodeAttributes(authAttribs, 1,
-                                                         &contentTypeAttrib, 1);
+        ret = EncodeAttributes(authAttribs, 1, &contentTypeAttrib, 1);
+        if (ret < 0) {
+            wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
+            return ret;
+        }
+        authAttribsSz += (word32)ret;
         authAttribsCount += 1;
     }
 
     /* authAttribs: add in user authenticated attributes */
     if (pkcs7->authAttribs != NULL && pkcs7->authAttribsSz > 0) {
-        authAttribsSz += (word32)EncodeAttributes(
-                                 authAttribs + authAttribsCount,
+        ret = EncodeAttributes(authAttribs + authAttribsCount,
                                  (int)(MAX_AUTH_ATTRIBS_SZ - authAttribsCount),
                                  pkcs7->authAttribs,
                                  (int)pkcs7->authAttribsSz);
+        if (ret < 0) {
+            wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
+            return ret;
+        }
+        authAttribsSz += (word32)ret;
         authAttribsCount += pkcs7->authAttribsSz;
     }
 
@@ -13202,11 +15491,17 @@ int wc_PKCS7_EncodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* output,
 
     /* build up unauthenticated attributes (unauthAttrs) */
     if (pkcs7->unauthAttribsSz > 0) {
-        unauthAttribsSz = (word32)EncodeAttributes(
-                              unauthAttribs + unauthAttribsCount,
+        ret = EncodeAttributes(unauthAttribs + unauthAttribsCount,
                               (int)(MAX_UNAUTH_ATTRIBS_SZ - unauthAttribsCount),
                               pkcs7->unauthAttribs,
                               (int)pkcs7->unauthAttribsSz);
+        if (ret < 0) {
+            wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
+            XFREE(aadBuffer, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
+            XFREE(flatAuthAttribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            return ret;
+        }
+        unauthAttribsSz = (word32)ret;
         unauthAttribsCount = pkcs7->unauthAttribsSz;
 
         if (unauthAttribsSz > 0) {
@@ -13257,6 +15552,7 @@ int wc_PKCS7_EncodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* output,
     encryptedContent = (byte*)XMALLOC((word32)encryptedAllocSz, pkcs7->heap,
                                       DYNAMIC_TYPE_PKCS7);
     if (encryptedContent == NULL) {
+        ForceZero(plain, (word32)encryptedAllocSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         wc_PKCS7_FreeEncodedRecipientSet(pkcs7);
         XFREE(aadBuffer, pkcs7->heap, DYNAMIC_TYPE_TMP_BUFFER);
@@ -13270,6 +15566,7 @@ int wc_PKCS7_EncodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* output,
             (int)pkcs7->cekSz, nonce, (int)nonceSz, aadBuffer, aadBufferSz,
             authTag, sizeof(authTag), plain, encryptedOutSz, encryptedContent);
 
+    ForceZero(plain, (word32)encryptedAllocSz);
     XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
     plain = NULL;
 
@@ -13523,6 +15820,10 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
             }
             else {
                 XMEMSET(decryptedKey, 0, MAX_ENCRYPTED_KEY_SZ);
+            #ifdef WOLFSSL_CHECK_MEM_ZERO
+                wc_MemZero_Add("wc_PKCS7 decryptedKey", decryptedKey,
+                                MAX_ENCRYPTED_KEY_SZ);
+            #endif
             }
         #ifndef NO_PKCS7_STREAM
             pkcs7->stream->key = decryptedKey;
@@ -13658,6 +15959,11 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 break;
             }
             pkiMsgSz = (pkcs7->stream->length > 0)? pkcs7->stream->length: inSz;
+
+            /* Restore encOID across WANT_READ re-entries so the nonce
+             * length validation below always sees the content-cipher
+             * algorithm parsed in AUTHENV_3. */
+            wc_PKCS7_StreamGetVar(pkcs7, &encOID, &blockKeySz, NULL);
         #endif
             /* get length of optional parameter sequence */
             if (ret == 0 && GetLength(pkiMsg, &idx, &length, pkiMsgSz) < 0) {
@@ -13675,6 +15981,46 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 ret = ASN_PARSE_E;
             }
 
+            /* Enforce algorithm-specific nonce length bounds at the parser
+             * layer so malformed lengths (notably zero-length, which would
+             * catastrophically break AEAD uniqueness on HW backends that
+             * skip their own checks) cannot reach the cipher engine.
+             *   - AES-GCM in CMS: RFC 5084 Sec. 3.2 mandates a 12-octet IV.
+             *   - AES-CCM: RFC 3610 Sec. 2.3 requires 7..13 octets.
+             * Any other encOID here is a parser-state invariant violation. */
+            if (ret == 0) {
+                int nonceMin = 0, nonceMax = 0;
+                switch (encOID) {
+                #ifdef HAVE_AESGCM
+                    case AES128GCMb:
+                    case AES192GCMb:
+                    case AES256GCMb:
+                        nonceMin = GCM_NONCE_MID_SZ;
+                        nonceMax = GCM_NONCE_MID_SZ;
+                        break;
+                #endif
+                #ifdef HAVE_AESCCM
+                    case AES128CCMb:
+                    case AES192CCMb:
+                    case AES256CCMb:
+                        nonceMin = CCM_NONCE_MIN_SZ;
+                        nonceMax = CCM_NONCE_MAX_SZ;
+                        break;
+                #endif
+                    default:
+                        WOLFSSL_MSG(
+                            "AuthEnvelopedData unexpected content cipher");
+                        ret = ALGO_ID_E;
+                        break;
+                }
+                if (ret == 0 &&
+                        (nonceSz < nonceMin || nonceSz > nonceMax)) {
+                    WOLFSSL_MSG(
+                        "AuthEnvelopedData nonce length invalid for cipher");
+                    ret = ASN_PARSE_E;
+                }
+            }
+
             if (ret == 0) {
                 XMEMCPY(nonce, &pkiMsg[idx], (word32)nonceSz);
                 idx += (word32)nonceSz;
@@ -13682,6 +16028,10 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
 
             /* get mac size, also stored in OPTIONAL parameter of AlgoID */
             if (ret == 0 && GetMyVersion(pkiMsg, &idx, &macSz, pkiMsgSz) < 0) {
+                ret = ASN_PARSE_E;
+            }
+            if (ret == 0 && (macSz <= 0 || macSz > WC_AES_BLOCK_SIZE)) {
+                WOLFSSL_MSG("AuthEnvelopedData invalid MAC length");
                 ret = ASN_PARSE_E;
             }
 
@@ -13721,6 +16071,12 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 }
             }
 
+        #ifdef NO_PKCS7_STREAM
+            if (ret == 0 && encryptedContentSz > (int)(pkiMsgSz - idx)) {
+                ret = BUFFER_E;
+            }
+        #endif
+
             if (ret < 0)
                 break;
 
@@ -13729,7 +16085,8 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 break;
             }
 
-            /* store nonce for later */
+            /* store nonce and macSz for later */
+            pkcs7->stream->icvSz = (word32)macSz;
             if (nonceSz > 0) {
                 pkcs7->stream->nonceSz = (word32)nonceSz;
                 pkcs7->stream->nonce = (byte*)XMALLOC((word32)nonceSz,
@@ -13795,9 +16152,17 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
             }
 
             if (ret == 0) {
-                XMEMCPY(encryptedContent, &pkiMsg[idx],
+                word32 tmpSum;
+                if (!WC_SAFE_SUM_WORD32(idx, (word32)encryptedContentSz,
+                                        tmpSum) ||
+                    tmpSum > pkiMsgSz) {
+                    ret = BUFFER_E;
+                    break;
+                } else {
+                    XMEMCPY(encryptedContent, &pkiMsg[idx],
                                                     (word32)encryptedContentSz);
-                idx += (word32)encryptedContentSz;
+                    idx += (word32)encryptedContentSz;
+                }
             }
         #ifndef NO_PKCS7_STREAM
             pkcs7->stream->bufferPt = encryptedContent;
@@ -13813,7 +16178,16 @@ int wc_PKCS7_DecodeAuthEnvelopedData(wc_PKCS7* pkcs7, byte* in,
                 if (GetLength_ex(pkiMsg, &idx, &length, pkiMsgSz, 0) <= 0) {
                     ret = ASN_PARSE_E;
                 }
-            #ifndef NO_PKCS7_STREAM
+
+            #ifdef NO_PKCS7_STREAM
+                /* In non-streaming mode, validate authenticatedAttributes
+                 * length is within the input buffer. The streaming path
+                 * handles this via wc_PKCS7_AddDataToStream instead. */
+                if (ret == 0 &&
+                        (idx > pkiMsgSz || (word32)length > pkiMsgSz - idx)) {
+                    ret = ASN_PARSE_E;
+                }
+            #else
                 pkcs7->stream->expected = (word32)length;
             #endif
                 encodedAttribSz = (word32)length + (idx - encodedAttribIdx);
@@ -13920,12 +16294,22 @@ authenv_atrbend:
                 encodedAttribSz = pkcs7->stream->aadSz;
                 encodedAttribs  = pkcs7->stream->aad;
             }
+            macSz = (int)pkcs7->stream->icvSz;
         #endif
 
 
             localIdx = idx;
 
+        #ifdef NO_PKCS7_STREAM
+            if (ret == 0 && localIdx >= pkiMsgSz) {
+                ret = BUFFER_E;
+            }
+        #endif
+
             /* Get authTag OCTET STRING */
+            if (ret == 0 && localIdx >= pkiMsgSz) {
+                ret = BUFFER_E;
+            }
             if (ret == 0 && pkiMsg[localIdx] != ASN_OCTET_STRING) {
                 ret = ASN_PARSE_E;
             }
@@ -13936,6 +16320,34 @@ authenv_atrbend:
                 ret = ASN_PARSE_E;
             }
             authTagSz = (word32)length;
+            if (ret == 0 && authTagSz != (word32)macSz) {
+                WOLFSSL_MSG("AuthEnvelopedData authTag size mismatch");
+                ret = ASN_PARSE_E;
+            }
+            if (ret == 0 &&
+                    (encOID == AES128GCMb || encOID == AES192GCMb ||
+                     encOID == AES256GCMb)) {
+    #if (defined(HAVE_FIPS) && FIPS_VERSION3_LT(7,0,0)) || \
+        defined(HAVE_SELFTEST) || !defined(HAVE_AESGCM)
+                if (authTagSz < WOLFSSL_MIN_AUTH_TAG_SZ) {
+                    WOLFSSL_MSG("AuthEnvelopedData GCM authTag too small");
+                    ret = ASN_PARSE_E;
+                }
+    #else
+                ret = wc_local_AesGcmCheckTagSz(authTagSz);
+                if (ret != 0) {
+                    ret = ASN_PARSE_E;
+                    WOLFSSL_MSG("AuthEnvelopedData GCM authTag invalid size");
+                }
+    #endif
+            }
+            if (ret == 0 &&
+                    (encOID == AES128CCMb || encOID == AES192CCMb ||
+                     encOID == AES256CCMb) &&
+                     authTagSz < WOLFSSL_MIN_AUTH_TAG_SZ) {
+                WOLFSSL_MSG("AuthEnvelopedData CCM authTag too small");
+                ret = ASN_PARSE_E;
+            }
 
         #ifndef NO_PKCS7_STREAM
             /* there might not be enough data for the auth tag too */
@@ -13953,10 +16365,27 @@ authenv_atrbend:
         #endif
             idx = localIdx;
 
+        #ifdef NO_PKCS7_STREAM
+            if (ret == 0 && authTagSz > (word32)(pkiMsgSz - idx)) {
+                ret = BUFFER_E;
+            }
+        #endif
+
             if (ret == 0 && authTagSz > (word32)sizeof(authTag)) {
                 WOLFSSL_MSG("AuthEnvelopedData authTag too large for buffer");
                 ret = ASN_PARSE_E;
             }
+
+        #ifdef NO_PKCS7_STREAM
+            /* In the streaming build the block above re-buffers enough data for
+             * the auth tag. Without streaming, verify the tag fits within the
+             * provided input before copying. */
+            if (ret == 0 &&
+                    (idx > pkiMsgSz || authTagSz > pkiMsgSz - idx)) {
+                WOLFSSL_MSG("AuthEnvelopedData authTag exceeds input buffer");
+                ret = BUFFER_E;
+            }
+        #endif
 
             if (ret == 0) {
                 XMEMCPY(authTag, &pkiMsg[idx], authTagSz);
@@ -14042,8 +16471,12 @@ authenv_atrbend:
                     encryptedContent, encryptedContentSz, encryptedContent,
                     pkcs7->devId, pkcs7->heap);
             if (ret != 0) {
-                XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
-                return ret;
+                /* Fall through to the shared error handler below, which
+                 * ForceZeros and frees encryptedContent, nulls
+                 * stream->bufferPt/key, and resets the stream. Returning
+                 * here would leave a dangling stream->bufferPt and risk a
+                 * use-after-free / double-free on streaming re-entry. */
+                break;
             }
 
             if (encodedAttribs != NULL) {
@@ -14055,12 +16488,19 @@ authenv_atrbend:
             }
 
             /* copy plaintext to output */
+            if ((word32)encryptedContentSz > outputSz) {
+                ret = BUFFER_E;
+                break;
+            }
             XMEMCPY(output, encryptedContent, (word32)encryptedContentSz);
 
             /* free memory, zero out keys */
             ForceZero(encryptedContent, (word32)encryptedContentSz);
             XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
             encryptedContent = NULL;
+        #ifndef NO_PKCS7_STREAM
+            pkcs7->stream->bufferPt = NULL;
+        #endif
             ForceZero(decryptedKey, MAX_ENCRYPTED_KEY_SZ);
             XFREE(decryptedKey, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
             decryptedKey = NULL;
@@ -14220,6 +16660,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     ret = wc_PKCS7_PadData(pkcs7->content, pkcs7->contentSz, plain,
                            (word32)encryptedOutSz, (word32)blockSz);
     if (ret < 0) {
+        ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
     }
@@ -14227,6 +16668,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     encryptedContent = (byte*)XMALLOC((word32)encryptedOutSz, pkcs7->heap,
                                       DYNAMIC_TYPE_PKCS7);
     if (encryptedContent == NULL) {
+        ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return MEMORY_E;
     }
@@ -14240,6 +16682,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
                                  oidBlkType, ivOctetStringSz + blockSz);
     if (contentEncAlgoSz == 0) {
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return BAD_FUNC_ARG;
     }
@@ -14249,6 +16692,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     ret = wc_PKCS7_GenerateBlock(pkcs7, NULL, tmpIv, (word32)blockSz);
     if (ret != 0) {
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
     }
@@ -14258,6 +16702,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
             NULL, 0, NULL, 0, plain, encryptedOutSz, encryptedContent);
     if (ret != 0) {
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return ret;
     }
@@ -14275,6 +16720,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
 
         if (pkcs7->unprotectedAttribs == NULL) {
             XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            ForceZero(plain, (word32)encryptedOutSz);
             XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
             return BAD_FUNC_ARG;
         }
@@ -14284,15 +16730,24 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
                 pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         if (attribs == NULL) {
             XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            ForceZero(plain, (word32)encryptedOutSz);
             XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
             return MEMORY_E;
         }
 
         attribsCount = pkcs7->unprotectedAttribsSz;
-        attribsSz = (word32)EncodeAttributes(attribs,
+        ret = EncodeAttributes(attribs,
                                      (int)pkcs7->unprotectedAttribsSz,
                                      pkcs7->unprotectedAttribs,
                                      (int)pkcs7->unprotectedAttribsSz);
+        if (ret < 0) {
+            XFREE(attribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            ForceZero(plain, (word32)encryptedOutSz);
+            XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+            return ret;
+        }
+        attribsSz = (word32)ret;
 
         if (attribsSz > 0) {
             flatAttribs = (byte*)XMALLOC(attribsSz, pkcs7->heap,
@@ -14300,6 +16755,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
             if (flatAttribs == NULL) {
                 XFREE(attribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(plain, (word32)encryptedOutSz);
                 XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return MEMORY_E;
             }
@@ -14309,6 +16765,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
             if (ret != 0) {
                 XFREE(attribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                ForceZero(plain, (word32)encryptedOutSz);
                 XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 XFREE(flatAttribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 return ret;
@@ -14349,6 +16806,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
         XFREE(attribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(flatAttribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+        ForceZero(plain, (word32)encryptedOutSz);
         XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
         return BUFFER_E;
     }
@@ -14390,6 +16848,7 @@ int wc_PKCS7_EncodeEncryptedData(wc_PKCS7* pkcs7, byte* output, word32 outputSz)
     XFREE(attribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
     XFREE(flatAttribs, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
     XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+    ForceZero(plain, (word32)encryptedOutSz);
     XFREE(plain, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
 
     return idx;
@@ -14454,6 +16913,8 @@ int wc_PKCS7_DecodeEncryptedData(wc_PKCS7* pkcs7, byte* in, word32 inSz,
     byte* pkiMsg = in;
     word32 pkiMsgSz = inSz;
     byte  tag = 0;
+    byte padCheck = 0;
+    int padIndex;
 
     if (pkcs7 == NULL ||
             ((pkcs7->encryptionKey == NULL || pkcs7->encryptionKeySz == 0) &&
@@ -14663,6 +17124,12 @@ int wc_PKCS7_DecodeEncryptedData(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                         pkiMsgSz, NO_USER_CHECK) <= 0)
                 ret = ASN_PARSE_E;
 
+#ifdef NO_PKCS7_STREAM
+            if (ret == 0 && encryptedContentSz > (int)(pkiMsgSz - idx)) {
+                ret = BUFFER_E;
+            }
+#endif
+
             if (ret < 0)
                 break;
 #ifndef NO_PKCS7_STREAM
@@ -14700,7 +17167,8 @@ int wc_PKCS7_DecodeEncryptedData(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             version    = (int)pkcs7->stream->vers;
             tmpIv      = pkcs7->stream->tmpIv;
 #endif
-            if (encryptedContentSz <= 0) {
+            if (encryptedContentSz <= 0 ||
+                    encryptedContentSz > (int)(pkiMsgSz - idx)) {
                 ret = BUFFER_E;
                 break;
             }
@@ -14713,16 +17181,22 @@ int wc_PKCS7_DecodeEncryptedData(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             }
 
             if (ret == 0) {
-                XMEMCPY(encryptedContent, &pkiMsg[idx],
-                    (unsigned int)encryptedContentSz);
-                idx += (word32)encryptedContentSz;
+                word32 tmpSum;
+                if (!WC_SAFE_SUM_WORD32(idx, (word32)encryptedContentSz, tmpSum) ||
+                    tmpSum > pkiMsgSz) {
+                    ret = BUFFER_E;
+                } else {
+                    XMEMCPY(encryptedContent, &pkiMsg[idx],
+                        (unsigned int)encryptedContentSz);
+                    idx += (word32)encryptedContentSz;
 
-                /* decrypt encryptedContent */
-                ret = wc_PKCS7_DecryptContent(pkcs7, encOID,
-                              pkcs7->encryptionKey, pkcs7->encryptionKeySz,
-                              tmpIv, expBlockSz, NULL, 0, NULL, 0,
-                              encryptedContent, encryptedContentSz,
-                              encryptedContent, pkcs7->devId, pkcs7->heap);
+                    /* decrypt encryptedContent */
+                    ret = wc_PKCS7_DecryptContent(pkcs7, encOID,
+                                pkcs7->encryptionKey, pkcs7->encryptionKeySz,
+                                tmpIv, expBlockSz, NULL, 0, NULL, 0,
+                                encryptedContent, encryptedContentSz,
+                                encryptedContent, pkcs7->devId, pkcs7->heap);
+                }
                 if (ret != 0) {
                     XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                 }
@@ -14731,14 +17205,31 @@ int wc_PKCS7_DecodeEncryptedData(wc_PKCS7* pkcs7, byte* in, word32 inSz,
             if (ret == 0) {
                 padLen = encryptedContent[encryptedContentSz-1];
 
-                if (padLen > encryptedContentSz) {
-                    WOLFSSL_MSG("Bad padding size found");
+                /* Constant-time padding check */
+                padCheck |= ctMaskEq(padLen, 0);
+                padCheck |= ctMaskGT(padLen, expBlockSz);
+                padCheck |= ctMaskGT(padLen, encryptedContentSz);
+                padCheck |= ctMaskGT(expBlockSz, encryptedContentSz);
+                for (padIndex = encryptedContentSz < expBlockSz ? 0 :
+                         encryptedContentSz - expBlockSz;
+                     padIndex < encryptedContentSz; padIndex++) {
+                    byte inPad = ctMaskGTE(padIndex,
+                                           encryptedContentSz - (int)padLen);
+                    padCheck |= inPad & (encryptedContent[padIndex] ^ padLen);
+                }
+                if (padCheck != 0) {
+                    WOLFSSL_MSG("Bad padding bytes found");
                     ret = BUFFER_E;
                     XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
                     break;
                 }
 
                 /* copy plaintext to output */
+                if ((word32)(encryptedContentSz - padLen) > outputSz) {
+                    XFREE(encryptedContent, pkcs7->heap, DYNAMIC_TYPE_PKCS7);
+                    ret = BUFFER_E;
+                    break;
+                }
                 XMEMCPY(output, encryptedContent,
                     (unsigned int)(encryptedContentSz - padLen));
 

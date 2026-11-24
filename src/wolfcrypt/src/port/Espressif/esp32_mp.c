@@ -1,6 +1,6 @@
 /* esp32_mp.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -567,12 +567,10 @@ static int esp_mp_hw_unlock(void)
          * This releases the RSA Accelerator from reset.*/
         portENTER_CRITICAL_SAFE(&wc_rsa_reg_lock);
         {
-            DPORT_REG_CLR_BIT(
-                 (volatile void *)(DR_REG_RSA_BASE + SYSTEM_CRYPTO_RSA_CLK_EN),
-                                   SYSTEM_PERIP_CLK_EN1_REG);
-            DPORT_REG_SET_BIT(
-                (volatile void *)(DR_REG_RSA_BASE + SYSTEM_RSA_MEM_PD),
-                                  SYSTEM_RSA_PD_CTRL_REG);
+            DPORT_REG_CLR_BIT((volatile void *)(SYSTEM_PERIP_CLK_EN1_REG),
+                              SYSTEM_CRYPTO_RSA_CLK_EN);
+            DPORT_REG_SET_BIT((volatile void *)(SYSTEM_RSA_PD_CTRL_REG),
+                              SYSTEM_RSA_MEM_PD);
         }
         portEXIT_CRITICAL_SAFE(&wc_rsa_reg_lock);
 #elif defined(CONFIG_IDF_TARGET_ESP32C6)
@@ -2249,6 +2247,9 @@ int esp_mp_mulmod(MATH_INT_T* X, MATH_INT_T* Y, MATH_INT_T* M, MATH_INT_T* Z)
     #ifdef WOLFSSL_DEBUG_ESP_HW_MOD_RSAMAX_BITS
             ESP_LOGW(TAG, "result exceeds max bit length");
     #endif
+            if (mulmod_lock_called) {
+                esp_mp_hw_unlock();
+            }
             return MP_HW_FALLBACK; /*  Error: value is not able to be used. */
         }
         WordsForOperand = bits2words(OperandBits);
@@ -2343,7 +2344,7 @@ int esp_mp_mulmod(MATH_INT_T* X, MATH_INT_T* Y, MATH_INT_T* M, MATH_INT_T* Z)
                            OperandBits, ESP_HW_MOD_RSAMAX_BITS);
     #endif
             if (mulmod_lock_called) {
-                ret = esp_mp_hw_unlock();
+                esp_mp_hw_unlock();
             }
             return MP_HW_FALLBACK; /*  Error: value is not able to be used. */
         }
@@ -2440,6 +2441,9 @@ int esp_mp_mulmod(MATH_INT_T* X, MATH_INT_T* Y, MATH_INT_T* M, MATH_INT_T* Z)
             ESP_LOGW(TAG, "mp_mulmod OperandBits %d exceeds max bit length %d.",
                            OperandBits, ESP_HW_MOD_RSAMAX_BITS);
     #endif
+            if (mulmod_lock_called) {
+                esp_mp_hw_unlock();
+            }
             return MP_HW_FALLBACK; /*  Error: value is not able to be used. */
         }
         WordsForOperand = bits2words(OperandBits);

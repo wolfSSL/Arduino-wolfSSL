@@ -1,6 +1,6 @@
 /* eccsi.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -36,17 +36,12 @@
     #include <wolfssl/wolfcrypt/sp.h>
 #endif
 
-#if defined(WOLFSSL_USE_SAVE_VECTOR_REGISTERS) && !defined(WOLFSSL_SP_ASM)
-    /* force off unneeded vector register save/restore. */
-    #undef SAVE_VECTOR_REGISTERS
-    #define SAVE_VECTOR_REGISTERS(fail_clause) SAVE_NO_VECTOR_REGISTERS(fail_clause)
-    #undef RESTORE_VECTOR_REGISTERS
-    #define RESTORE_VECTOR_REGISTERS() RESTORE_NO_VECTOR_REGISTERS()
-#endif
-
 #ifndef WOLFSSL_HAVE_ECC_KEY_GET_PRIV
     /* FIPS build has replaced ecc.h. */
-    #define wc_ecc_key_get_priv(key) (&((key)->k))
+    #define wc_ecc_key_get_priv(key)  (&((key)->k))
+    #define ecc_get_k_raw(key)        (&((key)->k))
+    #define ecc_blind_k_rng(key, rng) 0
+    #define ecc_forcezero_k(key)      mp_forcezero(&((key)->k))
     #define WOLFSSL_HAVE_ECC_KEY_GET_PRIV
 #endif
 
@@ -68,8 +63,6 @@ int wc_InitEccsiKey_ex(EccsiKey* key, int keySz, int curveId, void* heap,
         int devId)
 {
     int err = 0;
-    ecc_key* ecc = NULL;
-    ecc_key* pubkey = NULL;
     EccsiKeyParams* params = NULL;
 
     if (key == NULL) {
@@ -84,7 +77,6 @@ int wc_InitEccsiKey_ex(EccsiKey* key, int keySz, int curveId, void* heap,
         err = wc_ecc_init_ex(&key->ecc, heap, devId);
     }
     if (err == 0) {
-        ecc = &key->ecc;
         err = wc_ecc_init_ex(&key->pubkey, heap, devId);
     }
     if (err == 0) {
@@ -94,7 +86,6 @@ int wc_InitEccsiKey_ex(EccsiKey* key, int keySz, int curveId, void* heap,
         }
     }
     if (err == 0) {
-        pubkey = &key->pubkey;
         err = mp_init_multi(&params->order,
 #ifdef WOLFCRYPT_ECCSI_CLIENT
                 &params->a, &params->b, &params->prime, &key->tmp, &key->ssk
@@ -111,8 +102,7 @@ int wc_InitEccsiKey_ex(EccsiKey* key, int keySz, int curveId, void* heap,
     }
 
     if (err != 0) {
-        wc_ecc_free(pubkey);
-        wc_ecc_free(ecc);
+        wc_FreeEccsiKey(key);
     }
 
     return err;
@@ -477,6 +467,14 @@ int wc_MakeEccsiKey(EccsiKey* key, WC_RNG* rng)
     if (err == 0) {
         err = wc_ecc_make_key_ex(rng, key->ecc.dp->size, &key->ecc,
                 key->ecc.dp->id);
+#ifdef WOLFSSL_ASYNC_CRYPT
+        /* ECCSI has no asynchronous API, so the caller cannot resume a pending
+         * key generation - complete it here. The key->pubkey sites in
+         * eccsi_make_pair() and eccsi_gen_sig() need no wait: each is preceded
+         * by wc_ecc_free(&key->pubkey), which clears the marker that
+         * _ecc_make_key_ex() gates its pending path on. */
+        err = wc_AsyncWait(err, &key->ecc.asyncDev, WC_ASYNC_FLAG_NONE);
+#endif
     }
 
     return err;
@@ -684,8 +682,11 @@ static int eccsi_decode_key(EccsiKey* key, const byte* data)
     int err;
 
     /* Read the secret value from key size bytes. */
-    err = mp_read_unsigned_bin(wc_ecc_key_get_priv(&key->ecc), data,
+    err = mp_read_unsigned_bin(ecc_get_k_raw(&key->ecc), data,
         (word32)key->ecc.dp->size);
+    if (err == 0) {
+        err = ecc_blind_k_rng(&key->ecc, NULL);
+    }
     if (err == 0) {
         data += key->ecc.dp->size;
         /* Read public key. */
@@ -814,8 +815,11 @@ int wc_ImportEccsiPrivateKey(EccsiKey* key, const byte* data, word32 sz)
     }
 
     if (err == 0) {
-        err = mp_read_unsigned_bin(wc_ecc_key_get_priv(&key->ecc), data,
+        err = mp_read_unsigned_bin(ecc_get_k_raw(&key->ecc), data,
             (word32)key->ecc.dp->size);
+    }
+    if (err == 0) {
+        err = ecc_blind_k_rng(&key->ecc, NULL);
     }
 
     return err;
@@ -931,7 +935,7 @@ static int eccsi_make_pair(EccsiKey* key, WC_RNG* rng,
     /* Step 5: ensure SSK and HS are non-zero (code lines above) */
 
     /* Step 6: Copy out SSK (done during calc) and PVT. Erase v */
-    mp_forcezero(wc_ecc_key_get_priv(&key->pubkey));
+    ecc_forcezero_k(&key->pubkey);
 
     return err;
 }
@@ -1512,8 +1516,6 @@ int wc_ValidateEccsiPair(EccsiKey* key, enum wc_HashType hashType,
     if (err != 0)
         return err;
 
-    SAVE_VECTOR_REGISTERS(return _svr_ret;);
-
     params = &key->params;
     hs = &key->tmp;
     res = &key->pubkey.pubkey;
@@ -1567,8 +1569,6 @@ int wc_ValidateEccsiPair(EccsiKey* key, enum wc_HashType hashType,
             *valid = (wc_ecc_cmp_point(res, kpak) == MP_EQ);
         }
     }
-
-    RESTORE_VECTOR_REGISTERS();
 
     return err;
 }
@@ -2019,10 +2019,10 @@ int wc_SignEccsiHash(EccsiKey* key, WC_RNG* rng, enum wc_HashType hashType,
     if (err == 0) {
         j = wc_ecc_key_get_priv(&key->pubkey);
         err = mp_mulmod(s, j, &key->params.order, s);
+        /* Erase j on the failure path too. */
+        ecc_forcezero_k(&key->pubkey);
     }
     if (err == 0) {
-        mp_forcezero(j);
-
         /* Step 6: s = s' fitted */
         err = eccsi_fit_to_octets(s, &key->params.order, (int)sz, s);
     }
@@ -2119,17 +2119,20 @@ static int eccsi_calc_y(EccsiKey* key, ecc_point* pvt, mp_digit mp,
         ecc_point* y)
 {
     int err;
-    mp_int* hs = &key->ssk;
+    mp_int* hs = &key->tmp;
 
-    err = mp_read_unsigned_bin(hs, key->idHash, key->idHashSz);
 #ifndef WOLFSSL_HAVE_SP_ECC
+    err = eccsi_kpak_to_mont(key);
     /* Need KPAK in montgomery form. */
     if (err == 0) {
-        err = eccsi_kpak_to_mont(key);
+        err = mp_read_unsigned_bin(hs, key->idHash, key->idHashSz);
     }
+#else
+    err = mp_read_unsigned_bin(hs, key->idHash, key->idHashSz);
 #endif
-    /* [HS]PVT + KPAK */
-    if (err == 0) {
+    if (err == 0)
+    {
+        /* [HS]PVT + KPAK */
         ecc_point* kpak = &key->ecc.pubkey;
         err = eccsi_mulmod_point_add(key, hs, pvt, kpak, y, mp, 1);
     }
@@ -2163,6 +2166,18 @@ static int eccsi_calc_j(EccsiKey* key, const mp_int* hem, const byte* sig,
     err = eccsi_mulmod_base_add(key, hem, y, j, mp, 1);
     if (err == 0) {
         err = eccsi_decode_sig_s(key, sig, sigSz, s);
+    }
+    /* Validate s is in [1, q-1]: reject zero or out-of-range second signature
+     * component.  With s=0, [s](...) yields the point at infinity whose
+     * affine x-coordinate is 0, making the final mp_cmp(0,0) accept any
+     * forged signature. */
+    if (err == 0) {
+        if (mp_iszero(s)) {
+            err = MP_ZERO_E;
+        }
+        else if (mp_cmp(s, &key->params.order) != MP_LT) {
+            err = ECC_OUT_OF_RANGE_E;
+        }
     }
     /* [s]( [HE]G + [r]Y ) */
     if (err == 0) {
@@ -2224,8 +2239,6 @@ int wc_VerifyEccsiHash(EccsiKey* key, enum wc_HashType hashType,
     if (err != 0)
         return err;
 
-    SAVE_VECTOR_REGISTERS(return _svr_ret;);
-
     /* Decode the signature into components. */
     r = wc_ecc_key_get_priv(&key->pubkey);
     pvt = &key->pubkey.pubkey;
@@ -2241,6 +2254,19 @@ int wc_VerifyEccsiHash(EccsiKey* key, enum wc_HashType hashType,
     if (err == 0) {
         params = &key->params;
         err = mp_montgomery_setup(&params->prime, &mp);
+    }
+
+    /* Validate r is in [1, q-1]: reject zero or out-of-range first signature
+     * component before any scalar multiplication takes place.
+     * Without this check, r=0 causes J_x=0 and the final mp_cmp(0,0)==MP_EQ
+     * comparison accepts the forged signature unconditionally. */
+    if (err == 0) {
+        if (mp_iszero(r)) {
+            err = MP_ZERO_E;
+        }
+        else if (mp_cmp(r, &params->order) != MP_LT) {
+            err = ECC_OUT_OF_RANGE_E;
+        }
     }
 
     /* Step 1: Validate PVT is on curve */
@@ -2278,6 +2304,16 @@ int wc_VerifyEccsiHash(EccsiKey* key, enum wc_HashType hashType,
         key->params.haveBase = 0;
     }
 
+    /* Defense-in-depth: reject J = point at infinity before the final
+     * comparison. Catches any future path that might reach this point
+     * with a neutral-element result (e.g. s = 0 mod q for a non-zero
+     * encoded s). */
+    if (err == 0) {
+        if (wc_ecc_point_is_at_infinity(j)) {
+            err = ECC_INF_E;
+        }
+    }
+
     /* Step 6: Jx fitting, compare with r */
     if (err == 0) {
         jx = &key->tmp;
@@ -2287,8 +2323,6 @@ int wc_VerifyEccsiHash(EccsiKey* key, enum wc_HashType hashType,
     if (verified != NULL) {
         *verified = ((err == 0) && (mp_cmp(jx, r) == MP_EQ));
     }
-
-    RESTORE_VECTOR_REGISTERS();
 
     return err;
 }

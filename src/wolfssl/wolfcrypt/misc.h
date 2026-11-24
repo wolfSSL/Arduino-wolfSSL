@@ -1,6 +1,6 @@
 /* misc.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -56,6 +56,15 @@ word32 ByteReverseWord32(word32 value);
 WOLFSSL_LOCAL
 void   ByteReverseWords(word32* out, const word32* in, word32 byteCount);
 
+#ifdef WOLFSSL_WIDE_BYTE
+WOLFSSL_LOCAL
+void WordsFromBytesBE32(word32* w, const byte* b, word32 wordCnt);
+WOLFSSL_LOCAL
+void BytesFromWordsBE32(byte* b, const word32* w, word32 byteCnt);
+WOLFSSL_LOCAL
+void BytesFromWordsLE32(byte* b, const word32* w, word32 byteCnt);
+#endif
+
 WOLFSSL_LOCAL
 void XorWordsOut(wolfssl_word** r, const wolfssl_word** a,
         const wolfssl_word** b, word32 n);
@@ -72,6 +81,10 @@ void ForceZero(void* mem, size_t len);
 WOLFSSL_LOCAL
 int ConstantCompare(const byte* a, const byte* b, int length);
 
+WOLFSSL_LOCAL
+word16 readUnalignedWord16(const byte *in);
+WOLFSSL_LOCAL
+word16 writeUnalignedWord16(void *out, word16 in);
 WOLFSSL_LOCAL
 word32 readUnalignedWord32(const byte *in);
 WOLFSSL_LOCAL
@@ -99,6 +112,12 @@ WOLFSSL_LOCAL
 word64 ByteReverseWord64(word64 value);
 WOLFSSL_LOCAL
 void   ByteReverseWords64(word64* out, const word64* in, word32 byteCount);
+#ifdef WOLFSSL_WIDE_BYTE
+WOLFSSL_LOCAL
+void WordsFromBytesBE64(word64* w, const byte* b, word32 wordCnt);
+WOLFSSL_LOCAL
+void BytesFromWordsBE64(byte* b, const word64* w, word32 byteCnt);
+#endif
 #endif /* WORD64_AVAILABLE */
 
 #ifndef WOLFSSL_HAVE_MIN
@@ -151,6 +170,9 @@ WOLFSSL_LOCAL int  ctMaskSelInt(byte m, int a, int b);
 WOLFSSL_LOCAL word32 ctMaskSelWord32(byte m, word32 a, word32 b);
 WOLFSSL_LOCAL byte ctSetLTE(int a, int b);
 WOLFSSL_LOCAL void ctMaskCopy(byte mask, byte* dst, byte* src, word16 size);
+#ifdef WC_NO_PTR_INT_CAST
+WOLFSSL_LOCAL void* ctMaskSelPtr(byte mask, void* a, void* b);
+#endif
 WOLFSSL_LOCAL word32 MakeWordFromHash(const byte* hashID);
 WOLFSSL_LOCAL word32 HashObject(const byte* o, word32 len, int* error);
 WOLFSSL_LOCAL char* CopyString(const char* src, int srcLen, void* heap,

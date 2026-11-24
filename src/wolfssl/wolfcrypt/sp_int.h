@@ -1,6 +1,6 @@
 /* sp_int.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -58,8 +58,17 @@ extern "C" {
 
     typedef unsigned char sp_uint7;
     typedef          char  sp_int7;
+#elif UCHAR_MAX == 65535
+    /* CHAR_BIT == 16 (e.g. TI C28x): the smallest addressable type is 16-bit,
+     * so there is no native 8-bit type.  An "8-bit" SP value is a 16-bit char
+     * cell holding an octet (0..255); byte I/O masks to an octet (the same
+     * CHAR_BIT!=8 handling used elsewhere - see WOLFSSL_WIDE_BYTE). */
+    #define SP_UCHAR_BITS    16
+
+    typedef unsigned char sp_uint8;
+    typedef          char  sp_int8;
 #else
-    #error "Size of unsigned short not detected"
+    #error "Size of unsigned char not detected"
 #endif
 
 #if USHRT_MAX == 65535
@@ -195,7 +204,8 @@ extern "C" {
 #if !defined(WOLFSSL_SP_ASM) && ( \
       defined(WOLFSSL_SP_X86_64_ASM) || defined(WOLFSSL_SP_ARM32_ASM) || \
       defined(WOLFSSL_SP_ARM64_ASM)  || defined(WOLFSSL_SP_ARM_THUMB_ASM) || \
-      defined(WOLFSSL_SP_ARM_CORTEX_M_ASM))
+      defined(WOLFSSL_SP_ARM_CORTEX_M_ASM) || \
+      defined(WOLFSSL_SP_RISCV64_ASM))
     #define WOLFSSL_SP_ASM
 #endif
 
@@ -241,7 +251,7 @@ extern "C" {
     #define SP_WORD_SIZE 64
 #elif defined(WOLFSSL_SP_RISCV32)
     #define SP_WORD_SIZE 32
-#elif defined(WOLFSSL_SP_RISCV64)
+#elif defined(WOLFSSL_SP_RISCV64_ASM) || defined(WOLFSSL_SP_RISCV64)
     #define SP_WORD_SIZE 64
 #elif defined(WOLFSSL_SP_S390X)
     #define SP_WORD_SIZE 64
@@ -395,11 +405,53 @@ typedef struct sp_ecc_ctx {
     XALIGNED(4) byte data[66*80]; /* stack data */
     #elif defined(WOLFSSL_SP_384)
     XALIGNED(4) byte data[48*80]; /* stack data */
+    #elif SP_WORD_SIZE == 64
+    /* C64 P-256 sp_ecc_verify_256_ctx is 2640 bytes */
+    XALIGNED(4) byte data[32*84]; /* stack data */
     #else
     XALIGNED(4) byte data[32*80]; /* stack data */
     #endif
 } sp_ecc_ctx_t;
 #endif
+
+#if defined(WOLFSSL_SP_NONBLOCK) && \
+    (defined(WOLFSSL_HAVE_SP_RSA) || defined(WOLFSSL_HAVE_SP_DH))
+/* Non-blocking RSA / DH operation contexts. The wrapper state struct
+ * embeds the inner modexp ctx (which dominates the size) plus per-op
+ * buffers for the modulus, base/result, and exponent. Sized for the
+ * worst-case wrapper across C32/C64 word layouts at the largest
+ * enabled key size:
+ *   2048-bit: mod_exp td[3*144]*4 = 1728B + wrapper ~= 2960B
+ *   3072-bit: mod_exp td[3*216]*4 = 2592B + wrapper ~= 4400B
+ *   4096-bit: mod_exp td[3*284]*4 = 3408B + wrapper ~= 5760B
+ * Each tier carries a small safety margin for alignment / future
+ * generator changes. The compile-time ctx_size_test inside each
+ * sp_<size>_<op>_<words>_nb function asserts the buffer fits the
+ * generated wrapper. */
+#if defined(WOLFSSL_HAVE_SP_RSA) && !defined(NO_RSA)
+typedef struct sp_rsa_ctx {
+    #ifdef WOLFSSL_SP_4096
+    XALIGNED(8) byte data[6144];
+    #elif !defined(WOLFSSL_SP_NO_3072)
+    XALIGNED(8) byte data[4608];
+    #else
+    XALIGNED(8) byte data[3072];
+    #endif
+} sp_rsa_ctx_t;
+#endif
+
+#if defined(WOLFSSL_HAVE_SP_DH) && !defined(NO_DH)
+typedef struct sp_dh_ctx {
+    #ifdef WOLFSSL_SP_4096
+    XALIGNED(8) byte data[6144];
+    #elif !defined(WOLFSSL_SP_NO_3072)
+    XALIGNED(8) byte data[4608];
+    #else
+    XALIGNED(8) byte data[3072];
+    #endif
+} sp_dh_ctx_t;
+#endif
+#endif /* WOLFSSL_SP_NONBLOCK && (WOLFSSL_HAVE_SP_RSA || WOLFSSL_HAVE_SP_DH) */
 
 #if defined(WOLFSSL_SP_MATH) || defined(WOLFSSL_SP_MATH_ALL)
 #include <wolfssl/wolfcrypt/random.h>
@@ -414,9 +466,10 @@ typedef struct sp_ecc_ctx {
         #ifdef WOLFSSL_MYSQL_COMPATIBLE
             /* MySQL wants to be able to use 8192-bit numbers. */
             #define SP_INT_BITS     8192
-        #elif !defined(WOLFSSL_HAVE_SP_RSA) && !defined(WOLFSSL_HAVE_SP_DH) && \
-            !defined(WOLFSSL_HAVE_SP_ECC)
-            /* Not using SP - must be SP math all. */
+        #elif defined(WOLFSSL_SP_MATH_ALL) || \
+              (!defined(WOLFSSL_HAVE_SP_RSA) && \
+               !defined(WOLFSSL_HAVE_SP_DH) && !defined(WOLFSSL_HAVE_SP_ECC))
+            /* Using multi-precision implementation. */
             #if !defined(NO_RSA) || !defined(NO_DH) || !defined(NO_DSA)
                 /* Support max size FFHDE parameters compiled in. */
                 #if !defined(NO_DH) && defined(HAVE_FFDHE_8192)
@@ -426,8 +479,14 @@ typedef struct sp_ecc_ctx {
                 #elif !defined(NO_DH) && defined(HAVE_FFDHE_4096)
                     #define SP_INT_BITS     4096
                 #else
-                    /* Default to max 3072 for general RSA and DH. */
-                    #define SP_INT_BITS     3072
+                    /* No FFDHE parameters that big, but WOLFSSL_SP_4096 is
+                     * set when 4096 bit RSA/DH is wanted. */
+                    #ifdef WOLFSSL_SP_4096
+                        #define SP_INT_BITS 4096
+                    #else
+                        /* Default to max 3072 for general RSA and DH. */
+                        #define SP_INT_BITS 3072
+                    #endif
                 #endif
             #elif defined(WOLFCRYPT_HAVE_SAKKE)
                 #define SP_INT_BITS     1024
@@ -799,6 +858,17 @@ typedef struct sp_ecc_ctx {
 #define MP_BITS_CNT(bits)                                       \
         ((unsigned int)(((((bits) + SP_WORD_SIZE - 1) / SP_WORD_SIZE) * 2 + 1)))
 
+/* True when 'bits' would require more digit storage than 'max'.
+ *
+ * Pairs with DECL_MP_INT_SIZE_DYN(name, bits, max) to guard against the
+ * static buffer (sized for 'max' digits) being undersized for 'bits' when
+ * the caller's 'bits' value can carry digit/byte alignment slack
+ * (e.g. mp_bitsused() returns used*SP_WORD_SIZE; dp->size*8 rounds up to a
+ * full byte).  Compare digit-rounded counts so curves like P-521 (521 bits,
+ * 17 32-bit digits) are not falsely rejected when max == 521. */
+#define MP_BITS_OVER_MAX(bits, max) \
+    (MP_BITS_CNT(bits) > MP_BITS_CNT(max))
+
 #if !defined(WOLFSSL_SP_NO_DYN_STACK) && defined(__STDC_VERSION__) && \
              (__STDC_VERSION__ >= 199901L) &&                         \
     (defined(WOLFSSL_SP_NO_MALLOC) ||                                 \
@@ -856,9 +926,13 @@ while (0)
 #define DECL_MP_INT_SIZE(name, bits)                               \
     sp_int_digit name##d[MP_INT_SIZEOF_DIGITS(MP_BITS_CNT(bits))]; \
     sp_int* (name) = (sp_int*)name##d
-/* Zero out mp_int of minimal size. */
+/* Bytes to zero for a static mp_int: min(requested bits size, declared buffer). */
+#define MP_INT_ZERO_SIZE(name, bits)                                          \
+    ((sizeof(name##d) < MP_INT_SIZEOF(MP_BITS_CNT(bits))) ?                  \
+        sizeof(name##d) : MP_INT_SIZEOF(MP_BITS_CNT(bits)))
+/* Zero out mp_int without clearing more than the declared digit buffer. */
 #define NEW_MP_INT_SIZE(name, bits, heap, type) \
-    XMEMSET(name, 0, MP_INT_SIZEOF(MP_BITS_CNT(bits)))
+    XMEMSET((name), 0, MP_INT_ZERO_SIZE(name, bits))
 /* Dispose of static mp_int. */
 #define FREE_MP_INT_SIZE(name, heap, type) WC_DO_NOTHING
 /* Type to force compiler to not complain about size. */

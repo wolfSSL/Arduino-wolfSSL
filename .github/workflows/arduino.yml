@@ -38,7 +38,7 @@ name: Arduino CI Build (4 of 4) Arduino-wolfSSL
 #
 # To test locally:
 # cd [your WOLFSSL_ROOT], e.g. cd /mnt/c/workspace/wolfssl-$USER
-# [optional checkout]     e.g. git checkout tags/v5.8.4-stable
+# [optional checkout]     e.g. git checkout tags/v5.9.4-stable
 # pushd ./IDE/ARDUINO
 # export ARDUINO_ROOT="$HOME/Arduino/libraries"
 # ./wolfssl-arduino.sh INSTALL

@@ -1,6 +1,6 @@
 /* pkcs7.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -63,6 +63,15 @@
     #define MAX_ORI_VALUE_SZ 512
 #endif
 
+/* Bound on the number of signed attributes the encoder can place in a
+ * SignedData SignerInfo without a heap allocation. At encode time the working
+ * attribute array is sized to the actual attribute count (user-supplied
+ * attributes plus up to three CMS auto-defaults: contentType, messageDigest,
+ * signingTime); counts up to this bound use an inline buffer, and only larger
+ * counts fall back to a heap allocation (or fail under WOLFSSL_NO_MALLOC).
+ * The macro therefore no longer caps the attribute count, but it does set the
+ * size of that inline working buffer (in the transient encode-time ESD
+ * structure, not in wc_PKCS7), so raising it increases that buffer. */
 #ifndef MAX_SIGNED_ATTRIBS_SZ
     #define MAX_SIGNED_ATTRIBS_SZ 7
 #endif
@@ -175,6 +184,22 @@ typedef struct PKCS7Attrib {
 } PKCS7Attrib;
 
 
+/* A single decoded signed/unsigned attribute, as produced when verifying a
+ * SignedData. The fields follow a stable, guaranteed shape:
+ *
+ *   oid, oidSz:
+ *       The attribute OID, encoded as <tag><len><content> (the full OBJECT
+ *       IDENTIFIER TLV).
+ *
+ *   value, valueSz:
+ *       The contents of the SET OF AttributeValue, i.e. the bytes inside the
+ *       attribute's SET with the outer SET (tag 0x31) and its length removed.
+ *       A CMS attribute is a SET OF AttributeValue and may legitimately carry
+ *       more than one value, so this is the concatenation of all AttributeValue
+ *       TLVs. For the common single-valued case it is exactly one AttributeValue
+ *       encoded as <tag><len><content> (for example 0x13 PrintableString or
+ *       0x04 OCTET STRING).
+ */
 typedef struct PKCS7DecodedAttrib {
     struct PKCS7DecodedAttrib* next;
     byte* oid;
@@ -224,6 +249,14 @@ typedef int (*CallbackStreamOut)(wc_PKCS7* pkcs7, const byte* output,
 #if defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA)
 /* RSA sign raw digest callback, user builds DigestInfo */
 typedef int (*CallbackRsaSignRawDigest)(wc_PKCS7* pkcs7, byte* digest,
+                                   word32 digestSz, byte* out, word32 outSz,
+                                   byte* privateKey, word32 privateKeySz,
+                                   int devId, int hashOID);
+#endif
+
+#if defined(HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK) && defined(HAVE_ECC)
+/* ECC sign raw digest callback, user signs hash directly */
+typedef int (*CallbackEccSignRawDigest)(wc_PKCS7* pkcs7, byte* digest,
                                    word32 digestSz, byte* out, word32 outSz,
                                    byte* privateKey, word32 privateKeySz,
                                    int devId, int hashOID);
@@ -285,6 +318,9 @@ struct wc_PKCS7 {
     int devId;                    /* device ID for HW based private key   */
     byte issuerHash[KEYID_SIZE];  /* hash of all alt Names                */
     byte issuerSn[MAX_SN_SZ];     /* singleCert's serial number           */
+    /* Signer public key, stored only for RSA/ECC (consumed by the raw-sign
+     * callback paths). PQC keys (e.g. ML-DSA) are large and never read back
+     * from here, so they are not stored and this stays RSA-sized. */
     byte publicKey[MAX_RSA_INT_SZ + MAX_RSA_E_SZ]; /* MAX RSA key size (m + e)*/
     word32 certSz[MAX_PKCS7_CERTS];
 
@@ -375,6 +411,17 @@ struct wc_PKCS7 {
 #endif
 
     CallbackAESKeyWrapUnwrap aesKeyWrapUnwrapCb;
+
+#if defined(HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK) && defined(HAVE_ECC)
+    CallbackEccSignRawDigest eccSignRawDigestCb;
+#endif
+
+#if defined(WC_RSA_PSS) && !defined(NO_RSA)
+    int pssSaltLen;   /* RSASSA-PSS params from SignerInfo; valid when */
+    int pssHashType;  /* pssParamsPresent == 1; else verify path uses  */
+    int pssMgf;       /* RSA_PSS_SALT_LEN_DEFAULT / digest algo defaults */
+    byte pssParamsPresent;
+#endif
 
     /* !! NEW DATA MEMBERS MUST BE ADDED AT END !! */
 };
@@ -509,6 +556,11 @@ WOLFSSL_API int  wc_PKCS7_SetAESKeyWrapUnwrapCb(wc_PKCS7* pkcs7,
 #if defined(HAVE_PKCS7_RSA_RAW_SIGN_CALLBACK) && !defined(NO_RSA)
 WOLFSSL_API int  wc_PKCS7_SetRsaSignRawDigestCb(wc_PKCS7* pkcs7,
         CallbackRsaSignRawDigest cb);
+#endif
+
+#if defined(HAVE_PKCS7_ECC_RAW_SIGN_CALLBACK) && defined(HAVE_ECC)
+WOLFSSL_API int  wc_PKCS7_SetEccSignRawDigestCb(wc_PKCS7* pkcs7,
+        CallbackEccSignRawDigest cb);
 #endif
 
 /* CMS/PKCS#7 EnvelopedData */

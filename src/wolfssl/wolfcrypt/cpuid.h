@@ -1,6 +1,6 @@
 /* cpuid.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -43,6 +43,29 @@
     #define HAVE_CPUID
     #define HAVE_CPUID_AARCH64
 #endif
+/* 32-bit Arm (AArch32).  __arm__ is defined for both the A32 and Thumb
+ * instruction sets but not for AArch64, so it cleanly distinguishes the 32-bit
+ * build from the AArch64 one handled above.
+ *
+ * Thumb-2 builds - WOLFSSL_ARMASM_THUMB2, which the M profile requires - use
+ * the separate thumb2-*.S assembly.  It has a single implementation of each
+ * algorithm and nothing to choose between at run time, so no CPU id is built
+ * for it.
+ *
+ * The features detected (Advanced SIMD and the Armv8 crypto extension) and the
+ * registers used to detect them (HWCAP, ID_ISAR5) are Armv7 and later, so the
+ * older architectures - Armv4 / Armv5 / Armv6 - get no CPU id either. */
+#if (defined(WOLFSSL_ARM32_BUILD) || (defined(__arm__) && \
+     defined(WOLFSSL_ARMASM))) && !defined(__aarch64__) && \
+    !defined(WOLFSSL_ARMASM_THUMB2) && !defined(WOLFSSL_NO_ASM) && \
+    (!defined(__ARM_ARCH) || (__ARM_ARCH >= 7))
+    #define HAVE_CPUID
+    #define HAVE_CPUID_ARM32
+#endif
+#if defined(WOLFSSL_PPC64_ASM) && !defined(WOLFSSL_NO_ASM)
+    #define HAVE_CPUID
+    #define HAVE_CPUID_PPC64
+#endif
 
 #define WC_CPUID_INITIALIZER 0xffffffffU
 typedef word32 cpuid_flags_t;
@@ -67,6 +90,22 @@ typedef word32 cpuid_flags_t;
     #define CPUID_MOVBE  0x0080   /* Move and byte swap */
     #define CPUID_BMI1   0x0100   /* ANDN */
     #define CPUID_SHA    0x0200   /* SHA-1 and SHA-256 instructions */
+    #define CPUID_VAES   0x0400
+    #define CPUID_AVX512 0x0800
+    #define CPUID_INTEL  0x1000   /* CPU vendor is GenuineIntel */
+    /* CPU vendor is AuthenticAMD.  Used to pick between implementations that
+     * differ only in which instructions are fast on a vendor - see the
+     * VPMULLQ variant of the Curve25519 IFMA code in fe_x25519_asm.S. */
+    #define CPUID_AMD    0x2000
+    #define CPUID_AVX512_VBMI 0x4000  /* AVX-512 Vector Byte Manipulation */
+    #define CPUID_AVX512_VBMI2 0x8000 /* AVX-512 VBMI2 (vpcompressw etc.) */
+    #define CPUID_AVX512_IFMA 0x10000 /* AVX-512 IFMA (vpmadd52luq/huq) */
+    #define CPUID_AVX512_VL 0x20000   /* AVX-512 at 128 and 256 bits */
+    #define CPUID_AVX512_DQ 0x40000   /* AVX-512 DQ (vpmullq etc.) */
+    /* AVX-512 Byte and Word: byte/word instructions at 512-bit width
+     * (vpshufb, vpaddw, vpmulhw, vpackusdw, ... on zmm). */
+    #define CPUID_AVX512_BW 0x80000
+    #define CPUID_SSSE3  0x100000     /* SSSE3 (pshufb etc.) */
 
     #define IS_INTEL_AVX1(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX1)
     #define IS_INTEL_AVX2(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX2)
@@ -78,6 +117,30 @@ typedef word32 cpuid_flags_t;
     #define IS_INTEL_MOVBE(f)   (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_MOVBE)
     #define IS_INTEL_BMI1(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_BMI1)
     #define IS_INTEL_SHA(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA)
+    #define IS_INTEL_VAES(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_VAES)
+    #define IS_INTEL_AVX512(f)  (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512)
+    #define IS_INTEL_AVX512_VBMI(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512_VBMI)
+    #define IS_INTEL_AVX512_VBMI2(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512_VBMI2)
+    #define IS_INTEL_AVX512_IFMA(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512_IFMA)
+    #define IS_INTEL_AVX512_VL(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512_VL)
+    #define IS_INTEL_AVX512_DQ(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512_DQ)
+    #define IS_INTEL_AVX512_BW(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AVX512_BW)
+    /* Safe to dispatch to wolfSSL's AVX512 assembly: every algorithm using it
+     * (ML-DSA, ML-KEM, FrodoKEM) works on 8- or 16-bit lanes at 512-bit width
+     * - vpshufb, vpaddw, vpsubw, vpmulhw, vpmullw, vpackusdw, vpmaddwd, ... -
+     * which are AVX512BW, not AVX512F. IS_INTEL_AVX512() is the F bit alone
+     * and is not sufficient on its own. */
+    #define USE_INTEL_AVX512(f) \
+        (IS_INTEL_AVX512(f) && IS_INTEL_AVX512_BW(f))
+    #define IS_CPU_INTEL(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_INTEL)
+    #define IS_CPU_AMD(f)       (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AMD)
+    #define IS_INTEL_SSSE3(f)   (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SSSE3)
 
 #elif defined(HAVE_CPUID_AARCH64)
 
@@ -90,16 +153,64 @@ typedef word32 cpuid_flags_t;
     #define CPUID_SM3         0x0040    /* SM3 digest */
     #define CPUID_SM4         0x0080    /* SM4 enc/dec */
     #define CPUID_SB          0x0100    /* Speculation barrier */
+    #define CPUID_ASIMD       0x0200    /* ASIMD - NEON */
+    #define CPUID_SVE         0x0400    /* Scalable Vector Extension */
+    #define CPUID_SME         0x0800    /* Scalable Matrix Extension */
 
-    #define IS_AARCH64_AES(f)       (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AES)
-    #define IS_AARCH64_PMULL(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_PMULL)
-    #define IS_AARCH64_SHA256(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA256)
-    #define IS_AARCH64_SHA512(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA512)
-    #define IS_AARCH64_RDM(f)       (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_RDM)
-    #define IS_AARCH64_SHA3(f)      (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA3)
-    #define IS_AARCH64_SM3(f)       (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SM3)
-    #define IS_AARCH64_SM4(f)       (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SM4)
-    #define IS_AARCH64_SB(f)        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SB)
+    #define IS_AARCH64_AES(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AES)
+    #define IS_AARCH64_PMULL(f)   (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_PMULL)
+    #define IS_AARCH64_SHA256(f)  (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA256)
+    #define IS_AARCH64_SHA512(f)  (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA512)
+    #define IS_AARCH64_RDM(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_RDM)
+    #define IS_AARCH64_SHA3(f)    (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA3)
+    #define IS_AARCH64_SM3(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SM3)
+    #define IS_AARCH64_SM4(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SM4)
+    #define IS_AARCH64_SB(f)      (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SB)
+    #define IS_AARCH64_ASIMD(f)   (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_ASIMD)
+    #define IS_AARCH64_SVE(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SVE)
+    #define IS_AARCH64_SME(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SME)
+
+#elif defined(HAVE_CPUID_ARM32)
+
+    /* Only the features that select between the available wolfCrypt AArch32
+     * assembly implementations are tracked:
+     *   - AES / PMULL:  Armv8 crypto-extension AES and AES-GCM (armv8-32-aes).
+     *   - SHA256:       Armv8 crypto-extension SHA-256 (armv8-32-sha256).
+     *   - ASIMD (NEON): armv8-32 SHA-512, SHA-3, ChaCha and Poly1305 asm.
+     * AArch32 has no crypto-extension SHA-512/SHA-3 instructions, so those
+     * digests are accelerated with NEON rather than a crypto path. */
+    #define CPUID_AES         0x0001    /* AES enc/dec */
+    #define CPUID_PMULL       0x0002    /* Carryless multiply - VMULL.P64 */
+    #define CPUID_SHA256      0x0004    /* SHA-256 digest */
+    #define CPUID_ASIMD       0x0008    /* Advanced SIMD - NEON */
+
+    #define IS_ARM32_AES(f)     (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_AES)
+    #define IS_ARM32_PMULL(f)   (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_PMULL)
+    #define IS_ARM32_SHA256(f)  (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_SHA256)
+    #define IS_ARM32_ASIMD(f)   (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_ASIMD)
+
+#elif defined(HAVE_CPUID_PPC64)
+
+    #define CPUID_ALTIVEC     0x0001    /* VMX / AltiVec */
+    #define CPUID_VSX         0x0002    /* Vector-Scalar Extension */
+    #define CPUID_ARCH_2_07   0x0004    /* POWER8 / PowerISA 2.07 */
+    #define CPUID_VEC_CRYPTO  0x0008    /* Vector crypto: vshasigmaw, vcipher,
+                                         * vpmsumd, ... */
+    #define CPUID_ARCH_3_00   0x0010    /* POWER9 / PowerISA 3.0 */
+    #define CPUID_ARCH_3_1    0x0020    /* POWER10 / PowerISA 3.1 */
+
+    #define IS_PPC64_ALTIVEC(f)    \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_ALTIVEC)
+    #define IS_PPC64_VSX(f)        \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_VSX)
+    #define IS_PPC64_ARCH_2_07(f)  \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_ARCH_2_07)
+    #define IS_PPC64_VEC_CRYPTO(f) \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_VEC_CRYPTO)
+    #define IS_PPC64_ARCH_3_00(f)  \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_ARCH_3_00)
+    #define IS_PPC64_ARCH_3_1(f)   \
+        (WOLFSSL_ATOMIC_COERCE_UINT(f) & CPUID_ARCH_3_1)
 
 #endif
 

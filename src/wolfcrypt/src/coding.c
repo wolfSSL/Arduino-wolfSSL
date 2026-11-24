@@ -1,6 +1,6 @@
 /* coding.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -21,9 +21,10 @@
 
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
+#include <wolfssl/wolfcrypt/coding.h>
+
 #ifndef NO_CODING
 
-#include <wolfssl/wolfcrypt/coding.h>
 #ifndef NO_ASN
     #include <wolfssl/wolfcrypt/asn.h> /* For PEM_LINE_SZ */
 #endif
@@ -72,7 +73,7 @@ static WC_INLINE byte Base64_Char2Val_CT(byte c)
     v |= ((slashStart >> 8) ^ (slashEnd >> 8)) & (slashStart + 63 + 1);
     v |= ((plusStart  >> 8) ^ (plusEnd  >> 8)) & (plusStart  + 62 + 1);
 
-    return (byte)(v - 1);
+    return WC_OCTET(v - 1);
 }
 
 #ifndef BASE64_NO_TABLE
@@ -134,7 +135,7 @@ int Base64_SkipNewline(const byte* in, word32 *inLen,
         curChar = in[++j];
         len--;
     }
-    if (len && (curChar == '\r' || curChar == '\n')) {
+    if (curChar == '\r' || curChar == '\n') {
         j++;
         len--;
         if (curChar == '\r') {
@@ -174,6 +175,9 @@ int Base64_Decode_nonCT(const byte* in, word32 inLen, byte* out, word32* outLen)
     int ret;
     const byte maxIdx = BASE64DECODE_TABLE_SZ + BASE64_MIN - 1;
 
+    if ((in == NULL && inLen > 0) || out == NULL || outLen == NULL)
+        return BAD_FUNC_ARG;
+
     while (inLen > 3) {
         int pad3 = 0;
         int pad4 = 0;
@@ -189,6 +193,7 @@ int Base64_Decode_nonCT(const byte* in, word32 inLen, byte* out, word32* outLen)
         }
         e1 = in[j++];
         if (e1 == '\0') {
+            inLen = 0;
             break;
         }
         inLen--;
@@ -227,11 +232,6 @@ int Base64_Decode_nonCT(const byte* in, word32 inLen, byte* out, word32* outLen)
             return ASN_INPUT_E;
         }
 
-        if (i + 1 + !pad3 + !pad4 > *outLen) {
-            WOLFSSL_MSG("Bad Base64 Decode out buffer, too small");
-            return BUFFER_E;
-        }
-
         e1 = Base64_Char2Val_by_table(e1);
         e2 = Base64_Char2Val_by_table(e2);
         e3 = (byte)((e3 == PAD) ? 0 : Base64_Char2Val_by_table(e3));
@@ -240,6 +240,11 @@ int Base64_Decode_nonCT(const byte* in, word32 inLen, byte* out, word32* outLen)
         if (e1 == BAD || e2 == BAD || e3 == BAD || e4 == BAD) {
             WOLFSSL_MSG("Bad Base64 Decode bad character");
             return ASN_INPUT_E;
+        }
+
+        if (i + 1 + !pad3 + !pad4 > *outLen) {
+            WOLFSSL_MSG("Bad Base64 Decode out buffer, too small");
+            return BUFFER_E;
         }
 
         b1 = (byte)((e1 << 2) | (e2 >> 4));
@@ -255,8 +260,26 @@ int Base64_Decode_nonCT(const byte* in, word32 inLen, byte* out, word32* outLen)
             break;
     }
 
+    /* If there is still input available, and it's not whitespace or nulls, then
+     * the input is invalid.
+     */
+    while (inLen > 0) {
+        word32 cur_j = j;
+        if (in[j] == 0)
+            break;
+        if ((ret = Base64_SkipNewline(in, &inLen, &j)) != 0) {
+            if (ret == WC_NO_ERR_TRACE(BUFFER_E)) {
+                /* Running out of buffer here is not an error */
+                break;
+            }
+            return ret;
+        }
+        if (j == cur_j)
+            return ASN_INPUT_E;
+    }
+
     /* If the output buffer has a room for an extra byte, add a null terminator */
-    if (out && *outLen > i)
+    if (*outLen > i)
         out[i]= '\0';
 
     /* Note, *outLen won't reflect the optional terminating null. */
@@ -273,6 +296,9 @@ int Base64_Decode(const byte* in, word32 inLen, byte* out, word32* outLen)
     word32 j = 0;
     int ret;
 
+    if ((in == NULL && inLen > 0) || out == NULL || outLen == NULL)
+        return BAD_FUNC_ARG;
+
     while (inLen > 3) {
         int pad3 = 0;
         int pad4 = 0;
@@ -288,6 +314,7 @@ int Base64_Decode(const byte* in, word32 inLen, byte* out, word32* outLen)
         }
         e1 = in[j++];
         if (e1 == '\0') {
+            inLen = 0;
             break;
         }
         inLen--;
@@ -315,11 +342,6 @@ int Base64_Decode(const byte* in, word32 inLen, byte* out, word32* outLen)
         if (pad3 && !pad4)
             return ASN_INPUT_E;
 
-        if (i + 1 + !pad3 + !pad4 > *outLen) {
-            WOLFSSL_MSG("Bad Base64 Decode out buffer, too small");
-            return BUFFER_E;
-        }
-
         e1 = Base64_Char2Val_CT(e1);
         e2 = Base64_Char2Val_CT(e2);
         e3 = (byte)((e3 == PAD) ? 0 : Base64_Char2Val_CT(e3));
@@ -328,6 +350,15 @@ int Base64_Decode(const byte* in, word32 inLen, byte* out, word32* outLen)
         if (e1 == BAD || e2 == BAD || e3 == BAD || e4 == BAD) {
             WOLFSSL_MSG("Bad Base64 Decode bad character");
             return ASN_INPUT_E;
+        }
+
+        /* Output space check needs to follow input character validation to
+         * assure ASN_INPUT_E is returned on truncated input with the
+         * terminating null included in the input buffer.
+         */
+        if (i + 1 + !pad3 + !pad4 > *outLen) {
+            WOLFSSL_MSG("Bad Base64 Decode out buffer, too small");
+            return BUFFER_E;
         }
 
         b1 = (byte)((e1 << 2) | (e2 >> 4));
@@ -343,8 +374,26 @@ int Base64_Decode(const byte* in, word32 inLen, byte* out, word32* outLen)
             break;
     }
 
+    /* If there is still input available, and it's not whitespace or nulls, then
+     * the input is invalid.
+     */
+    while (inLen > 0) {
+        word32 cur_j = j;
+        if (in[j] == 0)
+            break;
+        if ((ret = Base64_SkipNewline(in, &inLen, &j)) != 0) {
+            if (ret == WC_NO_ERR_TRACE(BUFFER_E)) {
+                /* Running out of buffer here is not an error */
+                break;
+            }
+            return ret;
+        }
+        if (j == cur_j)
+            return ASN_INPUT_E;
+    }
+
     /* If the output buffer has a room for an extra byte, add a null terminator */
-    if (out && *outLen > i)
+    if (*outLen > i)
         out[i]= '\0';
 
     /* Note, *outLen won't reflect the optional terminating null. */
@@ -471,8 +520,18 @@ static int DoBase64_Encode(const byte* in, word32 inLen, byte* out,
 
     int    getSzOnly = (out == NULL);
 
-    word32 outSz = (inLen + 3 - 1) / 3 * 4;
-    word32 addSz = (outSz + BASE64_LINE_SZ - 1) / BASE64_LINE_SZ;  /* new lines */
+    word32 outSz;
+    word32 addSz;
+
+    if (in == NULL && inLen > 0)
+        return BAD_FUNC_ARG;
+
+    /* Reject lengths that would wrap the encoded-size calculation below. */
+    if (inLen >= (WOLFSSL_MAX_32BIT / 4))
+        return BAD_FUNC_ARG;
+
+    outSz = (inLen + 3 - 1) / 3 * 4;
+    addSz = (outSz + BASE64_LINE_SZ - 1) / BASE64_LINE_SZ;  /* new lines */
 
     if (escaped == WC_ESC_NL_ENC)
         addSz *= 3;   /* instead of just \n, we're doing %0A triplet */
@@ -602,7 +661,7 @@ int Base16_Decode(const byte* in, word32 inLen, byte* out, word32* outLen)
     if (in == NULL || out == NULL || outLen == NULL)
         return BAD_FUNC_ARG;
 
-    if (inLen == 1 && *outLen && in) {
+    if (inLen == 1 && *outLen) {
         byte b = (byte)(in[inIdx++] - BASE16_MIN);  /* 0 starts at 0x30 */
 
         /* sanity check */
@@ -663,6 +722,9 @@ int Base16_Encode(const byte* in, word32 inLen, byte* out, word32* outLen)
     if (in == NULL || out == NULL || outLen == NULL)
         return BAD_FUNC_ARG;
 
+    if (inLen > (WOLFSSL_MAX_32BIT / 2))
+        return BAD_FUNC_ARG;
+
     if (*outLen < (2 * inLen))
         return BAD_FUNC_ARG;
 
@@ -688,3 +750,111 @@ int Base16_Encode(const byte* in, word32 inLen, byte* out, word32* outLen)
 #endif /* WOLFSSL_BASE16 */
 
 #endif /* !NO_CODING */
+
+#ifdef WOLFSSL_UTF8_DECODE
+
+/**
+ * Decode the UTF-8 encoding of one code point.
+ *
+ * The encodings that RFC 3629 Sec. 3 requires a decoder to reject are
+ * rejected: overlong forms, the code points reserved for UTF-16 surrogates,
+ * code points past the end of the Unicode range, the five and six octet forms
+ * that RFC 3629 removed, and sequences whose continuation octets are missing
+ * or malformed. Any of these decoding to a character would let one octet
+ * sequence impersonate another.
+ *
+ * *inOutIdx only moves when a code point is decoded, so a caller that wants to
+ * keep going after a bad sequence is free to choose how far to skip.
+ *
+ * @param [in]      in        Buffer holding UTF-8 encoded text.
+ * @param [in]      inLen     Length of buffer in octets.
+ * @param [in, out] inOutIdx  On in, index of the first octet to decode.
+ *                            On out, index of the first octet after the code
+ *                            point decoded.
+ * @param [out]     cp        Code point decoded.
+ * @return  0 on success.
+ * @return  BAD_FUNC_ARG when in, inOutIdx or cp is NULL.
+ * @return  BUFFER_E when no octets remain, or when the sequence needs more
+ *          continuation octets than the buffer holds.
+ * @return  ASN_INPUT_E when the octets are not a valid encoding of a code
+ *          point.
+ */
+int wc_Utf8_DecodeChar(const byte* in, word32 inLen, word32* inOutIdx,
+                       word32* cp)
+{
+    word32 idx;
+    word32 c;
+    word32 minCp;
+    word32 need;
+    word32 i;
+
+    if ((in == NULL) || (inOutIdx == NULL) || (cp == NULL)) {
+        return BAD_FUNC_ARG;
+    }
+
+    idx = *inOutIdx;
+    if (idx >= inLen) {
+        return BUFFER_E;
+    }
+
+    c = in[idx];
+    if (c < 0x80U) {
+        /* 0xxxxxxx: the octet is the code point. */
+        *inOutIdx = idx + 1U;
+        *cp = c;
+        return 0;
+    }
+
+    /* Take the code point bits out of the lead octet and note how many
+     * continuation octets follow and the smallest code point that the form is
+     * allowed to carry. */
+    if ((c & 0xE0U) == 0xC0U) {
+        need = 1U;
+        minCp = 0x80U;
+        c &= 0x1FU;
+    }
+    else if ((c & 0xF0U) == 0xE0U) {
+        need = 2U;
+        minCp = 0x800U;
+        c &= 0x0FU;
+    }
+    else if ((c & 0xF8U) == 0xF0U) {
+        need = 3U;
+        minCp = 0x10000U;
+        c &= 0x07U;
+    }
+    else {
+        /* A continuation octet with no lead, or a lead octet of one of the
+         * longer forms that are no longer part of UTF-8. */
+        return ASN_INPUT_E;
+    }
+
+    /* Every continuation octet must be in the buffer. */
+    if ((inLen - idx) <= need) {
+        return BUFFER_E;
+    }
+    for (i = 1; i <= need; i++) {
+        /* 10xxxxxx. */
+        if ((in[idx + i] & 0xC0U) != 0x80U) {
+            return ASN_INPUT_E;
+        }
+        c = (c << 6U) | (word32)(in[idx + i] & 0x3FU);
+    }
+
+    if ((c < minCp) || (c > WC_UNICODE_MAX_CODEPOINT) ||
+            ((c >= WC_UTF16_HI_SURROGATE_MIN) &&
+             (c <= WC_UTF16_LO_SURROGATE_MAX))) {
+        return ASN_INPUT_E;
+    }
+
+    *inOutIdx = idx + need + 1U;
+    *cp = c;
+    return 0;
+}
+
+#endif /* WOLFSSL_UTF8_DECODE */
+
+/* An empty translation unit is a constraint violation in C89, so emit a
+ * harmless typedef to keep it well-formed in case everything above is
+ * compiled out. */
+typedef int wolfssl_coding_dummy_decl;

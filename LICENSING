@@ -17,6 +17,15 @@ Fetchmail
 
 OpenVPN
 
+SWUpdate
+
+RPCS3
+
+VDE - Virtual Distributed Ethernet
+
+U-Boot (from Cisco Systems, Inc. only)
+
+
 For our users who cannot use wolfSSL under GPLv3, a commercial license to
 wolfSSL and wolfCrypt is available.
 
