@@ -1,0 +1,191 @@
+name: Arduino Docker Test
+
+#
+# Tests the LOCAL Arduino-wolfSSL library inside the Docker container defined
+# in .github/docker. The same container runs unchanged on a workstation; see
+# the comments in .github/docker/Dockerfile.
+#
+# Job "compile": for each board, compile every example using
+#   compile-all-examples.sh and the full board_list.txt from wolfssl-examples.
+#
+# Job "qemu": compile the examples that need no network for an ESP32, boot
+#   them in Espressif QEMU and check the serial output. The TLS / DTLS client
+#   and server examples are not run: they need WiFi, which QEMU does not emulate.
+#
+# See also arduino.yml, which compiles outside Docker with the interim board list.
+#
+
+on:
+  push:
+    branches: [ '**', 'master', 'main', 'release/**' ]
+
+  pull_request:
+    branches: [ '**' ]
+
+  workflow_dispatch:
+
+concurrency:
+  # Same branch push cancels other jobs. Other PR branches untouched
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: arduino-wolfssl-test
+  # Board cores downloaded in the container are kept here and cached.
+  ARDUINO15_DIR: ${{ github.workspace }}/../arduino15
+
+jobs:
+  compile:
+    name: Compile (${{ matrix.fqbn }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        fqbn:
+          # When editing this list, see also board_list.txt:
+          # https://github.com/wolfSSL/wolfssl-examples/blob/master/Arduino/sketches/board_list.txt
+          - arduino:avr:ethernet
+          - arduino:avr:leonardoeth
+          - arduino:avr:mega
+          - arduino:avr:nano
+          - arduino:avr:uno
+          - arduino:avr:yun
+          - arduino:samd:mkrwifi1010
+          - arduino:samd:mkr1000
+          - arduino:samd:mkrfox1200
+          - arduino:mbed_edge:edge_control
+          - arduino:mbed_nano:nanorp2040connect
+          - arduino:mbed_portenta:envie_m7
+          - arduino:mbed_portenta:portenta_x8
+          - arduino:renesas_uno:unor4wifi
+          - arduino:sam:arduino_due_x
+          - arduino:samd:arduino_zero_native
+          - arduino:samd:tian
+          - esp32:esp32:esp32
+          - esp32:esp32:esp32s2
+          - esp32:esp32:esp32s3
+          - esp32:esp32:esp32c3
+          - esp32:esp32:esp32c6
+          - esp32:esp32:esp32h2
+          - esp8266:esp8266:generic
+          - teensy:avr:teensy40
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Derive CORE_ID (vendor:arch from FQBN)
+        run: |
+          CORE_ID="$(echo '${{ matrix.fqbn }}' | cut -d: -f1-2)"
+          echo "CORE_ID=$CORE_ID" >> "$GITHUB_ENV"
+
+      - name: Cache Arduino packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ARDUINO15_DIR }}
+          key: arduino-docker-${{ runner.os }}-${{ env.CORE_ID }}-v1
+
+      - name: Find Espressif QEMU release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Looked up here with the workflow token; the unauthenticated lookup
+          # in the Dockerfile is rate limited on shared runners.
+          QEMU_URL="$(gh release view --repo espressif/qemu --json assets \
+            --jq '.assets[].url | select(test("qemu-xtensa-softmmu-.*-x86_64-linux-gnu\\.tar\\.xz$"))' \
+            | head -n 1)"
+          if [ -z "$QEMU_URL" ]; then
+            echo "No Espressif QEMU release found"
+            exit 1
+          fi
+          echo "QEMU_URL=$QEMU_URL"
+          echo "QEMU_URL=$QEMU_URL" >> "$GITHUB_ENV"
+
+      - name: Build test container
+        run: docker build --build-arg QEMU_URL="$QEMU_URL" -t "$IMAGE" .github/docker
+
+      - name: Compile all examples for ${{ matrix.fqbn }}
+        run: |
+          mkdir -p "$ARDUINO15_DIR"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/repo:ro \
+            -v "$ARDUINO15_DIR":/root/.arduino15 \
+            -e EXAMPLES_REPO_OWNER="${{ github.repository_owner }}" \
+            "$IMAGE" compile "${{ matrix.fqbn }}"
+
+      - name: Make cache readable
+        if: always()
+        run: |
+          # The container runs as root; hand the files back for the cache step.
+          if [ -d "$ARDUINO15_DIR" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$ARDUINO15_DIR"
+          fi
+
+  qemu:
+    name: Run (${{ matrix.example }} on esp32 QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        example:
+          - wolfssl_version
+          - wolfssl_AES_CTR
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Cache Arduino packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ARDUINO15_DIR }}
+          key: arduino-docker-${{ runner.os }}-esp32:esp32-v1
+
+      - name: Find Espressif QEMU release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          QEMU_URL="$(gh release view --repo espressif/qemu --json assets \
+            --jq '.assets[].url | select(test("qemu-xtensa-softmmu-.*-x86_64-linux-gnu\\.tar\\.xz$"))' \
+            | head -n 1)"
+          if [ -z "$QEMU_URL" ]; then
+            echo "No Espressif QEMU release found"
+            exit 1
+          fi
+          echo "QEMU_URL=$QEMU_URL"
+          echo "QEMU_URL=$QEMU_URL" >> "$GITHUB_ENV"
+
+      - name: Build test container
+        run: docker build --build-arg QEMU_URL="$QEMU_URL" -t "$IMAGE" .github/docker
+
+      - name: Run ${{ matrix.example }} in QEMU
+        run: |
+          mkdir -p "$ARDUINO15_DIR" "$RUNNER_TEMP/qemu-out"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/repo:ro \
+            -v "$ARDUINO15_DIR":/root/.arduino15 \
+            -v "$RUNNER_TEMP/qemu-out":/tmp/qemu-out \
+            "$IMAGE" qemu "${{ matrix.example }}"
+
+      - name: Make cache and logs readable
+        if: always()
+        run: |
+          for d in "$ARDUINO15_DIR" "$RUNNER_TEMP/qemu-out"; do
+            if [ -d "$d" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$d"
+            fi
+          done
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-${{ matrix.example }}
+          path: |
+            ${{ runner.temp }}/qemu-out/serial.log
+            ${{ runner.temp }}/qemu-out/qemu.log
+          if-no-files-found: ignore
