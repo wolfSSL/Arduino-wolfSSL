@@ -23,7 +23,7 @@
 */
 
 /* Define a macro to display user settings version in example code: */
-#define WOLFSSL_USER_SETTINGS_ID "Arduino user_settings.h v5.8.2"
+#define WOLFSSL_USER_SETTINGS_ID "Arduino user_settings.h v5.9.4"
 
 /* Disable wolfcrypt cryptographic security hardening. Comment out to enable: */
 /* #define WC_NO_HARDEN */

@@ -40,7 +40,7 @@ Additional wolfSSL examples can be found at:
 
 ## Arduino Releases
 
-This release of wolfSSL is version [5.7.6](https://github.com/wolfSSL/wolfssl/releases/tag/v5.7.6-stable).
+This release of wolfSSL is version [5.9.4](https://github.com/wolfSSL/wolfssl/releases/tag/v5.9.4-stable).
 
 See GitHub for [all Arduino wolfSSL releases](https://github.com/wolfSSL/Arduino-wolfSSL/releases).
 
