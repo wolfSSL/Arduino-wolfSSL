@@ -27,7 +27,7 @@
 
 /* camellia.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -64,8 +64,7 @@
     #include <wolfcrypt/src/misc.c>
 #endif
 
-/* u32 must be 32bit word */
-typedef unsigned int u32;
+typedef word32 u32;
 typedef unsigned char u8;
 
 /* key constants */
@@ -1522,7 +1521,7 @@ int wc_CamelliaSetKey(wc_Camellia* cam, const byte* key, word32 len, const byte*
 {
     int ret = 0;
 
-    if (cam == NULL) return BAD_FUNC_ARG;
+    if (cam == NULL || key == NULL) return BAD_FUNC_ARG;
 
     XMEMSET(cam->key, 0, WC_CAMELLIA_TABLE_BYTE_LEN);
 
@@ -1563,10 +1562,20 @@ int wc_CamelliaSetIV(wc_Camellia* cam, const byte* iv)
 }
 
 
+/* Returns 1 when a valid key has been configured, 0 otherwise. */
+static int CamelliaKeyIsSet(const wc_Camellia* cam)
+{
+    return (cam->keySz == 128 || cam->keySz == 192 || cam->keySz == 256);
+}
+
+
 int wc_CamelliaEncryptDirect(wc_Camellia* cam, byte* out, const byte* in)
 {
     if (cam == NULL || out == NULL || in == NULL) {
         return BAD_FUNC_ARG;
+    }
+    if (!CamelliaKeyIsSet(cam)) {
+        return MISSING_KEY;
     }
     Camellia_EncryptBlock(cam->keySz, in, cam->key, out);
 
@@ -1579,6 +1588,9 @@ int wc_CamelliaDecryptDirect(wc_Camellia* cam, byte* out, const byte* in)
     if (cam == NULL || out == NULL || in == NULL) {
         return BAD_FUNC_ARG;
     }
+    if (!CamelliaKeyIsSet(cam)) {
+        return MISSING_KEY;
+    }
     Camellia_DecryptBlock(cam->keySz, in, cam->key, out);
 
     return 0;
@@ -1590,6 +1602,12 @@ int wc_CamelliaCbcEncrypt(wc_Camellia* cam, byte* out, const byte* in, word32 sz
     word32 blocks;
     if (cam == NULL || out == NULL || in == NULL) {
         return BAD_FUNC_ARG;
+    }
+    if (sz % WC_CAMELLIA_BLOCK_SIZE != 0) {
+        return BAD_LENGTH_E;
+    }
+    if (!CamelliaKeyIsSet(cam)) {
+        return MISSING_KEY;
     }
     blocks = sz / WC_CAMELLIA_BLOCK_SIZE;
 
@@ -1613,6 +1631,12 @@ int wc_CamelliaCbcDecrypt(wc_Camellia* cam, byte* out, const byte* in, word32 sz
     if (cam == NULL || out == NULL || in == NULL) {
         return BAD_FUNC_ARG;
     }
+    if (sz % WC_CAMELLIA_BLOCK_SIZE != 0) {
+        return BAD_LENGTH_E;
+    }
+    if (!CamelliaKeyIsSet(cam)) {
+        return MISSING_KEY;
+    }
     blocks = sz / WC_CAMELLIA_BLOCK_SIZE;
 
     while (blocks--) {
@@ -1626,6 +1650,14 @@ int wc_CamelliaCbcDecrypt(wc_Camellia* cam, byte* out, const byte* in, word32 sz
     }
 
     return 0;
+}
+
+
+void wc_CamelliaFree(wc_Camellia* cam)
+{
+    if (cam == NULL)
+        return;
+    ForceZero(cam, sizeof(wc_Camellia));
 }
 
 

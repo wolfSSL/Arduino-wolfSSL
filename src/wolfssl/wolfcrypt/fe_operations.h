@@ -1,6 +1,6 @@
 /* fe_operations.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -29,24 +29,10 @@
 
 #include <wolfssl/wolfcrypt/types.h>
 
-#if defined(USE_INTEL_SPEEDUP) && !defined(NO_CURVED25519_X64)
-    #define CURVED25519_X64
-#elif defined(HAVE___UINT128_T) && !defined(NO_CURVED25519_128BIT)
-    #define CURVED25519_128BIT
-#endif
-
-#if defined(CURVED25519_X64)
-    #define CURVED25519_ASM_64BIT
-    #define CURVED25519_ASM
-#endif
-#if defined(WOLFSSL_ARMASM)
-    #ifdef __aarch64__
-        #define CURVED25519_ASM_64BIT
-    #else
-        #define CURVED25519_ASM_32BIT
-    #endif
-    #define CURVED25519_ASM
-#endif
+/* CURVED25519_X64, CURVED25519_128BIT, CURVED25519_ASM[_32BIT|_64BIT] and
+ * WOLFSSL_CURVE25519_USE_ED25519 are derived in settings.h, so that the
+ * generated assembly - which only ever sees settings.h - is guarded by the
+ * same macros as the C sources. */
 
 /*
 fe means field element.
@@ -61,24 +47,59 @@ Bounds on each t[i] vary depending on context.
 #endif
 
 #if defined(CURVE25519_SMALL) || defined(ED25519_SMALL)
-    #define F25519_SIZE 32
 
-    WOLFSSL_LOCAL void lm_copy(byte* x, const byte* a);
-    WOLFSSL_LOCAL void lm_add(byte* r, const byte* a, const byte* b);
-    WOLFSSL_LOCAL void lm_sub(byte* r, const byte* a, const byte* b);
-    WOLFSSL_LOCAL void lm_neg(byte* r,const byte* a);
-    WOLFSSL_LOCAL void lm_invert(byte* r, const byte* x);
-    WOLFSSL_LOCAL void lm_mul(byte* r,const byte* a, const byte* b);
+#define F25519_SIZE 32
+
+#include <wolfssl/wolfcrypt/curve25519.h>
+
+WOLFSSL_LOCAL void lm_copy(byte*, const byte*);
+WOLFSSL_LOCAL void lm_add(byte*, const byte*, const byte*);
+WOLFSSL_LOCAL void lm_sub(byte*, const byte*, const byte*);
+WOLFSSL_LOCAL void lm_neg(byte*,const byte*);
+WOLFSSL_LOCAL void lm_invert(byte*, const byte*);
+WOLFSSL_LOCAL void lm_mul(byte*,const byte*,const byte*);
+
+#ifdef WC_X25519_NONBLOCK
+
+/* Use standard wolfSSL non-blocking error code */
+#ifndef FP_WOULDBLOCK
+#include <wolfssl/wolfcrypt/error-crypt.h>
+#define FP_WOULDBLOCK   MP_WOULDBLOCK
 #endif
+
+struct fe_inv__distinct_nb_ctx_t;
+struct x25519_nb_ctx_t;
+
+WOLFSSL_LOCAL int fe_inv__distinct_nb(byte *r, const byte *x,
+    struct fe_inv__distinct_nb_ctx_t* ctx);
+
+WOLFSSL_LOCAL int curve25519_nb(byte * q, const byte * n, const byte * p,
+    struct x25519_nb_ctx_t* ctx);
+
+#endif /* WC_X25519_NONBLOCK */
+
+#else
+    #ifdef WC_X25519_NONBLOCK
+        #error The X25519 non-blocking requires CURVE25519_SMALL \
+               (--enable-curve25519=small)
+    #endif
+#endif /* CURVE25519_SMALL || ED25519_SMALL */
 
 
 #if !defined(FREESCALE_LTC_ECC)
 WOLFSSL_LOCAL void fe_init(void);
 
-WOLFSSL_LOCAL int  curve25519(byte * q, const byte * n, const byte * p);
+WOLFSSL_LOCAL int curve25519(byte * q, const byte * n, const byte * p);
+#if defined(CURVED25519_X64) || (defined(WOLFSSL_ARMASM) && defined(__aarch64__))
+/* Fixed-base scalar multiply provided by the x64/aarch64 assembly
+ * (fe_x25519_asm.S, armv8-curve25519); declared here as no other header
+ * prototypes it, which otherwise breaks a strict C (implicit-declaration)
+ * build of curve25519.c. */
+WOLFSSL_LOCAL int curve25519_base(byte * q, const byte * n);
+#endif
 #ifdef WOLFSSL_CURVE25519_BLINDING
-WOLFSSL_LOCAL int  curve25519_blind(byte * q, const byte * n, const byte* mask,
-                                    const byte * p, const byte* rz);
+WOLFSSL_LOCAL int curve25519_blind(byte* q, const byte* n, const byte* mask,
+    const byte* p, const byte* rz);
 #endif
 #endif
 
@@ -125,7 +146,9 @@ WOLFSSL_LOCAL void fe_pow22523(fe out,const fe z);
 #endif
 
 #ifdef CURVED25519_ASM
-WOLFSSL_LOCAL void fe_cmov_table(fe* r, fe* base, signed char b);
+WOLFSSL_LOCAL void fe_cmov_table(fe* r, const fe* base, signed char b);
+
+WOLFSSL_LOCAL void fe_invert_nct(fe r, const fe a);
 #endif /* CURVED25519_ASM */
 #endif /* !CURVE25519_SMALL || !ED25519_SMALL */
 

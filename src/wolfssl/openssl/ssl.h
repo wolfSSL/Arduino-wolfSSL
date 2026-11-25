@@ -1,6 +1,6 @@
 /* ssl.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -44,6 +44,7 @@
 #include <wolfssl/openssl/evp.h>
 #endif
 #include <wolfssl/openssl/bio.h>
+#include <wolfssl/openssl/err.h>
 #ifdef OPENSSL_EXTRA
 #include <wolfssl/openssl/crypto.h>
 #endif
@@ -128,6 +129,12 @@
     WOLFSSL_MYSQL_COMPATIBLE || OPENSSL_EXTRA || \
     HAVE_LIGHTY || HAVE_STUNNEL || \
     WOLFSSL_WPAS_SMALL */
+
+/* Must equal HANDSHAKE_DONE in the internal 'enum states'
+ * (wolfssl/internal.h), returned by wolfSSL_get_state(); enforced by a
+ * wc_static_assert in src/ssl.c. */
+#define WOLFSSL_TLS_ST_OK               16
+#define WOLFSSL_SSL_ST_OK               WOLFSSL_TLS_ST_OK
 
 #if !defined(OPENSSL_COEXIST) && \
     (defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL))
@@ -247,7 +254,15 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 
 #define SSL_get_client_random(ssl,out,outSz) \
                                   wolfSSL_get_client_random((ssl),(out),(outSz))
-#define SSL_get_cipher_list(ctx,i)         wolfSSL_get_cipher_list_ex((ctx),(i))
+#if defined(OPENSSL_EXTRA) || defined(OPENSSL_ALL) || \
+    defined(WOLFSSL_NGINX) || defined(WOLFSSL_HAPROXY)
+#define SSL_get_cipher_list(ssl,i) \
+                                       wolfSSL_get_cipher_list_compat((ssl),(i))
+#else
+/* wolfSSL_get_cipher_list_compat is only declared with the compat layer;
+ * fall back to the always-declared _ex form otherwise. */
+#define SSL_get_cipher_list(ssl,i)         wolfSSL_get_cipher_list_ex((ssl),(i))
+#endif
 #define SSL_get_cipher_name(ctx)           wolfSSL_get_cipher((ctx))
 #define SSL_get_shared_ciphers(ctx,buf,len) \
                                    wolfSSL_get_shared_ciphers((ctx),(buf),(len))
@@ -273,6 +288,7 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 #define SSL_CTX_set_ecdh_auto           wolfSSL_CTX_set_ecdh_auto
 
 #define i2d_PUBKEY                      wolfSSL_i2d_PUBKEY
+#define i2d_PUBKEY_bio                  wolfSSL_i2d_PUBKEY_bio
 #define i2d_X509_PUBKEY                 wolfSSL_i2d_X509_PUBKEY
 #define d2i_PUBKEY                      wolfSSL_d2i_PUBKEY
 #define d2i_PUBKEY_bio                  wolfSSL_d2i_PUBKEY_bio
@@ -346,6 +362,8 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 #define SSL_new                         wolfSSL_new
 #define SSL_set_fd                      wolfSSL_set_fd
 #define SSL_get_fd                      wolfSSL_get_fd
+#define SSL_get_rfd                     wolfSSL_get_fd
+#define SSL_get_wfd                     wolfSSL_get_wfd
 #define SSL_connect                     wolfSSL_connect
 #define SSL_clear                       wolfSSL_clear
 #define SSL_state                       wolfSSL_state
@@ -409,6 +427,24 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 
 #define SSL_CTX_set1_groups_list        wolfSSL_CTX_set1_groups_list
 #define SSL_set1_groups_list            wolfSSL_set1_groups_list
+
+/* Both aliases are skipped for nginx. Note that --enable-all defines
+ * WOLFSSL_NGINX too. Only the aliases are dropped, the wolfSSL_* functions stay
+ * available.
+ * - SSL_group_to_name(): nginx defines its own fallback unconditionally in
+ *   ngx_event_openssl.h, after this header, so the alias would be a macro
+ *   redefinition and nginx builds with -Werror.
+ * - SSL_get_negotiated_group(): nginx keys off the macro to pick an
+ *   OpenSSL-only branch of ngx_ssl_get_curve() that needs TLSEXT_nid_unknown,
+ *   which wolfSSL does not have. Without the alias nginx keeps using
+ *   wolfSSL_get_curve_name(), as it did before this API existed.
+ * The second condition matches the one the functions are built under, so a
+ * build with neither an EC group nor DH gets no alias to a missing symbol. */
+#if !defined(WOLFSSL_NGINX) && (defined(HAVE_ECC) || \
+    defined(HAVE_CURVE25519) || defined(HAVE_CURVE448) || !defined(NO_DH))
+#define SSL_get_negotiated_group        wolfSSL_get_negotiated_group
+#define SSL_group_to_name               wolfSSL_group_to_name
+#endif
 
 #define SSL_set_ex_data                 wolfSSL_set_ex_data
 #define SSL_get_shutdown                wolfSSL_get_shutdown
@@ -574,6 +610,21 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 #define X509_set1_notBefore             wolfSSL_X509_set1_notBefore
 #define X509_set_serialNumber           wolfSSL_X509_set_serialNumber
 #define X509_set_version                wolfSSL_X509_set_version
+#ifdef WOLFSSL_CERT_EXT
+#define X509_set_subject_key_id         wolfSSL_X509_set_subject_key_id
+#ifndef NO_SHA
+#define X509_set_subject_key_id_ex      wolfSSL_X509_set_subject_key_id_ex
+#endif
+#define X509_set_authority_key_id       wolfSSL_X509_set_authority_key_id
+#ifndef NO_SHA
+#define X509_set_authority_key_id_ex    wolfSSL_X509_set_authority_key_id_ex
+#endif
+#define X509_CRL_set_dist_points        wolfSSL_X509_CRL_set_dist_points
+#define X509_CRL_add_dist_point         wolfSSL_X509_CRL_add_dist_point
+#endif
+#ifndef IGNORE_NETSCAPE_CERT_TYPE
+#define X509_set_ns_cert_type           wolfSSL_X509_set_ns_cert_type
+#endif
 #define X509_REQ_set_version            wolfSSL_X509_REQ_set_version
 #define X509_REQ_get_version            wolfSSL_X509_REQ_get_version
 #define X509_sign                       wolfSSL_X509_sign
@@ -615,16 +666,18 @@ typedef STACK_OF(ACCESS_DESCRIPTION) AUTHORITY_INFO_ACCESS;
 #define sk_X509_push                    wolfSSL_sk_X509_push
 #define sk_X509_pop                     wolfSSL_sk_X509_pop
 #define sk_X509_pop_free                wolfSSL_sk_X509_pop_free
-#define sk_X509_dup                     wolfSSL_sk_dup
+#define sk_X509_dup                     wolfSSL_shallow_sk_dup
 #define sk_X509_free                    wolfSSL_sk_X509_free
 #define X509_chain_up_ref               wolfSSL_X509_chain_up_ref
 
 #define sk_X509_CRL_new                 wolfSSL_sk_X509_CRL_new
+#define sk_X509_CRL_new_null            wolfSSL_sk_X509_CRL_new_null
 #define sk_X509_CRL_pop_free            wolfSSL_sk_X509_CRL_pop_free
 #define sk_X509_CRL_free                wolfSSL_sk_X509_CRL_free
 #define sk_X509_CRL_push                wolfSSL_sk_X509_CRL_push
 #define sk_X509_CRL_value               wolfSSL_sk_X509_CRL_value
 #define sk_X509_CRL_num                 wolfSSL_sk_X509_CRL_num
+#define sk_X509_CRL_dup                 wolfSSL_shallow_sk_dup
 
 #define sk_X509_OBJECT_new              wolfSSL_sk_X509_OBJECT_new
 #define sk_X509_OBJECT_free             wolfSSL_sk_X509_OBJECT_free
@@ -752,6 +805,9 @@ typedef WOLFSSL_X509_NAME_ENTRY X509_NAME_ENTRY;
 #define X509_STORE_CTX_get0_store       wolfSSL_X509_STORE_CTX_get0_store
 #define X509_STORE_CTX_get0_cert        wolfSSL_X509_STORE_CTX_get0_cert
 #define X509_STORE_CTX_trusted_stack    wolfSSL_X509_STORE_CTX_trusted_stack
+#ifdef HAVE_CRL
+#define X509_STORE_CTX_set0_crls        wolfSSL_X509_STORE_CTX_set0_crls
+#endif
 
 #define X509_STORE_set_verify_cb(s, c) \
 wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_CTX_verify_cb)(c))
@@ -802,10 +858,14 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 
 #define d2i_X509_CRL                    wolfSSL_d2i_X509_CRL
 #define d2i_X509_CRL_fp                 wolfSSL_d2i_X509_CRL_fp
+#define i2d_X509_CRL                    wolfSSL_i2d_X509_CRL
 #define PEM_read_X509_CRL               wolfSSL_PEM_read_X509_CRL
 
+#define X509_CRL_new                    wolfSSL_X509_CRL_new
 #define X509_CRL_dup                    wolfSSL_X509_CRL_dup
+#define X509_CRL_up_ref                 wolfSSL_X509_CRL_up_ref
 #define X509_CRL_free                   wolfSSL_X509_CRL_free
+#define X509_CRL_sign                   wolfSSL_X509_CRL_sign
 #define X509_CRL_get_lastUpdate         wolfSSL_X509_CRL_get_lastUpdate
 #define X509_CRL_get0_lastUpdate        wolfSSL_X509_CRL_get_lastUpdate
 #define X509_CRL_get_nextUpdate         wolfSSL_X509_CRL_get_nextUpdate
@@ -813,8 +873,15 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 #define X509_CRL_verify                 wolfSSL_X509_CRL_verify
 #define X509_CRL_get_REVOKED            wolfSSL_X509_CRL_get_REVOKED
 #define X509_CRL_get_issuer             wolfSSL_X509_CRL_get_issuer_name
-#define X509_CRL_get_signature_nid      wolfSSL_X509_CRL_get_signature_nid
 #define X509_CRL_get_version            wolfSSL_X509_CRL_version
+#define X509_CRL_set_lastUpdate         wolfSSL_X509_CRL_set_lastUpdate
+#define X509_CRL_set1_lastUpdate        wolfSSL_X509_CRL_set_lastUpdate
+#define X509_CRL_set_nextUpdate         wolfSSL_X509_CRL_set_nextUpdate
+#define X509_CRL_set1_nextUpdate        wolfSSL_X509_CRL_set_nextUpdate
+#define X509_CRL_set_issuer_name        wolfSSL_X509_CRL_set_issuer_name
+#define X509_CRL_set_version            wolfSSL_X509_CRL_set_version
+#define X509_CRL_get0_signature         wolfSSL_X509_CRL_get_signature
+#define X509_CRL_get_signature_nid      wolfSSL_X509_CRL_get_signature_nid
 #define X509_load_crl_file              wolfSSL_X509_load_crl_file
 
 #define X509_ACERT_new                  wolfSSL_X509_ACERT_new
@@ -852,6 +919,9 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 
 #define X509_REVOKED_get0_serialNumber   wolfSSL_X509_REVOKED_get0_serial_number
 #define X509_REVOKED_get0_revocationDate wolfSSL_X509_REVOKED_get0_revocation_date
+#define X509_REVOKED_free                wolfSSL_X509_REVOKED_free
+#define X509_REVOKED_get_ext_count       wolfSSL_X509_REVOKED_get_ext_count
+#define X509_REVOKED_get_ext             wolfSSL_X509_REVOKED_get_ext
 
 #define X509_check_purpose(x, id, ca)   0
 
@@ -868,7 +938,6 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 #define BIO_nread0                      wolfSSL_BIO_nread0
 #define BIO_nread                       wolfSSL_BIO_nread
 #define BIO_read                        wolfSSL_BIO_read
-#define BIO_nwrite0                     wolfSSL_BIO_nwrite0
 #define BIO_nwrite                      wolfSSL_BIO_nwrite
 #define BIO_write                       wolfSSL_BIO_write
 #define BIO_push                        wolfSSL_BIO_push
@@ -942,6 +1011,7 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 #define ASN1_BIT_STRING_free            wolfSSL_ASN1_BIT_STRING_free
 #define ASN1_BIT_STRING_get_bit         wolfSSL_ASN1_BIT_STRING_get_bit
 #define ASN1_BIT_STRING_set_bit         wolfSSL_ASN1_BIT_STRING_set_bit
+#define ASN1_BIT_STRING_set1            wolfSSL_ASN1_BIT_STRING_set1
 #define i2d_ASN1_BIT_STRING             wolfSSL_i2d_ASN1_BIT_STRING
 #define d2i_ASN1_BIT_STRING             wolfSSL_d2i_ASN1_BIT_STRING
 
@@ -990,8 +1060,27 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 #define ASN1_STRING_cmp                 wolfSSL_ASN1_STRING_cmp
 #define ASN1_OCTET_STRING_cmp           wolfSSL_ASN1_STRING_cmp
 #define ASN1_STRING_data                wolfSSL_ASN1_STRING_data
+/* In OpenSSL, ASN1_INTEGER is a typedef alias of ASN1_STRING (same struct),
+ * so ASN1_STRING_length/get0_data work on ASN1_INTEGER* as well.
+ * In wolfSSL they are distinct structs, so dispatch by type using _Generic. */
+#if !defined(__cplusplus) && defined(__STDC_VERSION__) && \
+        __STDC_VERSION__ >= 201112L
+#define ASN1_STRING_length(x) \
+    _Generic((x), \
+        WOLFSSL_ASN1_INTEGER*:       wolfSSL_ASN1_INTEGER_get_length, \
+        const WOLFSSL_ASN1_INTEGER*: wolfSSL_ASN1_INTEGER_get_length, \
+        default:                     wolfSSL_ASN1_STRING_length \
+    )(x)
+#define ASN1_STRING_get0_data(x) \
+    _Generic((x), \
+        WOLFSSL_ASN1_INTEGER*:       wolfSSL_ASN1_INTEGER_get0_data, \
+        const WOLFSSL_ASN1_INTEGER*: wolfSSL_ASN1_INTEGER_get0_data, \
+        default:                     wolfSSL_ASN1_STRING_get0_data \
+    )(x)
+#else
 #define ASN1_STRING_get0_data           wolfSSL_ASN1_STRING_get0_data
 #define ASN1_STRING_length              wolfSSL_ASN1_STRING_length
+#endif
 #define ASN1_STRING_to_UTF8             wolfSSL_ASN1_STRING_to_UTF8
 #define ASN1_UNIVERSALSTRING_to_string  wolfSSL_ASN1_UNIVERSALSTRING_to_string
 #define ASN1_STRING_print_ex            wolfSSL_ASN1_STRING_print_ex
@@ -1070,6 +1159,14 @@ wolfSSL_X509_STORE_set_verify_cb((WOLFSSL_X509_STORE *)(s), (WOLFSSL_X509_STORE_
 #define SSL_CTX_set_info_callback       wolfSSL_CTX_set_info_callback
 #define SSL_set_info_callback           wolfSSL_set_info_callback
 #define SSL_CTX_set_alpn_protos         wolfSSL_CTX_set_alpn_protos
+
+/* Application-defined ("custom") TLS extensions. */
+#if defined(OPENSSL_EXTRA) && defined(HAVE_TLS_EXTENSIONS)
+typedef wolfSSL_custom_ext_add_cb   custom_ext_add_cb;
+typedef wolfSSL_custom_ext_free_cb  custom_ext_free_cb;
+typedef wolfSSL_custom_ext_parse_cb custom_ext_parse_cb;
+#define SSL_CTX_add_client_custom_ext   wolfSSL_CTX_add_client_custom_ext
+#endif /* OPENSSL_EXTRA && HAVE_TLS_EXTENSIONS */
 
 #define SSL_CTX_keylog_cb_func          wolfSSL_CTX_keylog_cb_func
 #define SSL_CTX_set_keylog_callback     wolfSSL_CTX_set_keylog_callback
@@ -1307,13 +1404,22 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define SSL_SESSION_get_id              wolfSSL_SESSION_get_id
 #define SSL_get_cipher_bits(s,np)       \
                           wolfSSL_CIPHER_get_bits(SSL_get_current_cipher(s),np)
+#define SSL_get_cipher_version(s)       \
+                          wolfSSL_CIPHER_get_version(SSL_get_current_cipher(s))
 #define sk_SSL_CIPHER_num               wolfSSL_sk_SSL_CIPHER_num
 #define sk_SSL_COMP_zero                wolfSSL_sk_SSL_COMP_zero
 #define sk_SSL_CIPHER_value             wolfSSL_sk_SSL_CIPHER_value
 #endif /* OPENSSL_ALL || WOLFSSL_HAPROXY */
-#define sk_SSL_CIPHER_dup               wolfSSL_sk_dup
+#define sk_SSL_CIPHER_dup               wolfSSL_shallow_sk_dup
 #define sk_SSL_CIPHER_free              wolfSSL_sk_SSL_CIPHER_free
 #define sk_SSL_CIPHER_find              wolfSSL_sk_SSL_CIPHER_find
+#if defined(OPENSSL_EXTRA) && !defined(NO_CERTS)
+#define sk_SSL_CIPHER_delete            wolfSSL_sk_SSL_CIPHER_delete
+#endif
+#if defined(OPENSSL_ALL) || defined(WOLFSSL_NGINX) || \
+    defined(WOLFSSL_HAPROXY) || defined(OPENSSL_EXTRA)
+#define SSL_CIPHER_find                 wolfSSL_SSL_CIPHER_find
+#endif
 
 #if defined(SESSION_CERTS) && defined(OPENSSL_EXTRA)
 #define SSL_get0_peername wolfSSL_get0_peername
@@ -1330,6 +1436,7 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define SSL_CTRL_CLEAR_EXTRA_CHAIN_CERTS        83
 
 #define SSL_CTX_clear_chain_certs(ctx) SSL_CTX_set0_chain(ctx,NULL)
+#define SSL_clear_chain_certs           wolfSSL_clear_chain_certs
 #define d2i_RSAPrivateKey_bio           wolfSSL_d2i_RSAPrivateKey_bio
 #define SSL_CTX_use_RSAPrivateKey       wolfSSL_CTX_use_RSAPrivateKey
 #define d2i_PrivateKey_bio              wolfSSL_d2i_PrivateKey_bio
@@ -1368,6 +1475,7 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define SSL_get_secure_renegotiation_support wolfSSL_SSL_get_secure_renegotiation_support
 #define SSL_renegotiate_pending         wolfSSL_SSL_renegotiate_pending
 #define SSL_set_tlsext_debug_arg        wolfSSL_set_tlsext_debug_arg
+#define SSL_set_tlsext_debug_callback   wolfSSL_set_tlsext_debug_callback
 #define SSL_set_tlsext_status_type      wolfSSL_set_tlsext_status_type
 #define SSL_get_tlsext_status_type      wolfSSL_get_tlsext_status_type
 #define SSL_set_tlsext_status_exts      wolfSSL_set_tlsext_status_exts
@@ -1384,6 +1492,8 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define SSL_set_read_ahead              wolfSSL_set_read_ahead
 #define SSL_CTX_get_read_ahead          wolfSSL_CTX_get_read_ahead
 #define SSL_CTX_set_read_ahead          wolfSSL_CTX_set_read_ahead
+#define SSL_CTX_set_default_read_buffer_len wolfSSL_CTX_set_default_read_buffer_len
+#define SSL_set_default_read_buffer_len wolfSSL_set_default_read_buffer_len
 #define SSL_CTX_set_tlsext_status_arg   wolfSSL_CTX_set_tlsext_status_arg
 #define SSL_CTX_set_tlsext_opaque_prf_input_callback_arg \
                             wolfSSL_CTX_set_tlsext_opaque_prf_input_callback_arg
@@ -1514,6 +1624,10 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define SSL_version(x)                  wolfSSL_version ((WOLFSSL*) (x))
 #define SSL_get_state                   wolfSSL_get_state
 #define SSL_state_string_long           wolfSSL_state_string_long
+
+#define TLS_ST_OK                       WOLFSSL_TLS_ST_OK
+#define SSL_ST_OK                       WOLFSSL_SSL_ST_OK
+#define SSL_F_SSL_SET_FD                WOLFSSL_SSL_F_SSL_SET_FD
 
 #define GENERAL_NAME_new                wolfSSL_GENERAL_NAME_new
 #define GENERAL_NAME_free               wolfSSL_GENERAL_NAME_free
@@ -1685,12 +1799,22 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define SSL_R_DATA_LENGTH_TOO_LONG                 BUFFER_ERROR
 #define SSL_R_ENCRYPTED_LENGTH_TOO_LONG            BUFFER_ERROR
 #define SSL_R_BAD_LENGTH                           BUFFER_ERROR
-#define SSL_R_UNKNOWN_PROTOCOL                     VERSION_ERROR
-#define SSL_R_WRONG_VERSION_NUMBER                 VERSION_ERROR
+#define SSL_R_UNKNOWN_PROTOCOL WOLFSSL_SSL_R_UNKNOWN_PROTOCOL
+#define SSL_R_WRONG_VERSION_NUMBER WOLFSSL_SSL_R_WRONG_VERSION_NUMBER
 #define SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC  ENCRYPT_ERROR
 #define SSL_R_HTTPS_PROXY_REQUEST                  PARSE_ERROR
 #define SSL_R_HTTP_REQUEST                         PARSE_ERROR
-#define SSL_R_UNSUPPORTED_PROTOCOL                 VERSION_ERROR
+#define SSL_R_UNSUPPORTED_PROTOCOL WOLFSSL_SSL_R_UNSUPPORTED_PROTOCOL
+#define SSL_R_NO_PROTOCOLS_AVAILABLE \
+    WOLFSSL_SSL_R_NO_PROTOCOLS_AVAILABLE
+#define SSL_R_BAD_PROTOCOL_VERSION_NUMBER \
+    WOLFSSL_SSL_R_BAD_PROTOCOL_VERSION_NUMBER
+#define SSL_R_UNKNOWN_SSL_VERSION WOLFSSL_SSL_R_UNKNOWN_SSL_VERSION
+#define SSL_R_UNSUPPORTED_SSL_VERSION \
+    WOLFSSL_SSL_R_UNSUPPORTED_SSL_VERSION
+#define SSL_R_WRONG_SSL_VERSION WOLFSSL_SSL_R_WRONG_SSL_VERSION
+#define SSL_R_TLSV1_ALERT_PROTOCOL_VERSION \
+    WOLFSSL_SSL_R_TLSV1_ALERT_PROTOCOL_VERSION
 #define SSL_R_CERTIFICATE_VERIFY_FAILED            VERIFY_CERT_ERROR
 #define SSL_R_CERT_CB_ERROR                        CLIENT_CERT_CB_ERROR
 #define SSL_R_NULL_SSL_METHOD_PASSED               BAD_FUNC_ARG
@@ -1810,11 +1934,7 @@ typedef WOLFSSL_SRTP_PROTECTION_PROFILE      SRTP_PROTECTION_PROFILE;
 #define X509_OBJECT_new                 wolfSSL_X509_OBJECT_new
 #define X509_OBJECT_free                wolfSSL_X509_OBJECT_free
 #define X509_OBJECT_get_type            wolfSSL_X509_OBJECT_get_type
-#if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100000L
 #define OpenSSL_version(x)              wolfSSL_OpenSSL_version(x)
-#else
-#define OpenSSL_version(x)              wolfSSL_OpenSSL_version()
-#endif
 
 #define X509_OBJECT_retrieve_by_subject wolfSSL_X509_OBJECT_retrieve_by_subject
 

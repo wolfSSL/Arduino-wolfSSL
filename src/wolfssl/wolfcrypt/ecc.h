@@ -1,6 +1,6 @@
 /* ecc.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -44,12 +44,10 @@
 
 #ifdef WOLFSSL_ASYNC_CRYPT
     #include <wolfssl/wolfcrypt/async.h>
-    #ifdef WOLFSSL_CERT_GEN
-        #include <wolfssl/wolfcrypt/asn.h>
-    #endif
 #endif
 
-#if defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A)
+#if defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A) || \
+    defined(WOLFSSL_MICROCHIP_TA100)
     #include <wolfssl/wolfcrypt/port/atmel/atmel.h>
 #endif /* WOLFSSL_ATECC508A */
 
@@ -73,6 +71,17 @@
     #include <wolfssl/wolfcrypt/port/xilinx/xil-versal-glue.h>
 #endif
 
+#if defined(WOLFSSL_DHUK) || defined(WOLFSSL_STM32U5_DHUK)
+    /* wc_ecc_import_wrapped_private below is gated on WC_STM32_HAS_DHUK, which
+     * only stm32.h defines. Pull it in here so the prototype and the ecc.c
+     * definition are always gated identically -- otherwise the guard silently
+     * evaluates false in any translation unit that has not seen stm32.h.
+     * WOLFSSL_STM32U5_DHUK is the documented legacy spelling; stm32.h maps it
+     * to WOLFSSL_DHUK, so it has to be tested here too or the include is
+     * skipped for exactly the users following the older docs. */
+    #include <wolfssl/wolfcrypt/port/st/stm32.h>
+#endif
+
 #ifdef WOLFSSL_HAVE_SP_ECC
     #include <wolfssl/wolfcrypt/sp_int.h>
 #endif
@@ -85,13 +94,6 @@
 #if FIPS_VERSION3_GE(6,0,0)
     extern const unsigned int wolfCrypt_FIPS_ecc_ro_sanity[2];
     WOLFSSL_LOCAL int wolfCrypt_FIPS_ECC_sanity(void);
-#endif
-
-/* Enable curve B parameter if needed */
-#if defined(HAVE_COMP_KEY) || defined(ECC_CACHE_CURVE)
-    #ifndef USE_ECC_B_PARAM /* Allow someone to force enable */
-        #define USE_ECC_B_PARAM
-    #endif
 #endif
 
 
@@ -126,6 +128,17 @@
     #define MAX_ECC_BITS_NEEDED    112
 #endif
 
+/* The bit ECC_KEY_MAX_BITS adds for an order larger than the prime.  It is an
+ * internal sizing detail rather than part of the curve size a user configures,
+ * so ecc.c folds it into MAX_ECC_BITS_USE and builds ECC_KEY_MAX_BITS from the
+ * same macro, and MAX_ECC_BITS keeps meaning the plain largest curve. */
+#if defined(WOLFSSL_CUSTOM_CURVES) || (ECC_MIN_KEY_SZ <= 160) || \
+    (defined(HAVE_ECC_KOBLITZ) && (ECC_MIN_KEY_SZ <= 224))
+    #define MAX_ECC_BITS_EXTRA 1
+#else
+    #define MAX_ECC_BITS_EXTRA 0
+#endif
+
 #ifndef MAX_ECC_BITS
     #define MAX_ECC_BITS MAX_ECC_BITS_NEEDED
 #else
@@ -151,6 +164,11 @@
     #define MAX_ECC_BYTES     ((MAX_ECC_BITS / 8) + 1)
 #endif
 
+/* Bytes needed to hold a curve order.  MAX_ECC_BYTES sizes to the prime, but
+ * the curves MAX_ECC_BITS_EXTRA covers have an order a bit -- and so a byte --
+ * longer than that, e.g. secp160r1 and secp224k1. */
+#define MAX_ECC_ORDER_BYTES   (((MAX_ECC_BITS + MAX_ECC_BITS_EXTRA) + 7) / 8)
+
 #ifndef ECC_MAX_PAD_SZ
     /* ECC maximum padding size (when MSB is set extra byte required for R and S) */
     #define ECC_MAX_PAD_SZ 2
@@ -175,7 +193,11 @@ enum {
     ECC_MAX_SIG_SIZE= ((MAX_ECC_BYTES * 2) + ECC_MAX_PAD_SZ + SIG_HEADER_SZ),
 
     /* max crypto hardware size */
-#if defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A)
+#if defined(WOLFSSL_MICROCHIP_TA100)
+    /* TA100 supports up to P-384 */
+    ECC_MAX_CRYPTO_HW_SIZE = 48,
+    ECC_MAX_CRYPTO_HW_PUBKEY_SIZE = (ECC_MAX_CRYPTO_HW_SIZE*2),
+#elif defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A)
     ECC_MAX_CRYPTO_HW_SIZE = ATECC_KEY_SIZE, /* from port/atmel/atmel.h */
     ECC_MAX_CRYPTO_HW_PUBKEY_SIZE = (ATECC_KEY_SIZE*2),
 #elif defined(PLUTON_CRYPTO_ECC)
@@ -483,7 +505,22 @@ struct ecc_point {
 enum {
     WC_ECC_FLAG_NONE     = 0x00,
     WC_ECC_FLAG_COFACTOR = 0x01,
-    WC_ECC_FLAG_DEC_SIGN = 0x02
+    WC_ECC_FLAG_DEC_SIGN = 0x02,
+    /* Add key derivation to a PKCS#11 token-generated key, so the same key can
+     * do both ECDH and ECDSA on a token that grants only what was explicitly
+     * requested.
+     *
+     * Consumed ONLY by PKCS#11-backed key generation; it has no effect on any
+     * software or other hardware ECC path.
+     *
+     * IGNORED unless WC_ECC_FLAG_DEC_SIGN is also set. Setting it on its own
+     * changes nothing, because a generated key is already derive-only by
+     * default - so the meaningful use is:
+     *
+     *     wc_ecc_make_key_ex2(rng, keysize, key, curve_id,
+     *                         WC_ECC_FLAG_DEC_SIGN | WC_ECC_FLAG_DERIVE);
+     */
+    WC_ECC_FLAG_DERIVE   = 0x04
 };
 
 /* ECC non-blocking */
@@ -541,7 +578,8 @@ struct ecc_key {
     word32 keyId;
     byte   keyIdSet;
 #endif
-#if defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A)
+#if defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A) || \
+    defined(WOLFSSL_MICROCHIP_TA100)
     int  slot;        /* Key Slot Number (-1 unknown) */
     byte pubkey_raw[ECC_MAX_CRYPTO_HW_PUBKEY_SIZE];
 #endif
@@ -627,26 +665,67 @@ struct ecc_key {
 #ifdef WC_ECC_NONBLOCK
     ecc_nb_ctx_t* nb_ctx;
 #endif
+#ifdef WOLFSSL_DHUK
+    /* DHUK ECC sign: the ECC private scalar, AES-encrypted with the device key
+     * that the SAES derives (from the 256-bit seed below) inside the hardware.
+     * At sign time it is decrypted into a short-lived buffer; the device key
+     * never enters software.
+     *  - dhuk_wrapped_priv      -- the wrapped scalar. Length is a multiple of
+     *    16; 96 bytes covers P-521 (66 padded to 80) plus headroom.
+     *  - dhuk_seed              -- 256-bit derivation seed (mixed with the
+     *    silicon DHUK to derive the unwrap key).
+     *  - dhuk_wrapped_priv_len  -- wrapped blob length.
+     *  - dhuk_plain_priv_len    -- actual scalar size in bytes (32 P-256,
+     *    48 P-384, 66 P-521).
+     *  - dhuk_seed_sz           -- seed length (must be 32).
+     * Set via wc_ecc_import_wrapped_private(); enable the device by setting
+     * devId at init (wc_ecc_init_ex(&key, heap, WC_DHUK_DEVID)). */
+    byte    dhuk_wrapped_priv[96];
+    byte    dhuk_seed[32];
+    word32  dhuk_wrapped_priv_len;
+    word32  dhuk_plain_priv_len;
+    word32  dhuk_seed_sz;
+#ifdef WOLFSSL_STM32_CCB
+    /* CCB (Coupling and Chaining Bridge) ECDSA blob. The wrapped scalar reuses
+     * dhuk_wrapped_priv (+ dhuk_wrapped_priv_len); the AES-GCM blob IV and tag
+     * are here; the public key is the standard key->pubkey. dhuk_is_ccb selects
+     * the CCB sign path in the crypto callback. Provisioned on-device by the
+     * standard wc_ecc_make_key() (intercepted in the crypto callback) or loaded
+     * via wc_ecc_import_wrapped_private_ex(). */
+    byte    ccb_iv[16];
+    byte    ccb_tag[16];
+    byte    dhuk_is_ccb;
+#endif
+#endif
 };
 
 #ifndef WOLFSSL_ECC_BLIND_K
 #define ecc_get_k(key)              (key)->k
 #define ecc_blind_k(key, b)         (void)b
 #define ecc_blind_k_rng(key, rng)   0
+#define ecc_forcezero_k(key)        mp_forcezero((key)->k)
 
 #define wc_ecc_key_get_priv(key)    (key)->k
 #else
 mp_int* ecc_get_k(ecc_key* key);
 void ecc_blind_k(ecc_key* key, mp_int* b);
 int ecc_blind_k_rng(ecc_key* key, WC_RNG* rng);
+WOLFSSL_LOCAL void ecc_forcezero_k(ecc_key* key);
 
 WOLFSSL_API mp_int* wc_ecc_key_get_priv(ecc_key* key);
 #endif
+/* Writable handle on the stored private scalar. With blinding enabled,
+ * wc_ecc_key_get_priv() returns a value regenerated into scratch, so it is
+ * read-only: writes through it are discarded and erasing it leaves the
+ * secret in place. Write a new scalar through this instead, then install a
+ * fresh blind with ecc_blind_k_rng(); erase with ecc_forcezero_k(). */
+#define ecc_get_k_raw(key)          (key)->k
 
 #define WOLFSSL_HAVE_ECC_KEY_GET_PRIV
 
 
 WOLFSSL_ABI WOLFSSL_API ecc_key* wc_ecc_key_new(void* heap);
+WOLFSSL_ABI WOLFSSL_API ecc_key* wc_ecc_key_new_ex(void* heap, int devId);
 WOLFSSL_ABI WOLFSSL_API void wc_ecc_key_free(ecc_key* key);
 
 
@@ -718,8 +797,11 @@ WOLFSSL_LOCAL
 int wc_ecc_shared_secret_gen_sync(ecc_key* private_key,
     ecc_point* point, byte* out, word32* outlen);
 
-#if !defined(WOLFSSL_ATECC508A) && !defined(WOLFSSL_ATECC608A) && \
-    !defined(PLUTON_CRYPTO_ECC) && !defined(WOLFSSL_CRYPTOCELL)
+#if defined(WOLFSSL_ATECC508A) || defined(WOLFSSL_ATECC608A) || \
+    defined(WOLFSSL_MICROCHIP_TA100) || \
+    defined(PLUTON_CRYPTO_ECC) || defined(WOLFSSL_CRYPTOCELL)
+#define wc_ecc_shared_secret_ssh wc_ecc_shared_secret
+#else
 #define wc_ecc_shared_secret_ssh wc_ecc_shared_secret_ex /* For backwards compat */
 #endif
 
@@ -732,6 +814,61 @@ int wc_ecc_sign_hash(const byte* in, word32 inlen, byte* out, word32 *outlen,
 WOLFSSL_API
 int wc_ecc_sign_hash_ex(const byte* in, word32 inlen, WC_RNG* rng,
                         ecc_key* key, mp_int *r, mp_int *s);
+#if defined(WOLFSSL_DHUK) && defined(WC_STM32_HAS_DHUK) && \
+    (defined(WOLFSSL_STM32_BARE) || defined(WOLFSSL_STM32_CUBEMX))
+/* DHUK ECC sign: import a hardware-wrapped ECC private scalar + its derivation
+ * seed onto the ecc_key for the crypto-callback sign path. Sets the curve, so
+ * the key is ready to sign on return. Enable the device by setting devId at
+ * init (wc_ecc_init_ex(&key, heap, WC_DHUK_DEVID)). To verify with this same
+ * key, also populate key->pubkey (via wc_ecc_import_x963) -- verify uses the
+ * in-clear public counterpart and does not touch the wrapped scalar.
+ *   curve_id    -- curve the scalar belongs to (e.g. ECC_SECP256R1); without
+ *                  it the sign path has no parameters to drive the PKA and
+ *                  returns ECC_BAD_ARG_E
+ *   seed        -- 256-bit derivation seed (mixed with the silicon DHUK to
+ *                  derive the key that unwraps the scalar)
+ *   seedSz      -- seed length, must be 32
+ *   wrapped     -- ECC scalar AES-encrypted with the SAES-derived device key;
+ *                  length is a multiple of 16, <= 96
+ *   wrappedLen  -- length of the wrapped blob
+ *   plainLen    -- actual scalar size, and must match the curve (32 for
+ *                  P-256, 48 for P-384)
+ *
+ * On success: sets the curve, stores seed + blob + lengths, returns 0 (does
+ * NOT set devId).
+ * On failure: BAD_FUNC_ARG, or an error from the curve lookup. */
+WOLFSSL_API
+int wc_ecc_import_wrapped_private(ecc_key* key, int curve_id,
+                                  const byte* seed, word32 seedSz,
+                                  const byte* wrapped, word32 wrappedLen,
+                                  word32 plainLen);
+#endif
+
+#if defined(WOLFSSL_DHUK) && defined(WOLFSSL_STM32_CCB)
+/* STM32 CCB (Coupling and Chaining Bridge) ECDSA, HW DHUK->PKA. The private
+ * scalar is wrapped in an AES-GCM "blob" that only the device's CCB can unwrap
+ * into the PKA -- it never enters software.
+ *
+ * Provisioning is transparent through the standard ECC API: init the key with
+ * WC_DHUK_DEVID (wc_ecc_init_ex(&key, heap, WC_DHUK_DEVID)) and call the normal
+ * wc_ecc_make_key() -- the STM32 crypto callback intercepts keygen and binds a
+ * fresh device blob to the key (no CCB-specific public API). wc_ecc_sign_hash()
+ * then signs through the same callback.
+ *
+ * wc_ecc_import_wrapped_private_ex: restore a previously provisioned blob (the
+ *   wrapped scalar + AES-GCM iv/tag + public key) onto a WC_DHUK_DEVID key. */
+WOLFSSL_API
+int wc_ecc_import_wrapped_private_ex(ecc_key* key, int curve_id,
+                           const byte* wrapped, word32 wrappedLen,
+                           const byte* iv, word32 ivLen,
+                           const byte* tag, word32 tagLen,
+                           const byte* pub, word32 pubLen);
+/* Internal: crypto-callback keygen handler -- binds a fresh device blob to the
+ * key using the supplied rng. Not a public entry point; callers reach it via
+ * wc_ecc_make_key() on a WC_DHUK_DEVID key. */
+WOLFSSL_LOCAL
+int wc_ecc_dev_make_key(WC_RNG* rng, int keysize, ecc_key* key, int curve_id);
+#endif
 #if defined(WOLFSSL_ECDSA_DETERMINISTIC_K) || \
     defined(WOLFSSL_ECDSA_DETERMINISTIC_K_VARIANT)
 WOLFSSL_API
@@ -772,7 +909,7 @@ int wc_ecc_init_label(ecc_key* key, const char* label, void* heap, int devId);
 #endif
 #ifdef WOLFSSL_CUSTOM_CURVES
 WOLFSSL_LOCAL
-void wc_ecc_free_curve(const ecc_set_type* curve, void* heap);
+void wc_ecc_free_curve(ecc_set_type* curve, void* heap);
 #endif
 WOLFSSL_ABI WOLFSSL_API
 int wc_ecc_free(ecc_key* key);
@@ -784,6 +921,8 @@ WOLFSSL_API
 void wc_ecc_fp_init(void);
 WOLFSSL_API
 int wc_ecc_set_rng(ecc_key* key, WC_RNG* rng);
+WOLFSSL_API
+int wc_ecc_clear_rng(ecc_key* key);
 
 WOLFSSL_API
 int wc_ecc_set_curve(ecc_key* key, int keysize, int curve_id);
@@ -866,6 +1005,9 @@ int wc_ecc_import_x963(const byte* in, word32 inLen, ecc_key* key);
 WOLFSSL_API
 int wc_ecc_import_x963_ex(const byte* in, word32 inLen, ecc_key* key,
                           int curve_id);
+WOLFSSL_API
+int wc_ecc_import_x963_ex2(const byte* in, word32 inLen, ecc_key* key,
+                           int curve_id, int untrusted);
 WOLFSSL_ABI WOLFSSL_API
 int wc_ecc_import_private_key(const byte* priv, word32 privSz, const byte* pub,
                            word32 pubSz, ecc_key* key);
@@ -954,7 +1096,9 @@ enum ecEncAlgo {
     ecAES_128_CBC = 1,  /* default */
     ecAES_256_CBC = 2,
     ecAES_128_CTR = 3,
-    ecAES_256_CTR = 4
+    ecAES_256_CTR = 4,
+    ecAES_128_GCM = 5,
+    ecAES_256_GCM = 6
 };
 
 enum ecKdfAlgo {
@@ -1005,6 +1149,28 @@ int wc_ecc_ctx_reset(ecEncCtx* ctx, WC_RNG* rng);  /* reset for use again w/o al
 WOLFSSL_API
 int wc_ecc_ctx_set_algo(ecEncCtx* ctx, byte encAlgo, byte kdfAlgo,
     byte macAlgo);
+#ifdef WOLF_CRYPTO_CB
+/* Accessors for crypto-callback backends; only built with WOLF_CRYPTO_CB. */
+WOLFSSL_API
+int wc_ecc_ctx_get_algo(ecEncCtx* ctx, byte* encAlgo, byte* kdfAlgo,
+    byte* macAlgo);
+WOLFSSL_API
+int wc_ecc_ctx_get_kdf_salt(ecEncCtx* ctx, const byte** salt, word32* sz);
+WOLFSSL_API
+int wc_ecc_ctx_get_info(ecEncCtx* ctx, const byte** info, word32* sz);
+WOLFSSL_API
+int wc_ecc_ctx_get_mac_salt(ecEncCtx* ctx, const byte** salt, word32* sz);
+WOLFSSL_API
+int wc_ecc_ctx_get_protocol(ecEncCtx* ctx, int* protocol);
+WOLFSSL_API
+int wc_ecc_ctx_get_rng(ecEncCtx* ctx, WC_RNG** rng);
+/* Device that ECIES runs on; never copied from the ECC key. Unset means
+ * software, or the WOLF_CRYPTO_CB_FIND finder. Kept across ctx reset. */
+WOLFSSL_API
+int wc_ecc_ctx_set_dev_id(ecEncCtx* ctx, int devId);
+WOLFSSL_API
+int wc_ecc_ctx_get_dev_id(ecEncCtx* ctx, int* devId);
+#endif /* WOLF_CRYPTO_CB */
 WOLFSSL_API
 const byte* wc_ecc_ctx_get_own_salt(ecEncCtx* ctx);
 WOLFSSL_API

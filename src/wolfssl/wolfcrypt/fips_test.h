@@ -1,6 +1,6 @@
 /* fips_test.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -31,8 +31,21 @@
     extern "C" {
 #endif
 
+/* Added for FIPS v7.0.0 or later */
+#if defined(FIPS_VERSION_GE) && FIPS_VERSION_GE(7,0)
+    /* The v7 integrity test is HMAC-SHA-512 keyed with a full SHA-512
+     * block-size (128-byte) key, so the key is used as-is rather than being
+     * hashed down by HMAC. This makes FIPS_CAST_HMAC_SHA2_512 boot-critical;
+     * it was FIPS_CAST_HMAC_SHA2_256 through v6.0.0. */
+    #ifndef WOLFSSL_SHA512
+        #error FIPS v7 in core integrity check requires SHA2-512
+    #endif
+    #define FIPS_IN_CORE_DIGEST_SIZE 64
+    #define FIPS_IN_CORE_HASH_TYPE   WC_SHA512
+    #define FIPS_IN_CORE_KEY_SZ      128
+    #define FIPS_IN_CORE_VERIFY_SZ   FIPS_IN_CORE_KEY_SZ
 /* Added for FIPS v5.3 or later */
-#if defined(FIPS_VERSION_GE) && FIPS_VERSION_GE(5,3)
+#elif defined(FIPS_VERSION_GE) && FIPS_VERSION_GE(5,3)
     /* Determine FIPS in core hash type and size */
     #ifndef NO_SHA256
         #define FIPS_IN_CORE_DIGEST_SIZE 32
@@ -74,8 +87,20 @@ enum FipsCastId {
     FIPS_CAST_PBKDF2            = 18,
     /* v7.0.0 + */
     FIPS_CAST_AES_ECB           = 19,
-    FIPS_CAST_COUNT             = 20
+    FIPS_CAST_ML_KEM            = 20,
+    FIPS_CAST_ML_DSA            = 21,
+    FIPS_CAST_LMS               = 22,
+    FIPS_CAST_XMSS              = 23,
+    FIPS_CAST_DRBG_SHA512       = 24,
+    FIPS_CAST_SLH_DSA           = 25,
+    /* Vendor-elected enhanced self-tests, appended so the ids above keep
+     * their v7.0.0 values. */
+    FIPS_CAST_AES_CMAC          = 26,
+    FIPS_CAST_SHAKE             = 27,
+    FIPS_CAST_AES_KW            = 28,
+    FIPS_CAST_COUNT             = 29
 };
+#define WC_FIPS_ENUM_CAST_ID_DEFINED
 
 enum FipsCastStateId {
     FIPS_CAST_STATE_INIT        = 0,
@@ -93,6 +118,19 @@ enum FipsModeId {
 
 /* FIPS failure callback */
 typedef void(*wolfCrypt_fips_cb)(int ok, int err, const char* hash);
+
+#ifdef WOLFSSL_FIPS_DEV_NO_POST
+    #define wc_RunAllCast_fips() 0
+    static WC_INLINE int wolfCrypt_SetCb_fips(wolfCrypt_fips_cb cbf) {
+        (void)cbf;
+        return 0;
+    }
+    #define wolfCrypt_GetVersion_fips() "wolfCrypt DEV_NO_POST"
+    #define wolfCrypt_GetStatus_fips() 0
+    #define wolfCrypt_GetCoreHash_fips() ""
+    #define wolfCrypt_IntegrityTest_fips() 0
+    #define fipsEntry() WC_DO_NOTHING
+#else /* !WOLFSSL_FIPS_DEV_NO_POST */
 
 /* Public set function */
 WOLFSSL_API int wolfCrypt_SetCb_fips(wolfCrypt_fips_cb cbf);
@@ -122,6 +160,8 @@ WOLFSSL_API int wc_RunAllCast_fips(void);
      * this is outside user-control if called by the OS */
     void fipsEntry(void);
 #endif
+
+#endif /* !WOLFSSL_FIPS_DEV_NO_POST */
 
 #ifdef __cplusplus
     } /* extern "C" */

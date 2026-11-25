@@ -1,6 +1,6 @@
 /* objects.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -64,6 +64,7 @@
 #define OBJ_cleanup      wolfSSL_OBJ_cleanup
 #define OBJ_cmp          wolfSSL_OBJ_cmp
 #define OBJ_create       wolfSSL_OBJ_create
+#define OBJ_find_sigid_algs wolfSSL_OBJ_find_sigid_algs
 #define ASN1_OBJECT_free wolfSSL_ASN1_OBJECT_free
 #define OBJ_NAME_do_all  wolfSSL_OBJ_NAME_do_all
 #define i2t_ASN1_OBJECT  wolfSSL_i2t_ASN1_OBJECT

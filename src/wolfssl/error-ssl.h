@@ -1,6 +1,6 @@
 /* error-ssl.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -82,6 +82,8 @@ enum wolfSSL_ErrorCodes {
     CLIENT_ID_ERROR              = -331,   /* psk client identity error  */
     SERVER_HINT_ERROR            = -332,   /* psk server hint error  */
     PSK_KEY_ERROR                = -333,   /* psk key error  */
+    DUPE_ENTRY_E                 = -334,   /* duplicate entry error */
+    PSK_MISSING_ERROR            = -335,   /* psk missing  */
 
     GETTIME_ERROR                = -337,   /* gettimeofday failed ??? */
     GETITIMER_ERROR              = -338,   /* getitimer failed ??? */
@@ -157,7 +159,7 @@ enum wolfSSL_ErrorCodes {
     DTLS_EXPORT_VER_E            = -411,   /* export version error */
     INPUT_SIZE_E                 = -412,   /* input size too big error */
     CTX_INIT_MUTEX_E             = -413,   /* initialize ctx mutex error */
-    EXT_MASTER_SECRET_NEEDED_E   = -414,   /* need EMS enabled to resume */
+    EXT_MASTER_SECRET_NEEDED_E   = -414,   /* EMS required but not negotiated */
     DTLS_POOL_SZ_E               = -415,   /* exceeded DTLS pool size */
     DECODE_E                     = -416,   /* decode handshake message error */
     HTTP_TIMEOUT                 = -417,   /* HTTP timeout for OCSP or CRL req */
@@ -184,7 +186,7 @@ enum wolfSSL_ErrorCodes {
     TLS13_SECRET_CB_E            = -438,   /* TLS1.3 secret Cb fcn failure */
     DTLS_SIZE_ERROR              = -439,   /* Trying to send too much data */
     NO_CERT_ERROR                = -440,   /* TLS1.3 - no cert set error */
-    APP_DATA_READY               = -441,   /* DTLS1.2 application data ready for read */
+    APP_DATA_READY               = -441,   /* Application data ready for read */
     TOO_MUCH_EARLY_DATA          = -442,   /* Too much Early data */
     SOCKET_FILTERED_E            = -443,   /* Session stopped by network filter */
     HTTP_RECV_ERR                = -444,   /* HTTP Receive error */
@@ -196,7 +198,7 @@ enum wolfSSL_ErrorCodes {
     UNSUPPORTED_PROTO_VERSION    = -450,   /* bad/unsupported protocol version*/
     FALCON_KEY_SIZE_E            = -451,   /* Wrong key size for Falcon. */
     QUIC_TP_MISSING_E            = -452,   /* QUIC transport parameter missing */
-    DILITHIUM_KEY_SIZE_E         = -453,   /* Wrong key size for Dilithium. */
+    MLDSA_KEY_SIZE_E             = -453,   /* Wrong key size for ML-DSA. */
     DTLS_CID_ERROR               = -454,   /* Wrong or missing CID */
     DTLS_TOO_MANY_FRAGMENTS_E    = -455,   /* Received too many fragments */
     QUIC_WRONG_ENC_LEVEL         = -456,   /* QUIC data received on wrong encryption level */
@@ -237,12 +239,30 @@ enum wolfSSL_ErrorCodes {
     CRYPTO_POLICY_FORBIDDEN      = -516,   /* operation forbidden by system
                                             * crypto-policy */
 
-    WOLFSSL_LAST_E               = -516
+    SESSION_TICKET_NONCE_OVERFLOW = -517,  /* Session ticket nonce overflow */
+
+    EMPTY_RECORD_LIMIT_E         = -518,   /* Too many empty records received */
+
+    ECH_REQUIRED_E               = -519,   /* ECH offered but rejected by server */
+
+    SEQUENCE_NUMBER_E            = -520,   /* Record sequence number would wrap */
+
+    RPK_UNTRUSTED_E              = -521,   /* RFC 7250 Raw Public Key not trusted
+                                           * out of band */
+
+    OCSP_NO_URL                  = -522,   /* Cert advertises no OCSP responder
+                                            * and no override URL is set */
+
+    WOLFSSL_LAST_E               = -522
 
     /* codes -1000 to -1999 are reserved for wolfCrypt. */
 };
 
-wc_static_assert((int)WC_LAST_E <= (int)WOLFSSL_LAST_E);
+#ifndef WOLFSSL_NO_DILITHIUM_LEGACY_NAMES
+    /* Legacy alias for code written against the pre-standardization
+     * Dilithium name. Will be removed alongside the dilithium.h shim. */
+    #define DILITHIUM_KEY_SIZE_E MLDSA_KEY_SIZE_E
+#endif
 
 /* I/O Callback default errors */
 enum IOerrors {

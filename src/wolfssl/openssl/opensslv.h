@@ -1,6 +1,6 @@
 /* opensslv.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -40,6 +40,9 @@
 #elif defined(OPENSSL_VERSION_NUMBER)
     /* unrecognized version, but continue. */
     #define WOLFSSL_OPENSSL_VERSION_NUMBER_UNRECOGNIZED
+#elif defined(WOLFSSL_QT) || defined(WOLFSSL_PYTHON)
+    /* For Qt and Python 3.8.5 compatibility */
+    #define OPENSSL_VERSION_NUMBER 0x10101000L
 #elif defined(HAVE_MOSQUITTO)
     #define OPENSSL_VERSION_NUMBER 0x10100000L
 #elif defined(WOLFSSL_APACHE_HTTPD) || defined(HAVE_LIBEST) || \
@@ -48,9 +51,6 @@
       defined(WOLFSSL_OPENSSH)
     /* For Apache httpd, Use 1.1.0 compatibility */
     #define OPENSSL_VERSION_NUMBER 0x10100003L
-#elif defined(WOLFSSL_QT) || defined(WOLFSSL_PYTHON)
-    /* For Qt and Python 3.8.5 compatibility */
-    #define OPENSSL_VERSION_NUMBER 0x10101000L
 #elif defined(WOLFSSL_HAPROXY) || defined(WOLFSSL_FFMPEG)
     #define OPENSSL_VERSION_NUMBER 0x1010000fL
 #elif defined(OPENSSL_ALL) || defined(HAVE_LIGHTY) || \
@@ -67,6 +67,21 @@
 #endif
 #ifndef OPENSSL_VERSION
     #define OPENSSL_VERSION 0
+#endif
+#ifndef OPENSSL_CFLAGS
+    #define OPENSSL_CFLAGS 1
+#endif
+#ifndef OPENSSL_BUILT_ON
+    #define OPENSSL_BUILT_ON 2
+#endif
+#ifndef OPENSSL_PLATFORM
+    #define OPENSSL_PLATFORM 3
+#endif
+#ifndef OPENSSL_DIR
+    #define OPENSSL_DIR 4
+#endif
+#ifndef OPENSSL_ENGINES_DIR
+    #define OPENSSL_ENGINES_DIR 5
 #endif
 
 #ifndef OPENSSL_IS_WOLFSSL

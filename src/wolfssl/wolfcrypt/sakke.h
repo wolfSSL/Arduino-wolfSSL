@@ -1,6 +1,6 @@
 /* sakke.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -40,6 +40,7 @@
 #define WOLFCRYPT_SAKKE_CLIENT
 
 #define SAKKE_ID_MAX_SIZE       128
+#define SAKKE_EB_BUF_SIZE       128
 
 /* Maximum number of loops of attempting to generate a key. */
 #ifndef SAKKE_MAX_GEN_COUNT

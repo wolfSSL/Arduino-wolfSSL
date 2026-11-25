@@ -1,6 +1,6 @@
 /* dh.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -19,15 +19,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
  */
 
+#define WC_FIPS_LL_CRYPTO
+#define _WC_BUILDING_DH_C
+
 #include <wolfssl/wolfcrypt/libwolfssl_sources.h>
 
 #ifndef NO_DH
 
 #if defined(HAVE_FIPS) && \
     defined(HAVE_FIPS_VERSION) && (HAVE_FIPS_VERSION >= 2)
-
-    /* set NO_WRAPPERS before headers, use direct internal f()s not wrappers */
-    #define FIPS_NO_WRAPPERS
 
     #ifdef USE_WINDOWS_API
         #pragma code_seg(".fipsA$e")
@@ -57,12 +57,33 @@
     }
 #endif
 
-#if defined(WOLFSSL_USE_SAVE_VECTOR_REGISTERS) && !defined(WOLFSSL_SP_ASM)
-    /* force off unneeded vector register save/restore. */
-    #undef SAVE_VECTOR_REGISTERS
-    #define SAVE_VECTOR_REGISTERS(fail_clause) SAVE_NO_VECTOR_REGISTERS(fail_clause)
-    #undef RESTORE_VECTOR_REGISTERS
-    #define RESTORE_VECTOR_REGISTERS() RESTORE_NO_VECTOR_REGISTERS()
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+
+/* Note that the wc_dh_enabled runtime feature-switching facility is neither
+ * thread-synchronized nor thread-local, and is only allowed during global
+ * initialization or self-test sequences before application service begins.
+ */
+
+static volatile int wc_dh_enabled = WC_DH_INITIAL_RUNTIME_ENABLEMENT;
+int wc_dh_enable(void) {
+    if (wc_dh_enabled)
+        return ALREADY_E;
+    else {
+        wc_dh_enabled = 1;
+        return 0;
+    }
+}
+int wc_dh_disable(void) {
+    if (wc_dh_enabled) {
+        wc_dh_enabled = 0;
+        return 0;
+    }
+    else
+        return ALREADY_E;
+}
+int wc_dh_is_enabled(void) {
+    return wc_dh_enabled;
+}
 #endif
 
 /*
@@ -948,8 +969,15 @@ int wc_InitDhKey_ex(DhKey* key, void* heap, int devId)
     if (key == NULL)
         return BAD_FUNC_ARG;
 
+    XMEMSET(key, 0, sizeof(*key));
+
     key->heap = heap; /* for XMALLOC/XFREE in future */
     key->trustedGroup = 0;
+
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if (! wc_dh_enabled)
+        return FIPS_NOT_ALLOWED_E;
+#endif
 
 #ifdef WOLFSSL_DH_EXTRA
     if (mp_init_multi(&key->p, &key->g, &key->q, &key->pub, &key->priv, NULL) != MP_OKAY)
@@ -966,11 +994,17 @@ int wc_InitDhKey_ex(DhKey* key, void* heap, int devId)
     (void)devId;
 #endif
 
-    key->trustedGroup = 0;
-
 #ifdef WOLFSSL_KCAPI_DH
     key->handle = NULL;
 #endif
+
+#ifdef WC_DH_NONBLOCK
+    key->nb = NULL;
+#endif
+
+    /* On failure, release MPI allocations, if any. */
+    if (ret != 0)
+        (void)wc_FreeDhKey(key);
 
     return ret;
 }
@@ -979,6 +1013,23 @@ int wc_InitDhKey(DhKey* key)
 {
     return wc_InitDhKey_ex(key, NULL, INVALID_DEVID);
 }
+
+#ifdef WC_DH_NONBLOCK
+int wc_DhSetNonBlock(DhKey* key, DhNb* nb)
+{
+    if (key == NULL)
+        return BAD_FUNC_ARG;
+
+    if (nb != NULL) {
+        XMEMSET(nb, 0, sizeof(DhNb));
+    }
+
+    /* Pass NULL to disable non-blocking mode. */
+    key->nb = nb;
+
+    return 0;
+}
+#endif
 
 
 int wc_FreeDhKey(DhKey* key)
@@ -997,6 +1048,13 @@ int wc_FreeDhKey(DhKey* key)
     #endif
     #ifdef WOLFSSL_KCAPI_DH
         KcapiDh_Free(key);
+    #endif
+    #ifdef WOLFSSL_CHECK_MEM_ZERO
+        /* Deregister any mem-zero entries covering this key (e.g. key->priv
+         * registered by wc_DhImportKeyPair) now that its fields are zeroed.
+         * Mirrors wc_FreeRsaKey(); mp_forcezero() alone does not remove the
+         * registration, so without this the entry leaks into later checks. */
+        wc_MemZero_Check(key, sizeof(*key));
     #endif
     }
     return 0;
@@ -1032,13 +1090,13 @@ static int _ffc_pairwise_consistency_test(DhKey* key,
 #ifndef WOLFSSL_DH_CONST
     #define WOLFSSL_DH_ROUND(x) WC_DO_NOTHING
 #else
-    #define WOLFSSL_DH_ROUND(x) \
-        do {                    \
-            if (x % 128) {      \
-                x &= 0xffffff80;\
-                x += 128;       \
-            }                   \
-        }                       \
+    #define WOLFSSL_DH_ROUND(x)   \
+        do {                      \
+            if ((x) % 128) {      \
+                (x) &= 0xffffff80;\
+                (x) += 128;       \
+            }                     \
+        }                         \
         while (0)
 #endif
 
@@ -1061,6 +1119,11 @@ static int CheckDhLN(word32 modLen, word32 divLen)
         /* FB, FC */
         case 2048:
             if (divLen == 224 || divLen == 256)
+                ret = 0;
+            break;
+        /* Per SP 800-56Ar3 Table 2 */
+        case 3072:
+            if (divLen == 256)
                 ret = 0;
             break;
         default:
@@ -1096,11 +1159,22 @@ static int GeneratePrivateDh186(DhKey* key, WC_RNG* rng, byte* priv,
     byte cBuf[DH_MAX_SIZE + 64 / WOLFSSL_BIT_SIZE];
 #endif
 
-    /* Parameters validated in calling functions. */
+    /* Pointer parameters validated by the public entry wc_DhGenerateKeyPair. */
 
     if (mp_iszero(&key->q) == MP_YES) {
         WOLFSSL_MSG("DH q parameter needed for FIPS 186-4 key generation");
         return BAD_FUNC_ARG;
+    }
+
+    /* Bound *privSz so cSz (= *privSz + 8) cannot exceed the cBuf capacity.
+     * Note: DH_MAX_SIZE is documented as a bit count, but the cBuf declaration
+     * above uses it directly as a byte count (cBuf is DH_MAX_SIZE + 8 bytes).
+     * This check matches that convention so *privSz (in bytes) is bounded by
+     * the actual byte capacity of cBuf. The same bound is applied to the
+     * WOLFSSL_SMALL_STACK path to avoid unbounded heap allocation. */
+    if (*privSz > DH_MAX_SIZE) {
+        WOLFSSL_MSG("DH private key size exceeds DH_MAX_SIZE");
+        return WC_KEY_SIZE_E;
     }
 
     qSz = (word32)mp_unsigned_bin_size(&key->q);
@@ -1157,8 +1231,9 @@ static int GeneratePrivateDh186(DhKey* key, WC_RNG* rng, byte* priv,
         if (err == MP_OKAY)
             err = mp_read_unsigned_bin(tmpX, cBuf, cSz);
         if (err != MP_OKAY) {
-            mp_clear(tmpX);
+            mp_forcezero(tmpX);
             mp_clear(tmpQ);
+            ForceZero(cBuf, cSz);
 #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
             XFREE(cBuf, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
             XFREE(tmpQ, key->heap, DYNAMIC_TYPE_DH);
@@ -1228,6 +1303,12 @@ static int GeneratePrivateDh(DhKey* key, WC_RNG* rng, byte* priv,
 #ifndef WC_NO_RNG
     int ret = 0;
     word32 sz = 0;
+
+    /* reject primes below the minimum allowed size */
+    if (mp_count_bits(&key->p) < DH_MIN_SIZE) {
+        WOLFSSL_MSG("DH prime smaller than DH_MIN_SIZE");
+        return WC_KEY_SIZE_E;
+    }
 
     if (mp_iseven(&key->p) == MP_YES) {
         ret = MP_VAL;
@@ -1314,6 +1395,12 @@ static int GeneratePublicDh(DhKey* key, byte* priv, word32 privSz,
         return WC_KEY_SIZE_E;
     }
 
+    /* reject primes below the minimum allowed size */
+    if (mp_count_bits(&key->p) < DH_MIN_SIZE) {
+        WOLFSSL_MSG("DH prime smaller than DH_MIN_SIZE");
+        return WC_KEY_SIZE_E;
+    }
+
 #ifdef WOLFSSL_HAVE_SP_DH
 #ifndef WOLFSSL_SP_NO_2048
     if (mp_count_bits(&key->p) == 2048)
@@ -1387,7 +1474,10 @@ int wc_DhGeneratePublic(DhKey* key, byte* priv, word32 privSz,
         return BAD_FUNC_ARG;
     }
 
-    SAVE_VECTOR_REGISTERS(return _svr_ret;);
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if (! wc_dh_enabled)
+        return FIPS_NOT_ALLOWED_E;
+#endif
 
     ret = GeneratePublicDh(key, priv, privSz, pub, pubSz);
 
@@ -1397,8 +1487,6 @@ int wc_DhGeneratePublic(DhKey* key, byte* priv, word32 privSz,
     if (ret == 0)
         ret = _ffc_pairwise_consistency_test(key, pub, *pubSz, priv, privSz);
     #endif /* FIPS V5 or later || WOLFSSL_VALIDATE_DH_KEYGEN */
-
-    RESTORE_VECTOR_REGISTERS();
 
     return ret;
 }
@@ -1413,8 +1501,6 @@ static int wc_DhGenerateKeyPair_Sync(DhKey* key, WC_RNG* rng,
         return BAD_FUNC_ARG;
     }
 
-    SAVE_VECTOR_REGISTERS(return _svr_ret;);
-
     ret = GeneratePrivateDh(key, rng, priv, privSz);
 
     if (ret == 0)
@@ -1425,9 +1511,6 @@ static int wc_DhGenerateKeyPair_Sync(DhKey* key, WC_RNG* rng,
     if (ret == 0)
         ret = _ffc_pairwise_consistency_test(key, pub, *pubSz, priv, *privSz);
 #endif /* FIPS V5 or later || WOLFSSL_VALIDATE_DH_KEYGEN */
-
-
-    RESTORE_VECTOR_REGISTERS();
 
     return ret;
 }
@@ -1464,7 +1547,7 @@ static int wc_DhGenerateKeyPair_Async(DhKey* key, WC_RNG* rng,
         if (ret == MP_OKAY)
             ret = IntelQaDhKeyGen(&key->asyncDev, &key->p.raw, &key->g.raw,
                 &x.raw, pub, pubSz);
-        mp_clear(&x);
+        mp_forcezero(&x);
 
         return ret;
     }
@@ -1551,8 +1634,6 @@ static int _ffc_validate_public_key(DhKey* key, const byte* pub, word32 pubSz,
         return MP_INIT_E;
     }
 
-    SAVE_VECTOR_REGISTERS(ret = _svr_ret;);
-
     if (mp_read_unsigned_bin(y, pub, pubSz) != MP_OKAY) {
         ret = MP_READ_E;
     }
@@ -1593,7 +1674,7 @@ static int _ffc_validate_public_key(DhKey* key, const byte* pub, word32 pubSz,
         }
 
         /* SP 800-56Ar3, section 5.6.2.3.1, process step 2 */
-        if (ret == 0 && prime != NULL) {
+        if (ret == 0 && mp_iszero(q) == MP_NO) {
 #ifdef WOLFSSL_HAVE_SP_DH
 #ifndef WOLFSSL_SP_NO_2048
             if (mp_count_bits(&key->p) == 2048) {
@@ -1640,8 +1721,6 @@ static int _ffc_validate_public_key(DhKey* key, const byte* pub, word32 pubSz,
     mp_clear(y);
     mp_clear(p);
     mp_clear(q);
-
-    RESTORE_VECTOR_REGISTERS();
 
 #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
     XFREE(q, key->heap, DYNAMIC_TYPE_DH);
@@ -1693,6 +1772,9 @@ int wc_DhCheckPubValue(const byte* prime, word32 primeSz, const byte* pub,
 {
     int ret = 0;
     word32 i;
+
+    if (prime == NULL || pub == NULL)
+        return BAD_FUNC_ARG;
 
     for (i = 0; i < pubSz && pub[i] == 0; i++) {
     }
@@ -1791,12 +1873,9 @@ int wc_DhCheckPrivKey_ex(DhKey* key, const byte* priv, word32 privSz,
     if (ret == 0) {
         if (mp_iszero(q) == MP_NO) {
             /* priv (x) shouldn't be greater than q - 1 */
-            if (mp_copy(&key->q, q) != MP_OKAY)
-                ret = MP_INIT_E;
-            if (ret == 0) {
-                if (mp_sub_d(q, 1, q) != MP_OKAY)
-                    ret = MP_SUB_E;
-            }
+            /* q already holds the supplied prime or key->q; do not clobber it */
+            if (mp_sub_d(q, 1, q) != MP_OKAY)
+                ret = MP_SUB_E;
             if (ret == 0) {
                 if (mp_cmp(x, q) == MP_GT)
                     ret = DH_CHECK_PRIV_E;
@@ -1881,8 +1960,6 @@ static int _ffc_pairwise_consistency_test(DhKey* key,
         return MP_INIT_E;
     }
 
-    SAVE_VECTOR_REGISTERS(ret = _svr_ret;);
-
     /* Load the private and public keys into big integers. */
     if (mp_read_unsigned_bin(publicKey, pub, pubSz) != MP_OKAY ||
         mp_read_unsigned_bin(privateKey, priv, privSz) != MP_OKAY) {
@@ -1941,8 +2018,6 @@ static int _ffc_pairwise_consistency_test(DhKey* key,
     mp_clear(publicKey);
     mp_clear(checkKey);
 
-    RESTORE_VECTOR_REGISTERS();
-
 #if defined(WOLFSSL_SMALL_STACK) && !defined(WOLFSSL_NO_MALLOC)
     XFREE(checkKey, key->heap, DYNAMIC_TYPE_DH);
     XFREE(privateKey, key->heap, DYNAMIC_TYPE_DH);
@@ -1983,6 +2058,11 @@ int wc_DhGenerateKeyPair(DhKey* key, WC_RNG* rng,
         return BAD_FUNC_ARG;
     }
 
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if (! wc_dh_enabled)
+        return FIPS_NOT_ALLOWED_E;
+#endif
+
 #ifdef WOLFSSL_KCAPI_DH
     (void)priv;
     (void)privSz;
@@ -2021,18 +2101,87 @@ static int wc_DhAgree_Sync(DhKey* key, byte* agree, word32* agreeSz,
 #endif
 #endif
 
+    /* reject primes below the minimum allowed size */
+    if (mp_count_bits(&key->p) < DH_MIN_SIZE) {
+        WOLFSSL_MSG("DH prime smaller than DH_MIN_SIZE");
+        return WC_KEY_SIZE_E;
+    }
+
     if (mp_iseven(&key->p) == MP_YES) {
         return MP_VAL;
     }
+
+    /* Non-blocking re-entry: the same wc_DhAgree call repeats until the
+     * SP state machine completes, so cache the per-op key validation
+     * results instead of re-running them each yield. The cache is
+     * scoped to non-blocking, non-const-time callers only. */
+#ifdef WC_DH_NONBLOCK
+    if (key->nb == NULL || ct || !key->nb->pubKeyValidated)
+#endif
+    {
 #ifdef WOLFSSL_VALIDATE_FFC_IMPORT
-    if (wc_DhCheckPrivKey(key, priv, privSz) != 0) {
-        WOLFSSL_MSG("wc_DhAgree wc_DhCheckPrivKey failed");
-        return DH_CHECK_PRIV_E;
+        if (wc_DhCheckPrivKey(key, priv, privSz) != 0) {
+            WOLFSSL_MSG("wc_DhAgree wc_DhCheckPrivKey failed");
+            return DH_CHECK_PRIV_E;
+        }
+#endif
+        /* Always validate peer public key (2 <= y <= p-2) per SP 800-56A */
+        if (wc_DhCheckPubKey_ex(key, otherPub, pubSz, NULL, 0) != 0) {
+            WOLFSSL_MSG("wc_DhAgree wc_DhCheckPubKey failed");
+            return DH_CHECK_PUB_E;
+        }
+#ifdef WC_DH_NONBLOCK
+        if (key->nb != NULL && !ct) {
+            key->nb->pubKeyValidated = 1;
+        }
+#endif
     }
 
-    if (wc_DhCheckPubKey(key, otherPub, pubSz) != 0) {
-        WOLFSSL_MSG("wc_DhAgree wc_DhCheckPubKey failed");
-        return DH_CHECK_PUB_E;
+#if defined(WC_DH_NONBLOCK) && defined(WOLFSSL_HAVE_SP_DH) && \
+    defined(WOLFSSL_SP_NONBLOCK) && defined(WOLFSSL_SP_SMALL) && \
+    !defined(WOLFSSL_SP_FAST_MODEXP)
+    /* Non-blocking dispatch bypasses the mp_int dance entirely - the SP
+     * wrapper takes byte buffers and persists across yields. The constant-
+     * time fold-back (ct branch) is intentionally not applied here; nb
+     * callers should use the standard wc_DhAgree(). */
+    if (key->nb != NULL && !ct) {
+        int nb_ret = MP_OKAY;
+        int dispatched = 0;
+    #ifndef WOLFSSL_SP_NO_2048
+        if (mp_count_bits(&key->p) == 2048) {
+            nb_ret = sp_DhExp_2048_nb(&key->nb->sp_ctx, otherPub, pubSz,
+                         priv, privSz, &key->p, agree, agreeSz);
+            dispatched = 1;
+        }
+    #endif
+    #ifndef WOLFSSL_SP_NO_3072
+        if (!dispatched && mp_count_bits(&key->p) == 3072) {
+            nb_ret = sp_DhExp_3072_nb(&key->nb->sp_ctx, otherPub, pubSz,
+                         priv, privSz, &key->p, agree, agreeSz);
+            dispatched = 1;
+        }
+    #endif
+    #ifdef WOLFSSL_SP_4096
+        if (!dispatched && mp_count_bits(&key->p) == 4096) {
+            nb_ret = sp_DhExp_4096_nb(&key->nb->sp_ctx, otherPub, pubSz,
+                         priv, privSz, &key->p, agree, agreeSz);
+            dispatched = 1;
+        }
+    #endif
+        if (dispatched) {
+            /* Op finished (or hit a hard error) - clear the cached
+             * validation so the next op on this DhNb re-runs the
+             * SP 800-56A peer-key check. MP_WOULDBLOCK keeps it. */
+            if (nb_ret != WC_NO_ERR_TRACE(MP_WOULDBLOCK)) {
+                key->nb->pubKeyValidated = 0;
+            }
+            return nb_ret;
+        }
+        /* size not nb-supported - the blocking path below completes in
+         * one call, so the cached validation is single-use. Clear it
+         * here so the next agree on this DhNb re-validates. */
+        key->nb->pubKeyValidated = 0;
+        /* fall through to blocking path */
     }
 #endif
 
@@ -2073,8 +2222,6 @@ static int wc_DhAgree_Sync(DhKey* key, byte* agree, word32* agreeSz,
             ret = MP_INIT_E;
 
         if (ret == 0) {
-            SAVE_VECTOR_REGISTERS(ret = _svr_ret;);
-
             if (ret == 0 && mp_read_unsigned_bin(y, otherPub, pubSz) != MP_OKAY)
                 ret = MP_READ_E;
 
@@ -2100,8 +2247,6 @@ static int wc_DhAgree_Sync(DhKey* key, byte* agree, word32* agreeSz,
             }
 
             mp_clear(y);
-
-            RESTORE_VECTOR_REGISTERS();
         }
 
         /* make sure agree is > 1 (SP800-56A, 5.7.1.1) */
@@ -2151,8 +2296,6 @@ static int wc_DhAgree_Sync(DhKey* key, byte* agree, word32* agreeSz,
         mp_forcezero(x);
     }
 #endif
-
-    SAVE_VECTOR_REGISTERS(ret = _svr_ret;);
 
     if (mp_read_unsigned_bin(x, priv, privSz) != MP_OKAY)
         ret = MP_READ_E;
@@ -2212,8 +2355,6 @@ static int wc_DhAgree_Sync(DhKey* key, byte* agree, word32* agreeSz,
     mp_clear(y);
     mp_forcezero(x);
 
-    RESTORE_VECTOR_REGISTERS();
-
 #else
     (void)ct;
     ret = WC_KEY_SIZE_E;
@@ -2226,8 +2367,10 @@ static int wc_DhAgree_Sync(DhKey* key, byte* agree, word32* agreeSz,
 #endif
     XFREE(y, key->heap, DYNAMIC_TYPE_DH);
 #elif defined(WOLFSSL_CHECK_MEM_ZERO)
+#if !defined(WOLFSSL_SP_MATH)
     mp_memzero_check(x);
     mp_memzero_check(z);
+#endif
 #endif
 
     return ret;
@@ -2289,12 +2432,26 @@ int wc_DhAgree(DhKey* key, byte* agree, word32* agreeSz, const byte* priv,
         return BAD_FUNC_ARG;
     }
 
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if (! wc_dh_enabled)
+        return FIPS_NOT_ALLOWED_E;
+#endif
+
 #ifdef WOLFSSL_KCAPI_DH
     (void)priv;
     (void)privSz;
+    if (mp_count_bits(&key->p) < DH_MIN_SIZE) {
+        WOLFSSL_MSG("DH prime smaller than DH_MIN_SIZE");
+        return WC_KEY_SIZE_E;
+    }
     ret = KcapiDh_SharedSecret(key, otherPub, pubSz, agree, agreeSz);
 #else
 #if defined(WOLFSSL_ASYNC_CRYPT) && defined(WC_ASYNC_ENABLE_DH)
+    /* Async marker takes precedence: when wolfAsync_DoSw (wolfcrypt/src/
+     * async.c) re-enters the compute path, wc_DhAgree_Async dispatches
+     * to the SP nonblock wrapper if key->nb is attached, and per-yield
+     * FP_WOULDBLOCK (alias of MP_WOULDBLOCK) is translated to
+     * WC_PENDING_E by wolfAsync_DoSw so the TLS event loop drives it. */
     if (key->asyncDev.marker == WOLFSSL_ASYNC_MARKER_DH) {
         ret = wc_DhAgree_Async(key, agree, agreeSz, priv, privSz, otherPub,
                                pubSz);
@@ -2302,6 +2459,9 @@ int wc_DhAgree(DhKey* key, byte* agree, word32* agreeSz, const byte* priv,
     else
 #endif
     {
+        /* wc_DhAgree_Sync handles key->nb internally; no separate dispatch
+         * needed here. wc_DhAgree_ct (constant-time fold-back) bypasses
+         * this function entirely so passing ct=0 is correct. */
         ret = wc_DhAgree_Sync(key, agree, agreeSz, priv, privSz, otherPub,
                               pubSz, 0);
     }
@@ -2319,6 +2479,11 @@ int wc_DhAgree_ct(DhKey* key, byte* agree, word32 *agreeSz, const byte* priv,
                                                             otherPub == NULL) {
         return BAD_FUNC_ARG;
     }
+
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if (! wc_dh_enabled)
+        return FIPS_NOT_ALLOWED_E;
+#endif
 
     requested_agreeSz = (word32)mp_unsigned_bin_size(&key->p);
     if (requested_agreeSz > *agreeSz) {
@@ -2403,7 +2568,7 @@ int wc_DhImportKeyPair(DhKey* key, const byte* priv, word32 privSz,
     }
     if (havePriv) {
         if (mp_read_unsigned_bin(&key->priv, priv, privSz) != MP_OKAY) {
-            mp_clear(&key->priv);
+            mp_forcezero(&key->priv);
             havePriv = 0;
         } else {
             WOLFSSL_MSG("DH Private Key Set");
@@ -2490,7 +2655,10 @@ static int _DhSetKey(DhKey* key, const byte* p, word32 pSz, const byte* g,
         ret = BAD_FUNC_ARG;
     }
 
-    SAVE_VECTOR_REGISTERS(return _svr_ret;);
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if ((ret == 0) && (! wc_dh_enabled))
+        ret = FIPS_NOT_ALLOWED_E;
+#endif
 
     if (ret == 0) {
         /* may have leading 0 */
@@ -2566,10 +2734,37 @@ static int _DhSetKey(DhKey* key, const byte* p, word32 pSz, const byte* g,
         else
         #endif
         {
-            if (rng != NULL)
-                ret = mp_prime_is_prime_ex(keyP, 8, &isPrime, rng);
-            else
+#ifndef WC_NO_RNG
+            WC_RNG* checkRng = rng;
+            WC_RNG* tmpRng = NULL;
+
+            /* A fixed-base Miller-Rabin test can be fooled by a crafted
+             * composite, so use random witnesses when an RNG is available.
+             * Create a temporary RNG when the caller did not supply one. */
+            if (checkRng == NULL) {
+                if (wc_rng_new_ex(&tmpRng, NULL, 0, key->heap,
+                        INVALID_DEVID) == 0) {
+                    checkRng = tmpRng;
+                }
+            }
+
+            if (checkRng != NULL) {
+                ret = mp_prime_is_prime_ex(keyP, 8, &isPrime, checkRng);
+            }
+            else {
+                /* Fall back to the deterministic test rather than failing the
+                 * parameter load. This is the weaker check: a composite
+                 * crafted against the fixed bases is accepted as prime. */
+                WOLFSSL_MSG("DH: no RNG, primality test uses fixed bases");
                 ret = mp_prime_is_prime(keyP, 8, &isPrime);
+            }
+
+            /* Safe on NULL and zeroizes the RNG state before freeing. */
+            wc_rng_free(tmpRng);
+#else
+            (void)rng;
+            ret = mp_prime_is_prime(keyP, 8, &isPrime);
+#endif
         }
 
         if (ret == 0 && isPrime == 0)
@@ -2602,8 +2797,6 @@ static int _DhSetKey(DhKey* key, const byte* p, word32 pSz, const byte* g,
         if (keyP)
             mp_clear(keyP);
     }
-
-    RESTORE_VECTOR_REGISTERS();
 
     return ret;
 }
@@ -3016,6 +3209,11 @@ int wc_DhGenerateParams(WC_RNG *rng, int modSz, DhKey *dh)
     if (rng == NULL || dh == NULL)
         ret = BAD_FUNC_ARG;
 
+#ifdef WC_DH_INITIAL_RUNTIME_ENABLEMENT
+    if (! wc_dh_enabled)
+        return FIPS_NOT_ALLOWED_E;
+#endif
+
     /* set group size in bytes from modulus size
      * FIPS 186-4 defines valid values (1024, 160) (2048, 256) (3072, 256)
      */
@@ -3093,8 +3291,6 @@ int wc_DhGenerateParams(WC_RNG *rng, int modSz, DhKey *dh)
     }
 #endif
 
-    SAVE_VECTOR_REGISTERS(ret = _svr_ret;);
-
     if (ret == 0) {
         /* force magnitude */
         buf[0] |= 0xC0;
@@ -3153,9 +3349,10 @@ int wc_DhGenerateParams(WC_RNG *rng, int modSz, DhKey *dh)
             if (ret != 0 || primeCheck == MP_YES)
                 break;
 
-            /* linuxkm: release the kernel for a moment before iterating. */
-            RESTORE_VECTOR_REGISTERS();
-            SAVE_VECTOR_REGISTERS(ret = _svr_ret; break;);
+            ret = WC_CHECK_FOR_INTR_SIGNALS();
+            if (ret != 0)
+                break;
+            WC_RELAX_LONG_LOOP();
         };
     }
 
@@ -3196,8 +3393,6 @@ int wc_DhGenerateParams(WC_RNG *rng, int modSz, DhKey *dh)
         mp_clear(&dh->p);
         mp_clear(&dh->g);
     }
-
-    RESTORE_VECTOR_REGISTERS();
 
 #ifndef WOLFSSL_NO_MALLOC
     if (buf != NULL)

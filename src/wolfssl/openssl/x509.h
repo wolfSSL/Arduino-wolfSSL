@@ -1,6 +1,6 @@
 /* x509.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -50,7 +50,6 @@
 
 #define WOLFSSL_XN_FLAG_FN_SN           0
 #define WOLFSSL_XN_FLAG_COMPAT          0
-#define WOLFSSL_XN_FLAG_RFC2253         1
 #define WOLFSSL_XN_FLAG_SEP_COMMA_PLUS  (1 << 16)
 #define WOLFSSL_XN_FLAG_SEP_CPLUS_SPC   (2 << 16)
 #define WOLFSSL_XN_FLAG_SEP_SPLUS_SPC   (3 << 16)
@@ -65,11 +64,20 @@
 #define WOLFSSL_XN_FLAG_DUMP_UNKNOWN_FIELDS (1 << 24)
 #define WOLFSSL_XN_FLAG_FN_ALIGN        (1 << 25)
 
-#define WOLFSSL_XN_FLAG_MULTILINE       0xFFFF
+/* wolfSSL_X509_NAME_print_ex() flattens multi-valued RDNs: their attributes
+ * are separated like RDNs, never with '+'. */
+#define WOLFSSL_XN_FLAG_RFC2253 (WOLFSSL_ASN1_STRFLGS_RFC2253 | \
+                                 WOLFSSL_XN_FLAG_SEP_COMMA_PLUS | \
+                                 WOLFSSL_XN_FLAG_DN_REV | \
+                                 WOLFSSL_XN_FLAG_FN_SN | \
+                                 WOLFSSL_XN_FLAG_DUMP_UNKNOWN_FIELDS)
+#define WOLFSSL_XN_FLAG_MULTILINE (WOLFSSL_ASN1_STRFLGS_ESC_CTRL | \
+                                   WOLFSSL_ASN1_STRFLGS_ESC_MSB | \
+                                   WOLFSSL_XN_FLAG_SEP_MULTILINE | \
+                                   WOLFSSL_XN_FLAG_SPC_EQ | \
+                                   WOLFSSL_XN_FLAG_FN_LN | \
+                                   WOLFSSL_XN_FLAG_FN_ALIGN)
 #define WOLFSSL_XN_FLAG_ONELINE (WOLFSSL_XN_FLAG_SEP_CPLUS_SPC | WOLFSSL_XN_FLAG_SPC_EQ | WOLFSSL_XN_FLAG_FN_SN)
-
-#define WOLFSSL_X509_V_ERR_CRL_HAS_EXPIRED              12
-#define WOLFSSL_X509_V_ERR_UNABLE_TO_GET_CRL            3
 
 #ifndef OPENSSL_COEXIST
 
@@ -213,6 +221,9 @@
 #define X509_V_ERR_CA_CERT_MISSING_KEY_USAGE           92
 #define X509_V_ERR_EXTENSIONS_REQUIRE_VERSION_3        93
 #define X509_V_ERR_EC_KEY_EXPLICIT_PARAMS              94
+/* 95 matches OpenSSL's X509_V_ERR_RPK_UNTRUSTED (OpenSSL 3.2+) for source
+ * compatibility. */
+#define X509_V_ERR_RPK_UNTRUSTED                       95
 #define X509_R_CERT_ALREADY_IN_HASH_TABLE              101
 #define X509_R_KEY_VALUES_MISMATCH                     WC_KEY_MISMATCH_E
 

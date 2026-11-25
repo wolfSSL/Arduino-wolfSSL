@@ -1,6 +1,6 @@
 /* hash.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -40,7 +40,7 @@
 #if defined(WOLFSSL_SHA384) || defined(WOLFSSL_SHA512)
     #include <wolfssl/wolfcrypt/sha512.h>
 #endif
-#if defined(HAVE_BLAKE2) || defined(HAVE_BLAKE2S)
+#if defined(HAVE_BLAKE2B) || defined(HAVE_BLAKE2S)
     #include <wolfssl/wolfcrypt/blake2.h>
 #endif
 #ifdef WOLFSSL_SHA3
@@ -131,7 +131,7 @@ typedef struct {
 #elif defined(WOLFSSL_SHA512)
     #define WC_MAX_DIGEST_SIZE WC_SHA512_DIGEST_SIZE
     #define WC_MAX_BLOCK_SIZE  WC_SHA512_BLOCK_SIZE
-#elif defined(HAVE_BLAKE2)
+#elif defined(HAVE_BLAKE2B)
     #define WC_MAX_DIGEST_SIZE BLAKE2B_OUTBYTES
     #define WC_MAX_BLOCK_SIZE  BLAKE2B_BLOCKBYTES
 #elif defined(WOLFSSL_SHA384)
@@ -158,6 +158,133 @@ typedef struct {
 #else
     #define WC_MAX_DIGEST_SIZE 64 /* default to max size of 64 */
     #define WC_MAX_BLOCK_SIZE  128
+#endif
+
+#if defined(WC_HASH_CUSTOM_MAX_DIGEST_SIZE) && \
+    defined(WC_HASH_CUSTOM_MIN_DIGEST_SIZE)
+    #if WC_HASH_CUSTOM_MAX_DIGEST_SIZE < \
+        WC_HASH_CUSTOM_MIN_DIGEST_SIZE
+        #error HASH_CUSTOM_MAX_DIGEST_SIZE < WC_HASH_CUSTOM_MIN_DIGEST_SIZE
+    #endif
+#endif
+#ifdef WC_HASH_CUSTOM_MAX_DIGEST_SIZE
+    #undef WC_MAX_DIGEST_SIZE
+    #define WC_MAX_DIGEST_SIZE WC_HASH_CUSTOM_MAX_DIGEST_SIZE
+#endif
+#ifdef WC_HASH_CUSTOM_MAX_BLOCK_SIZE
+    #undef WC_MAX_BLOCK_SIZE
+    #define WC_MAX_BLOCK_SIZE WC_HASH_CUSTOM_MAX_BLOCK_SIZE
+#endif
+
+/* Set up WC_MIN_DIGEST_SIZE.  This is the shortest digest supported by any
+ * fixed-output-size hash algorithm enabled in the library.  It is not
+ * necessarily the shortest digest permitted for signature generation -- that is
+ * designated by WC_MIN_DIGEST_SIZE_FOR_SIGN, defined below, with additional
+ * restrictions under FIPS 186-5.
+ */
+#if defined(WC_HASH_CUSTOM_MIN_DIGEST_SIZE)
+    /* Note, FIPS 186-5 allows (and we need) SHA-1 in verify-only mode, but
+     * restricts signing to SHA-224 and larger, enforced below.
+     */
+    #if defined(WC_FIPS_186_4_PLUS) && \
+            (WC_HASH_CUSTOM_MIN_DIGEST_SIZE < 160 / 8)
+        #error FIPS 186 requires a minimum hash size >= SHA-1.
+    #elif (WC_HASH_CUSTOM_MIN_DIGEST_SIZE < 128 / 8)
+        #error WC_HASH_CUSTOM_MIN_DIGEST_SIZE is too small.
+    #endif
+    /* Let the user override the minimum digest size */
+    #define WC_MIN_DIGEST_SIZE WC_HASH_CUSTOM_MIN_DIGEST_SIZE
+#elif defined(WOLFSSL_MD2)
+    #define WC_MIN_DIGEST_SIZE WC_MD2_DIGEST_SIZE /* 16 */
+#elif !defined(NO_MD4)
+    #define WC_MIN_DIGEST_SIZE WC_MD4_DIGEST_SIZE /* 16 */
+#elif !defined(NO_MD5)
+    #define WC_MIN_DIGEST_SIZE WC_MD5_DIGEST_SIZE /* 16 */
+#elif !defined(NO_SHA)
+    #define WC_MIN_DIGEST_SIZE WC_SHA_DIGEST_SIZE /* 20 */
+#elif defined(WOLFSSL_SHA224)
+    #define WC_MIN_DIGEST_SIZE WC_SHA224_DIGEST_SIZE
+#elif !defined(HAVE_FIPS) && !defined(HAVE_SELFTEST) && \
+    defined(WOLFSSL_SHA512) && !defined(WOLFSSL_NOSHA512_224)
+    #define WC_MIN_DIGEST_SIZE WC_SHA512_224_DIGEST_SIZE
+#elif defined(WOLFSSL_SHA3) && !defined(WOLFSSL_NOSHA3_224)
+    #define WC_MIN_DIGEST_SIZE WC_SHA3_224_DIGEST_SIZE
+#elif !defined(NO_SHA256)
+    #define WC_MIN_DIGEST_SIZE WC_SHA256_DIGEST_SIZE
+#elif !defined(HAVE_FIPS) && !defined(HAVE_SELFTEST) && \
+    defined(WOLFSSL_SHA512) && !defined(WOLFSSL_NOSHA512_256)
+    #define WC_MIN_DIGEST_SIZE WC_SHA512_256_DIGEST_SIZE
+#elif defined(WOLFSSL_SHA3) && !defined(WOLFSSL_NOSHA3_256)
+    #define WC_MIN_DIGEST_SIZE WC_SHA3_256_DIGEST_SIZE
+#elif defined(HAVE_BLAKE2S)
+    #define WC_MIN_DIGEST_SIZE BLAKE2S_OUTBYTES /* 32 */
+#elif defined(WOLFSSL_SM3)
+    #define WC_MIN_DIGEST_SIZE WC_SM3_DIGEST_SIZE /* 32 */
+#elif defined(WOLFSSL_SHA384)
+    #define WC_MIN_DIGEST_SIZE WC_SHA384_DIGEST_SIZE
+#elif defined(WOLFSSL_SHA3) && !defined(WOLFSSL_NOSHA3_384)
+    #define WC_MIN_DIGEST_SIZE WC_SHA3_384_DIGEST_SIZE
+#elif defined(WOLFSSL_SHA512)
+    #define WC_MIN_DIGEST_SIZE WC_SHA512_DIGEST_SIZE
+#elif defined(WOLFSSL_SHA3) && !defined(WOLFSSL_NOSHA3_512)
+    #define WC_MIN_DIGEST_SIZE WC_SHA3_512_DIGEST_SIZE
+#elif defined(HAVE_BLAKE2B)
+    #define WC_MIN_DIGEST_SIZE BLAKE2B_OUTBYTES /* 64 */
+#elif defined(WOLFSSL_SHAKE128) || defined(WOLFSSL_SHAKE256)
+    #error SHAKE enabled without SHA-3.
+    #define WC_MIN_DIGEST_SIZE 64
+#else
+    #error No builtin hashes enabled and no WC_HASH_CUSTOM_MIN_DIGEST_SIZE.
+    #define WC_MIN_DIGEST_SIZE 64
+#endif
+
+/* We can't use preprocessor comparisons for asserts and conditional definitions
+ * here, because old FIPS uses enums for most of the digest sizes.  Moreover we
+ * can't use WC_SHA_DIGEST_SIZE at all here, because we support SHA-1-sized
+ * digests even in NO_SHA builds.
+ */
+#ifdef WC_MIN_DIGEST_SIZE_FOR_SIGN
+    wc_static_assert2((WC_MIN_DIGEST_SIZE_FOR_SIGN <= WC_MAX_DIGEST_SIZE) &&
+                      (WC_MIN_DIGEST_SIZE_FOR_SIGN >= WC_MIN_DIGEST_SIZE),
+                      "Supplied WC_MIN_DIGEST_SIZE_FOR_SIGN is out of range.");
+    #if defined(WC_FIPS_186_5_PLUS)
+        wc_static_assert2(WC_MIN_DIGEST_SIZE_FOR_SIGN >= 224 / 8,
+            "FIPS 186-5 requires a minimum sign-mode hash size >= SHA-224.");
+    #elif defined(WC_FIPS_186_4)
+        wc_static_assert2(WC_MIN_DIGEST_SIZE_FOR_SIGN >= 160 / 8,
+            "FIPS 186-4 requires a minimum sign-mode hash size >= SHA-1.");
+    #endif
+#else
+    #if defined(WC_FIPS_186_5_PLUS)
+        #define WC_MIN_DIGEST_SIZE_FOR_SIGN \
+            ((WC_MIN_DIGEST_SIZE < 224 / 8) ? (224 / 8) : WC_MIN_DIGEST_SIZE)
+    #elif defined(WC_FIPS_186_4)
+        #define WC_MIN_DIGEST_SIZE_FOR_SIGN \
+            ((WC_MIN_DIGEST_SIZE < 224 / 8) ? (160 / 8) : WC_MIN_DIGEST_SIZE)
+    #else
+        #define WC_MIN_DIGEST_SIZE_FOR_SIGN WC_MIN_DIGEST_SIZE
+    #endif
+#endif
+
+/* The minimum digest _FOR_VERIFY_under FIPS 186-5, FIPS 140-3, and SP 800-131A,
+ * is permitted to be shorter, to allow verify-only legacy DSA and ECDSA
+ * operations.
+ */
+#ifdef WC_MIN_DIGEST_SIZE_FOR_VERIFY
+    wc_static_assert2((WC_MIN_DIGEST_SIZE_FOR_VERIFY <= WC_MAX_DIGEST_SIZE) &&
+                      (WC_MIN_DIGEST_SIZE_FOR_VERIFY >= 128 / 8),
+                      "Supplied WC_MIN_DIGEST_SIZE_FOR_VERIFY is out of range.");
+    #if defined(WC_FIPS_186_4_PLUS)
+        wc_static_assert2(WC_MIN_DIGEST_SIZE_FOR_VERIFY >= 160 / 8,
+            "FIPS 186 requires a minimum verify-mode hash size >= SHA-1.");
+    #endif
+#else
+    #if defined(WC_FIPS_186_4_PLUS)
+        #define WC_MIN_DIGEST_SIZE_FOR_VERIFY \
+            ((WC_MIN_DIGEST_SIZE < 160 / 8) ? (160 / 8) : WC_MIN_DIGEST_SIZE)
+    #else
+        #define WC_MIN_DIGEST_SIZE_FOR_VERIFY WC_MIN_DIGEST_SIZE
+    #endif
 #endif
 
 #if !defined(NO_ASN) || !defined(NO_DH) || defined(HAVE_ECC)
@@ -238,14 +365,18 @@ WOLFSSL_API int wc_Sha384Hash_ex(const byte* data, word32 len, byte* hash,
 #ifdef WOLFSSL_SHA512
 #include <wolfssl/wolfcrypt/sha512.h>
 WOLFSSL_API int wc_Sha512Hash(const byte* data, word32 len, byte* hash);
-WOLFSSL_API int wc_Sha512_224Hash(const byte* data, word32 len, byte* hash);
-WOLFSSL_API int wc_Sha512_256Hash(const byte* data, word32 len, byte* hash);
 WOLFSSL_API int wc_Sha512Hash_ex(const byte* data, word32 len, byte* hash,
     void* heap, int devId);
-WOLFSSL_API int wc_Sha512_224Hash_ex(const byte* data, word32 len, byte* hash,
-    void* heap, int devId);
-WOLFSSL_API int wc_Sha512_256Hash_ex(const byte* data, word32 len, byte* hash,
-    void* heap, int devId);
+#ifndef WOLFSSL_NOSHA512_224
+    WOLFSSL_API int wc_Sha512_224Hash(const byte* data, word32 len, byte* hash);
+    WOLFSSL_API int wc_Sha512_224Hash_ex(const byte* data, word32 len,
+        byte* hash, void* heap, int devId);
+#endif
+#ifndef WOLFSSL_NOSHA512_256
+    WOLFSSL_API int wc_Sha512_256Hash(const byte* data, word32 len, byte* hash);
+    WOLFSSL_API int wc_Sha512_256Hash_ex(const byte* data, word32 len,
+        byte* hash, void* heap, int devId);
+#endif
 #endif /* WOLFSSL_SHA512 */
 
 #ifdef WOLFSSL_SHA3

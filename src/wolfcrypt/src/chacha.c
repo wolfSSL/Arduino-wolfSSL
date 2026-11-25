@@ -1,6 +1,6 @@
 /* chacha.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -52,7 +52,7 @@ Public domain.
 
     #define U32C(v) (v##U)
     #define U32V(v) ((word32)(v) & U32C(0xFFFFFFFF))
-    #define U8TO32_LITTLE(p) LITTLE32(((word32*)(p))[0])
+    #define U8TO32_LITTLE(p) LITTLE32(readUnalignedWord32(p))
 
     #define ROTATE(v,c) rotlFixed(v, c)
     #define XOR(v,w)    ((v) ^ (w))
@@ -66,11 +66,6 @@ Public domain.
         x[c] = PLUS(x[c],x[d]); x[b] = ROTATE(XOR(x[b],x[c]), 7);
 #endif /* HAVE_CHACHA */
 
-
-#if defined(WOLFSSL_RISCV_ASM) && !defined(NO_CHACHA_ASM)
-    /* implementation located in wolfcrypt/src/port/riscv/riscv-64-chacha.c */
-
-#else
 
 /* BEGIN ChaCha C implementation */
 #if defined(HAVE_CHACHA)
@@ -105,8 +100,40 @@ Public domain.
     #ifndef NO_AVX2_SUPPORT
         #define HAVE_INTEL_AVX2
     #endif
+    #if !defined(NO_AVX512_SUPPORT) && !defined(HAVE_INTEL_AVX512)
+        #define HAVE_INTEL_AVX512
+    #endif
+    /* SSSE3 is the baseline SIMD path, used on CPUs that lack AVX. */
+    #ifndef HAVE_INTEL_SSSE3
+        #define HAVE_INTEL_SSSE3
+    #endif
 
     static cpuid_flags_t cpuidFlags = WC_CPUID_INITIALIZER;
+#endif
+
+/* The aarch64 ChaCha assembly is NEON-only. When NEON might be absent, also
+ * build the C implementation: dispatch on ASIMD at runtime when NEON is
+ * compiled in, or use only the C path when NEON is disabled at build time. */
+#if defined(USE_ARM_CHACHA_SPEEDUP) && defined(__aarch64__)
+    #ifdef WOLFSSL_ARMASM_NO_NEON
+        #define WOLFSSL_ARM_CHACHA_C_ONLY
+    #else
+        #define WOLFSSL_ARM_CHACHA_NEON_FALLBACK
+    #endif
+#endif
+#if defined(WOLFSSL_ARM_CHACHA_NEON_FALLBACK) || \
+    defined(WOLFSSL_ARM_CHACHA_C_ONLY)
+    #define WOLFSSL_ARM_CHACHA_NEED_C
+#endif
+
+#ifdef WOLFSSL_ARM_CHACHA_NEON_FALLBACK
+    static cpuid_flags_t chacha_cpuid_flags = WC_CPUID_INITIALIZER;
+    /* Return non-zero when NEON/ASIMD is present and the asm path should run. */
+    static WC_INLINE int chacha_use_neon(void)
+    {
+        cpuid_get_flags_ex(&chacha_cpuid_flags);
+        return IS_AARCH64_ASIMD(chacha_cpuid_flags);
+    }
 #endif
 
 /**
@@ -115,7 +142,8 @@ Public domain.
   */
 int wc_Chacha_SetIV(ChaCha* ctx, const byte* inIv, word32 counter)
 {
-#if !defined(USE_ARM_CHACHA_SPEEDUP)
+#if (!defined(USE_ARM_CHACHA_SPEEDUP) || defined(WOLFSSL_ARM_CHACHA_NEED_C)) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP) && !defined(WOLFSSL_WIDE_BYTE)
     word32 temp[CHACHA_IV_WORDS];/* used for alignment of memory */
 #endif
 
@@ -124,24 +152,44 @@ int wc_Chacha_SetIV(ChaCha* ctx, const byte* inIv, word32 counter)
 
     ctx->left = 0; /* resets state */
 
-#if !defined(USE_ARM_CHACHA_SPEEDUP)
-    XMEMCPY(temp, inIv, CHACHA_IV_BYTES);
-    /* block counter */
-    ctx->X[CHACHA_MATRIX_CNT_IV+0] = counter;
-    /* fixed variable from nonce */
-    ctx->X[CHACHA_MATRIX_CNT_IV+1] = LITTLE32(temp[0]);
-    /* counter from nonce */
-    ctx->X[CHACHA_MATRIX_CNT_IV+2] = LITTLE32(temp[1]);
-    /* counter from nonce */
-    ctx->X[CHACHA_MATRIX_CNT_IV+3] = LITTLE32(temp[2]);
-#else
+#ifdef WOLFSSL_ARM_CHACHA_NEON_FALLBACK
+    if (chacha_use_neon())
+        wc_chacha_setiv(ctx->X, inIv, counter);
+    else
+#elif (defined(USE_ARM_CHACHA_SPEEDUP) && !defined(WOLFSSL_ARM_CHACHA_C_ONLY)) || \
+    defined(USE_RISCV_CHACHA_SPEEDUP)
     wc_chacha_setiv(ctx->X, inIv, counter);
+#endif
+#if (!defined(USE_ARM_CHACHA_SPEEDUP) || defined(WOLFSSL_ARM_CHACHA_NEED_C)) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP)
+    {
+#ifdef WOLFSSL_WIDE_BYTE
+        /* inIv holds one octet per cell, so XMEMCPY into a word32[] would
+         * overflow; load the three little-endian nonce/counter words
+         * octet-wise instead. */
+        ctx->X[CHACHA_MATRIX_CNT_IV+0] = counter;
+        ctx->X[CHACHA_MATRIX_CNT_IV+1] = U8TO32_LITTLE(inIv + 0);
+        ctx->X[CHACHA_MATRIX_CNT_IV+2] = U8TO32_LITTLE(inIv + 4);
+        ctx->X[CHACHA_MATRIX_CNT_IV+3] = U8TO32_LITTLE(inIv + 8);
+#else
+        XMEMCPY(temp, inIv, CHACHA_IV_BYTES);
+        /* block counter */
+        ctx->X[CHACHA_MATRIX_CNT_IV+0] = counter;
+        /* fixed variable from nonce */
+        ctx->X[CHACHA_MATRIX_CNT_IV+1] = LITTLE32(temp[0]);
+        /* counter from nonce */
+        ctx->X[CHACHA_MATRIX_CNT_IV+2] = LITTLE32(temp[1]);
+        /* counter from nonce */
+        ctx->X[CHACHA_MATRIX_CNT_IV+3] = LITTLE32(temp[2]);
+#endif
+    }
 #endif
 
     return 0;
 }
 
-#if !defined(USE_ARM_CHACHA_SPEEDUP)
+#if (!defined(USE_ARM_CHACHA_SPEEDUP) || defined(WOLFSSL_ARM_CHACHA_NEED_C)) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP)
 /* "expand 32-byte k" as unsigned 32 byte */
 static const word32 sigma[4] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
 /* "expand 16-byte k" as unsigned 16 byte */
@@ -153,7 +201,8 @@ static const word32 tau[4] = {0x61707865, 0x3120646e, 0x79622d36, 0x6b206574};
   */
 int wc_Chacha_SetKey(ChaCha* ctx, const byte* key, word32 keySz)
 {
-#if !defined(USE_ARM_CHACHA_SPEEDUP)
+#if (!defined(USE_ARM_CHACHA_SPEEDUP) || defined(WOLFSSL_ARM_CHACHA_NEED_C)) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP)
     const word32* constants;
     const byte*   k;
 #ifdef XSTREAM_ALIGN
@@ -167,7 +216,17 @@ int wc_Chacha_SetKey(ChaCha* ctx, const byte* key, word32 keySz)
     if (keySz != (CHACHA_MAX_KEY_SZ/2) && keySz != CHACHA_MAX_KEY_SZ)
         return BAD_FUNC_ARG;
 
-#if !defined(USE_ARM_CHACHA_SPEEDUP)
+#ifdef WOLFSSL_ARM_CHACHA_NEON_FALLBACK
+    if (chacha_use_neon())
+        wc_chacha_setkey(ctx->X, key, keySz);
+    else
+#elif (defined(USE_ARM_CHACHA_SPEEDUP) && !defined(WOLFSSL_ARM_CHACHA_C_ONLY)) || \
+    defined(USE_RISCV_CHACHA_SPEEDUP)
+    wc_chacha_setkey(ctx->X, key, keySz);
+#endif
+#if (!defined(USE_ARM_CHACHA_SPEEDUP) || defined(WOLFSSL_ARM_CHACHA_NEED_C)) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP)
+    {
 #ifdef XSTREAM_ALIGN
     if ((wc_ptr_t)key % 4) {
         WOLFSSL_MSG("wc_ChachaSetKey unaligned key");
@@ -211,16 +270,17 @@ int wc_Chacha_SetKey(ChaCha* ctx, const byte* key, word32 keySz)
     ctx->X[ 1] = constants[1];
     ctx->X[ 2] = constants[2];
     ctx->X[ 3] = constants[3];
-#else
-    wc_chacha_setkey(ctx->X, key, keySz);
+    }
 #endif
 
     ctx->left = 0; /* resets state */
+    ctx->keySet = 1;
 
     return 0;
 }
 
-#if !defined(USE_INTEL_CHACHA_SPEEDUP) && !defined(USE_ARM_CHACHA_SPEEDUP)
+#if (!defined(USE_INTEL_CHACHA_SPEEDUP) && !defined(USE_ARM_CHACHA_SPEEDUP) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP)) || defined(WOLFSSL_ARM_CHACHA_NEED_C)
 /**
   * Converts word into bytes with rotations having been done.
   */
@@ -229,7 +289,11 @@ static WC_INLINE void wc_Chacha_wordtobyte(word32 x[CHACHA_CHUNK_WORDS],
 {
     word32 i;
 
-    XMEMCPY(x, state, CHACHA_CHUNK_BYTES);
+    /* Copy the word32[] state array by its cell size, not CHACHA_CHUNK_BYTES:
+     * that macro is an octet count (=64) for serialized keystream buffers, and
+     * XMEMCPY works in CHAR_BIT-sized cells, so using it here would over-copy
+     * (2x) on CHAR_BIT == 16 targets. See chacha.h CHACHA_CHUNK_BYTES note. */
+    XMEMCPY(x, state, CHACHA_CHUNK_WORDS * sizeof(word32));
 
     for (i = (ROUNDS); i > 0; i -= 2) {
         QUARTERROUND(0, 4,  8, 12)
@@ -261,30 +325,87 @@ extern void chacha_encrypt_avx1(ChaCha* ctx, const byte* m, byte* c,
                                 word32 bytes);
 extern void chacha_encrypt_avx2(ChaCha* ctx, const byte* m, byte* c,
                                 word32 bytes);
+extern void chacha_encrypt_avx512(ChaCha* ctx, const byte* m, byte* c,
+                                  word32 bytes);
+extern void chacha_encrypt_avx512vl(ChaCha* ctx, const byte* m, byte* c,
+                                    word32 bytes);
+extern void chacha_encrypt_sse3(ChaCha* ctx, const byte* m, byte* c,
+                                word32 bytes);
 
 #ifdef __cplusplus
     }  /* extern "C" */
 #endif
 
+#if defined(USE_INTEL_CHACHA_SPEEDUP) && defined(HAVE_INTEL_AVX512)
+/* Decide whether to use the 512-bit (zmm) ChaCha path for this CPU.
+ *
+ * The zmm path processes 16 blocks at a time and is the fastest option on
+ * microarchitectures that run 512-bit code at full clock: AMD Zen 4/5 (no
+ * AVX-512 license) and Intel Ice Lake and later.  On Intel Skylake-SP /
+ * Cascade Lake-class parts, sustained 512-bit instructions trip the AVX-512
+ * frequency license and downclock the core - enough that the 256-bit AVX2 path
+ * is faster in practice (this matches OpenSSL, which suppresses its 16x zmm
+ * ChaCha there, and the Linux kernel, which uses only 256-bit AVX-512VL).
+ *
+ * There is no direct "does this core downclock" CPUID bit, so VAES presence is
+ * used as a generational proxy: the throttling parts (Skylake-SP / Skylake-X /
+ * Cascade Lake) predate VAES, whereas every microarchitecture that runs 512-bit
+ * without penalty (AMD Zen 4/5, Intel Ice Lake+) implements it.  A missing VAES
+ * only costs a little throughput (fall back to AVX2), never correctness.
+ *
+ * Override the heuristic with:
+ *   WOLFSSL_CHACHA20_AVX512_ALWAYS - use zmm whenever AVX-512 is present
+ *   WOLFSSL_CHACHA20_AVX512_NEVER  - never use zmm (always AVX2 or below)
+ */
+static WC_INLINE int chacha_avx512_beneficial(cpuid_flags_t flags)
+{
+#if defined(WOLFSSL_CHACHA20_AVX512_NEVER)
+    (void)flags;
+    return 0;
+#elif defined(WOLFSSL_CHACHA20_AVX512_ALWAYS)
+    return IS_INTEL_AVX512(flags) != 0;
+#else
+    return (IS_INTEL_AVX512(flags) != 0) && (IS_INTEL_VAES(flags) != 0);
+#endif
+}
+#endif /* USE_INTEL_CHACHA_SPEEDUP && HAVE_INTEL_AVX512 */
 
-#if !defined(USE_INTEL_CHACHA_SPEEDUP) && !defined(USE_ARM_CHACHA_SPEEDUP)
+
+#if (!defined(USE_INTEL_CHACHA_SPEEDUP) && !defined(USE_ARM_CHACHA_SPEEDUP) && \
+    !defined(USE_RISCV_CHACHA_SPEEDUP)) || defined(WOLFSSL_ARM_CHACHA_NEED_C)
 /**
   * Encrypt a stream of bytes
   */
 static void wc_Chacha_encrypt_bytes(ChaCha* ctx, const byte* m, byte* c,
                                     word32 bytes)
 {
+#ifdef WOLFSSL_WIDE_BYTE
+    /* A C byte is wider than an octet here, so the keystream cannot be aliased
+     * as both word32 and byte through a union; generate the 16 state words and
+     * serialize them little-endian into a one-octet-per-cell byte buffer. */
+    word32 ks32[CHACHA_CHUNK_WORDS];
+    byte   sbuf[CHACHA_CHUNK_BYTES];
+    byte*  state = sbuf;
+    #define WC_CHACHA_GEN_STREAM()                                  \
+        do {                                                        \
+            wc_Chacha_wordtobyte(ks32, ctx->X);                     \
+            BytesFromWordsLE32(sbuf, ks32, CHACHA_CHUNK_BYTES);     \
+        } while (0)
+#else
     union {
         byte state[CHACHA_CHUNK_BYTES];
         word32 state32[CHACHA_CHUNK_WORDS];
         wolfssl_word align_word; /* align for xorbufout */
     } tmp;
+    byte* state = tmp.state;
+    #define WC_CHACHA_GEN_STREAM() wc_Chacha_wordtobyte(tmp.state32, ctx->X)
+#endif
 
     /* handle left overs */
     if (bytes > 0 && ctx->left > 0) {
         word32 processed = min(bytes, ctx->left);
-        wc_Chacha_wordtobyte(tmp.state32, ctx->X); /* recreate the stream */
-        xorbufout(c, m, tmp.state + CHACHA_CHUNK_BYTES - ctx->left, processed);
+        WC_CHACHA_GEN_STREAM(); /* recreate the stream */
+        xorbufout(c, m, state + CHACHA_CHUNK_BYTES - ctx->left, processed);
         ctx->left -= processed;
 
         /* Used up all of the stream that was left, increment the counter */
@@ -298,9 +419,9 @@ static void wc_Chacha_encrypt_bytes(ChaCha* ctx, const byte* m, byte* c,
     }
 
     while (bytes >= CHACHA_CHUNK_BYTES) {
-        wc_Chacha_wordtobyte(tmp.state32, ctx->X);
+        WC_CHACHA_GEN_STREAM();
         ctx->X[CHACHA_MATRIX_CNT_IV] = PLUSONE(ctx->X[CHACHA_MATRIX_CNT_IV]);
-        xorbufout(c, m, tmp.state, CHACHA_CHUNK_BYTES);
+        xorbufout(c, m, state, CHACHA_CHUNK_BYTES);
         bytes -= CHACHA_CHUNK_BYTES;
         c += CHACHA_CHUNK_BYTES;
         m += CHACHA_CHUNK_BYTES;
@@ -310,10 +431,11 @@ static void wc_Chacha_encrypt_bytes(ChaCha* ctx, const byte* m, byte* c,
         /* in this case there will always be some left over since bytes is less
          * than CHACHA_CHUNK_BYTES, so do not increment counter after getting
          * stream in order for the stream to be recreated on next call */
-        wc_Chacha_wordtobyte(tmp.state32, ctx->X);
-        xorbufout(c, m, tmp.state, bytes);
+        WC_CHACHA_GEN_STREAM();
+        xorbufout(c, m, state, bytes);
         ctx->left = CHACHA_CHUNK_BYTES - bytes;
     }
+    #undef WC_CHACHA_GEN_STREAM
 }
 #endif /* !USE_INTEL_CHACHA_SPEEDUP */
 
@@ -326,6 +448,9 @@ int wc_Chacha_Process(ChaCha* ctx, byte* output, const byte* input,
 {
     if (ctx == NULL || input == NULL || output == NULL)
         return BAD_FUNC_ARG;
+
+    if (!ctx->keySet)
+        return MISSING_KEY;
 
 #ifdef USE_INTEL_CHACHA_SPEEDUP
     /* handle left overs */
@@ -347,6 +472,73 @@ int wc_Chacha_Process(ChaCha* ctx, byte* output, const byte* input,
 
     cpuid_get_flags_ex(&cpuidFlags);
 
+    /* One block or less. */
+#if defined(HAVE_INTEL_AVX1) && !defined(WOLFSSL_LINUXKM)
+    /* In userspace SAVE_VECTOR_REGISTERS is free, so a single AVX block (~285
+     * cyc) beats the scalar block (~435) - e.g. the per-record Poly1305 key
+     * derivation (a 32-byte ChaCha) in the ChaCha20-Poly1305 two-pass path.
+     * The AVX-512VL path already uses SIMD for one block; match that here. */
+    if (msglen <= CHACHA_CHUNK_BYTES && IS_INTEL_AVX512_VL(cpuidFlags) == 0 &&
+            IS_INTEL_AVX1(cpuidFlags)) {
+        SAVE_VECTOR_REGISTERS(return _svr_ret;);
+        chacha_encrypt_avx1(ctx, input, output, msglen);
+        RESTORE_VECTOR_REGISTERS();
+        return 0;
+    }
+#endif
+    /* At most one block: the scalar path avoids the SIMD broadcast/transpose
+     * setup and (in the Linux kernel module) the costly vector-register
+     * save/restore. */
+    if (msglen <= CHACHA_CHUNK_BYTES) {
+        chacha_encrypt_x64(ctx, input, output, msglen);
+        return 0;
+    }
+
+    /* 65..255 bytes without AVX-512VL: use the SSSE3 128-bit exact-block path.
+     * It is ~1.8x the scalar path and beats the 8-block AVX2 kernel (which
+     * always emits a full 512-byte key stream) below 256 bytes - e.g. a
+     * 192-byte key stream is 735 vs 1335 (scalar) vs 836 (AVX2) cycles on
+     * Coffee Lake.  This is the ChaCha20-Poly1305 short-record hot path (poly
+     * key + <=2 data blocks).  At >=256 bytes the four-block AVX2/AVX1 kernels
+     * take over below. */
+#ifdef HAVE_INTEL_SSSE3
+    if (IS_INTEL_AVX512_VL(cpuidFlags) == 0 &&
+            msglen < 4 * CHACHA_CHUNK_BYTES &&
+            IS_INTEL_SSSE3(cpuidFlags)) {
+        SAVE_VECTOR_REGISTERS(return _svr_ret;);
+        chacha_encrypt_sse3(ctx, input, output, msglen);
+        RESTORE_VECTOR_REGISTERS();
+        return 0;
+    }
+#endif
+    if (IS_INTEL_AVX512_VL(cpuidFlags) == 0 &&
+            msglen < 4 * CHACHA_CHUNK_BYTES) {
+        chacha_encrypt_x64(ctx, input, output, msglen);
+        return 0;
+    }
+
+    #ifdef HAVE_INTEL_AVX512
+    /* Below one 16-block chunk (1024 bytes) the zmm path does no work and
+     * just tail-calls AVX2, so dispatch straight to AVX2 for smaller input. */
+    if (chacha_avx512_beneficial(cpuidFlags) &&
+            msglen >= 16 * CHACHA_CHUNK_BYTES) {
+        SAVE_VECTOR_REGISTERS(return _svr_ret;);
+        chacha_encrypt_avx512(ctx, input, output, msglen);
+        RESTORE_VECTOR_REGISTERS();
+        return 0;
+    }
+    /* Everything below the AVX2 512-byte minimum (1..511 bytes) is handled by
+     * the AVX-512VL path itself - whole 256-byte four-block chunks plus a
+     * partial four-block tail - using single-instruction vprold rotations on
+     * 128-bit registers (no AVX-512 frequency penalty).  It does not fall back
+     * to any other implementation. */
+    if (IS_INTEL_AVX512_VL(cpuidFlags) && msglen < 8 * CHACHA_CHUNK_BYTES) {
+        SAVE_VECTOR_REGISTERS(return _svr_ret;);
+        chacha_encrypt_avx512vl(ctx, input, output, msglen);
+        RESTORE_VECTOR_REGISTERS();
+        return 0;
+    }
+    #endif
     #ifdef HAVE_INTEL_AVX2
     if (IS_INTEL_AVX2(cpuidFlags)) {
         SAVE_VECTOR_REGISTERS(return _svr_ret;);
@@ -361,35 +553,59 @@ int wc_Chacha_Process(ChaCha* ctx, byte* output, const byte* input,
         RESTORE_VECTOR_REGISTERS();
         return 0;
     }
+    #ifdef HAVE_INTEL_SSSE3
+    else if (IS_INTEL_SSSE3(cpuidFlags)) {
+        SAVE_VECTOR_REGISTERS(return _svr_ret;);
+        chacha_encrypt_sse3(ctx, input, output, msglen);
+        RESTORE_VECTOR_REGISTERS();
+        return 0;
+    }
+    #endif
     else {
         chacha_encrypt_x64(ctx, input, output, msglen);
         return 0;
     }
-#elif defined(USE_ARM_CHACHA_SPEEDUP)
-    /* Handle left over bytes from last block. */
-    if ((msglen > 0) && (ctx->left > 0)) {
-        byte* over = ((byte*)ctx->over) + CHACHA_CHUNK_BYTES - ctx->left;
-        word32 l = min(msglen, ctx->left);
+#elif defined(USE_ARM_CHACHA_SPEEDUP) || defined(USE_RISCV_CHACHA_SPEEDUP)
+#ifdef WOLFSSL_ARM_CHACHA_NEON_FALLBACK
+    if (chacha_use_neon())
+#endif
+#ifndef WOLFSSL_ARM_CHACHA_C_ONLY
+    {
+        /* Handle left over bytes from last block. */
+        if ((msglen > 0) && (ctx->left > 0)) {
+            byte* over = ((byte*)ctx->over) + CHACHA_CHUNK_BYTES - ctx->left;
+            word32 l = min(msglen, ctx->left);
 
-        wc_chacha_use_over(over, output, input, l);
+            wc_chacha_use_over(over, output, input, l);
 
-        ctx->left -= l;
-        input += l;
-        output += l;
-        msglen -= l;
+            ctx->left -= l;
+            input += l;
+            output += l;
+            msglen -= l;
+        }
+
+        if (msglen != 0) {
+            wc_chacha_crypt_bytes(ctx, output, input, msglen);
+        }
+        return 0;
     }
-
-    if (msglen != 0) {
-        wc_chacha_crypt_bytes(ctx, output, input, msglen);
+#endif
+#ifdef WOLFSSL_ARM_CHACHA_NEED_C
+#ifdef WOLFSSL_ARM_CHACHA_NEON_FALLBACK
+    else
+#endif
+    {
+        wc_Chacha_encrypt_bytes(ctx, input, output, msglen);
+        return 0;
     }
-    return 0;
+#endif
 #else
     wc_Chacha_encrypt_bytes(ctx, input, output, msglen);
     return 0;
 #endif
 }
 #endif /* HAVE_CHACHA */
-#endif /* END ChaCha C implementation */
+/* END ChaCha C implementation */
 
 #if defined(HAVE_CHACHA) && defined(HAVE_XCHACHA)
 
@@ -444,19 +660,44 @@ int wc_XChacha_SetKey(ChaCha *ctx,
     word32 k[CHACHA_MAX_KEY_SZ];
     byte   iv[CHACHA_IV_BYTES];
 
-    if (nonceSz != XCHACHA_NONCE_BYTES)
-        return BAD_FUNC_ARG;
+    /* k will hold the HChacha-derived subkey and iv the derived IV. Register
+     * from the top with a zero baseline so every exit (including the arg/setup
+     * error returns below, where the buffers are still zero) is covered. */
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    XMEMSET(k, 0, sizeof k);
+    XMEMSET(iv, 0, sizeof iv);
+    wc_MemZero_Add("wc_XChacha_SetKey k", k, sizeof k);
+    wc_MemZero_Add("wc_XChacha_SetKey iv", iv, sizeof iv);
+#endif
 
-    if ((ret = wc_Chacha_SetKey(ctx, key, keySz)) < 0)
+    if (nonceSz != XCHACHA_NONCE_BYTES) {
+    #ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Check(k, sizeof k);
+        wc_MemZero_Check(iv, sizeof iv);
+    #endif
+        return BAD_FUNC_ARG;
+    }
+
+    if ((ret = wc_Chacha_SetKey(ctx, key, keySz)) < 0) {
+    #ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Check(k, sizeof k);
+        wc_MemZero_Check(iv, sizeof iv);
+    #endif
         return ret;
+    }
 
     /* form a first chacha IV from the first 16 bytes of the nonce.
      * the first word is supplied in the "counter" arg, and
      * the result is a full 128 bit nonceful IV for the one-time block
      * crypto op that follows.
      */
-    if ((ret = wc_Chacha_SetIV(ctx, nonce + 4, U8TO32_LITTLE(nonce))) < 0)
+    if ((ret = wc_Chacha_SetIV(ctx, nonce + 4, U8TO32_LITTLE(nonce))) < 0) {
+    #ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Check(k, sizeof k);
+        wc_MemZero_Check(iv, sizeof iv);
+    #endif
         return ret;
+    }
 
     wc_HChacha_block(ctx, k, 20); /* 20 rounds, but keeping half the output. */
 
@@ -469,11 +710,23 @@ int wc_XChacha_SetKey(ChaCha *ctx,
     XMEMSET(iv, 0, 4);
     XMEMCPY(iv + 4, nonce + 16, 8);
 
-    if ((ret = wc_Chacha_SetIV(ctx, iv, counter)) < 0)
+    if ((ret = wc_Chacha_SetIV(ctx, iv, counter)) < 0) {
+        /* k and iv hold derived key material - wipe before erroring out. */
+        ForceZero(k, sizeof k);
+        ForceZero(iv, sizeof iv);
+    #ifdef WOLFSSL_CHECK_MEM_ZERO
+        wc_MemZero_Check(k, sizeof k);
+        wc_MemZero_Check(iv, sizeof iv);
+    #endif
         return ret;
+    }
 
     ForceZero(k, sizeof k);
     ForceZero(iv, sizeof iv);
+#ifdef WOLFSSL_CHECK_MEM_ZERO
+    wc_MemZero_Check(k, sizeof k);
+    wc_MemZero_Check(iv, sizeof iv);
+#endif
 
     return 0;
 }

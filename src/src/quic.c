@@ -1,6 +1,6 @@
 /* quic.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -70,17 +70,26 @@ static QuicRecord *quic_record_make(WOLFSSL *ssl,
 {
     QuicRecord *qr;
 
+    /* a NULL return is reported as WOLFSSL_FAILURE by the caller, so the
+     * reason has to be left on ssl->error for wolfSSL_get_error() */
     qr = (QuicRecord*)XMALLOC(sizeof(*qr), ssl->heap, DYNAMIC_TYPE_TMP_BUFFER);
     if (qr) {
-        memset(qr, 0, sizeof(*qr));
+        XMEMSET(qr, 0, sizeof(*qr));
         qr->level = level;
         if (level == wolfssl_encryption_early_data) {
+            if (len > (size_t)WOLFSSL_QUIC_MAX_RECORD_CAPACITY) {
+                WOLFSSL_MSG("QUIC early data length larger than expected");
+                ssl->error = BUFFER_E;
+                quic_record_free(ssl, qr);
+                return NULL;
+            }
             qr->capacity = qr->len = (word32)len;
         }
         else {
             qr->capacity = qr->len = (word32) qr_length(data, len);
             if (qr->capacity > WOLFSSL_QUIC_MAX_RECORD_CAPACITY) {
                 WOLFSSL_MSG("QUIC length read larger than expected");
+                ssl->error = BUFFER_E;
                 quic_record_free(ssl, qr);
                 return NULL;
             }
@@ -91,9 +100,13 @@ static QuicRecord *quic_record_make(WOLFSSL *ssl,
         qr->data = (uint8_t*)XMALLOC(qr->capacity, ssl->heap,
                                      DYNAMIC_TYPE_TMP_BUFFER);
         if (!qr->data) {
+            ssl->error = MEMORY_ERROR;
             quic_record_free(ssl, qr);
             return NULL;
         }
+    }
+    else {
+        ssl->error = MEMORY_ERROR;
     }
     return qr;
 }
@@ -134,7 +147,10 @@ static int quic_record_append(WOLFSSL *ssl, QuicRecord *qr, const uint8_t *data,
         /* sanity check on length read from wire before use */
         if (qr->len > WOLFSSL_QUIC_MAX_RECORD_CAPACITY) {
             WOLFSSL_MSG("Length read for quic is larger than expected");
-            ret = BUFFER_E;
+            /* reset len so a later append cannot copy past the buffer */
+            qr->len = 0;
+            ssl->error = BUFFER_E;
+            ret = WOLFSSL_FAILURE;
             goto cleanup;
         }
 
@@ -142,6 +158,10 @@ static int quic_record_append(WOLFSSL *ssl, QuicRecord *qr, const uint8_t *data,
             uint8_t *ndata = (uint8_t*)XREALLOC(qr->data, qr->len, ssl->heap,
                                                 DYNAMIC_TYPE_TMP_BUFFER);
             if (!ndata) {
+                /* keep len consistent with the unchanged buffer so a later
+                 * append does not copy into the smaller allocation */
+                qr->len = 0;
+                ssl->error = MEMORY_ERROR;
                 ret = WOLFSSL_FAILURE;
                 goto cleanup;
             }
@@ -184,23 +204,24 @@ static word32 add_rec_header(byte* output, word32 length, byte type)
 
 static sword32 quic_record_transfer(QuicRecord* qr, byte* buf, word32 sz)
 {
-    word32 len = qr->end - qr->start;
+    word32 len;
     word32 offset = 0;
     word32 rlen;
 
-    if (len <= 0) {
+    if (qr->end <= qr->start) {
         return 0;
     }
-
-    /* We check if the buf is at least RECORD_HEADER_SZ */
-    if (sz < RECORD_HEADER_SZ) {
-        return WOLFSSL_FATAL_ERROR;
-    }
+    len = qr->end - qr->start;
 
     if (qr->rec_hdr_remain == 0) {
-        /* start a new TLS record */
-        rlen = (qr->len <= (word32)MAX_RECORD_SIZE) ?
-                qr->len : (word32)MAX_RECORD_SIZE;
+        /* a new TLS record needs room for its header, the body of a record
+         * already started can be handed out in smaller pieces */
+        if (sz < RECORD_HEADER_SZ) {
+            return WOLFSSL_FATAL_ERROR;
+        }
+        /* start a new TLS record over the bytes left to transfer */
+        rlen = (len <= (word32)MAX_RECORD_SIZE) ?
+                len : (word32)MAX_RECORD_SIZE;
         offset += add_rec_header(buf, rlen,
                                  (qr->level == wolfssl_encryption_early_data) ?
                                   application_data : handshake);
@@ -227,7 +248,7 @@ const QuicTransportParam* QuicTransportParam_new(const uint8_t* data,
 {
     QuicTransportParam* tp;
 
-    if (len > 65353) return NULL;
+    if (len > 65535) return NULL;
     tp = (QuicTransportParam*)XMALLOC(sizeof(*tp), heap, DYNAMIC_TYPE_TLSX);
     if (!tp) return NULL;
     tp->data = (uint8_t*)XMALLOC(len, heap, DYNAMIC_TYPE_TLSX);
@@ -285,6 +306,9 @@ void wolfSSL_quic_clear(WOLFSSL* ssl)
         ssl->quic.transport_peer_draft = NULL;
     }
     ssl->quic.enc_level_write = wolfssl_encryption_initial;
+    ssl->quic.enc_level_write_next = wolfssl_encryption_initial;
+    ssl->quic.enc_level_read = wolfssl_encryption_initial;
+    ssl->quic.enc_level_read_next = wolfssl_encryption_initial;
     ssl->quic.enc_level_latest_recvd = wolfssl_encryption_initial;
 
     while ((qd = ssl->quic.input_head)) {
@@ -430,7 +454,7 @@ int wolfSSL_get_peer_quic_transport_version(const WOLFSSL* ssl)
 {
     return ssl->quic.transport_peer ?
         TLSX_KEY_QUIC_TP_PARAMS : (ssl->quic.transport_peer_draft ?
-        TLSX_KEY_QUIC_TP_PARAMS : -1);
+        TLSX_KEY_QUIC_TP_PARAMS_DRAFT : -1);
 }
 
 
@@ -643,6 +667,10 @@ int wolfSSL_quic_read_write(WOLFSSL* ssl)
 
     if (!wolfSSL_is_quic(ssl)) {
         WOLFSSL_MSG("WOLFSSL_QUIC_READ_WRITE not a QUIC SSL");
+        /* the check above also passes for a NULL ssl */
+        if (ssl != NULL) {
+            ssl->error = BAD_FUNC_ARG;
+        }
         ret = WOLFSSL_FAILURE;
         goto cleanup;
     }
@@ -668,25 +696,37 @@ int wolfSSL_process_quic_post_handshake(WOLFSSL* ssl)
 
     if (!wolfSSL_is_quic(ssl)) {
         WOLFSSL_MSG("WOLFSSL_QUIC_POST_HS not a QUIC SSL");
+        /* the check above also passes for a NULL ssl */
+        if (ssl != NULL) {
+            ssl->error = BAD_FUNC_ARG;
+        }
         ret = WOLFSSL_FAILURE;
         goto cleanup;
     }
 
     if (ssl->options.handShakeState != HANDSHAKE_DONE) {
         WOLFSSL_MSG("WOLFSSL_QUIC_POST_HS handshake is not done yet");
+        ssl->error = NOT_READY_ERROR;
         ret = WOLFSSL_FAILURE;
         goto cleanup;
     }
 
+    /* SSL_process_quic_post_handshake() is defined as returning 1 or 0, so
+     * the code goes on ssl->error rather than into the return value */
     while (ssl->quic.input_head != NULL
            || ssl->buffers.inputBuffer.length > 0) {
         if ((nret = ProcessReply(ssl)) < 0) {
-            ret = nret;
+            ssl->error = nret;
+            ret = WOLFSSL_FAILURE;
             break;
         }
     }
     while (ssl->buffers.outputBuffer.length > 0) {
-        SendBuffered(ssl);
+        if ((nret = SendBuffered(ssl)) < 0) {
+            ssl->error = nret;
+            ret = WOLFSSL_FAILURE;
+            break;
+        }
     }
 
 cleanup:
@@ -704,6 +744,10 @@ int wolfSSL_provide_quic_data(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL level,
     WOLFSSL_ENTER("wolfSSL_provide_quic_data");
     if (!wolfSSL_is_quic(ssl)) {
         WOLFSSL_MSG("WOLFSSL_QUIC_PROVIDE_DATA not a QUIC SSL");
+        /* the check above also passes for a NULL ssl */
+        if (ssl != NULL) {
+            ssl->error = BAD_FUNC_ARG;
+        }
         ret = WOLFSSL_FAILURE;
         goto cleanup;
     }
@@ -712,6 +756,7 @@ int wolfSSL_provide_quic_data(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL level,
         || (ssl->quic.input_tail && level < ssl->quic.input_tail->level)
         || level < ssl->quic.enc_level_latest_recvd) {
         WOLFSSL_MSG("WOLFSSL_QUIC_PROVIDE_DATA wrong encryption level");
+        ssl->error = QUIC_WRONG_ENC_LEVEL;
         ret = WOLFSSL_FAILURE;
         goto cleanup;
     }
@@ -720,6 +765,7 @@ int wolfSSL_provide_quic_data(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL level,
         if (ssl->quic.scratch) {
             if (ssl->quic.scratch->level != level) {
                 WOLFSSL_MSG("WOLFSSL_QUIC_PROVIDE_DATA wrong encryption level");
+                ssl->error = QUIC_WRONG_ENC_LEVEL;
                 ret = WOLFSSL_FAILURE;
                 goto cleanup;
             }
@@ -746,6 +792,7 @@ int wolfSSL_provide_quic_data(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL level,
             /* start of next record with all bytes for the header */
             ssl->quic.scratch = quic_record_make(ssl, level, data, len);
             if (!ssl->quic.scratch) {
+                /* quic_record_make() left the reason on ssl->error */
                 ret = WOLFSSL_FAILURE;
                 goto cleanup;
             }
@@ -843,6 +890,11 @@ static int wolfSSL_quic_send_internal(WOLFSSL* ssl)
         }
         else {
             /* at start of a TLS Record */
+            if (length < RECORD_HEADER_SZ) {
+                WOLFSSL_MSG("WOLFSSL_QUIC_SEND application failed");
+                ret = FWRITE_ERROR;
+                goto cleanup;
+            }
             rl = (RecordLayerHeader*)output;
             ato16(rl->length, &rlen);
             output += RECORD_HEADER_SZ;
@@ -873,6 +925,34 @@ cleanup:
 int wolfSSL_quic_send(WOLFSSL* ssl)
 {
     return wolfSSL_quic_send_internal(ssl);
+}
+
+/* Report a fatal handshake failure to the QUIC protocol handler, which closes
+ * the connection with it (RFC 9001 Section 4.8). code is a TLS
+ * AlertDescription, or WOLFSSL_QUIC_ERR_CRYPTO_ERROR | code for a QUIC
+ * transport error (RFC 9000 Section 20.1), which keeps the two apart in the
+ * alert history. Returns 0 when the handler accepted it. */
+int wolfSSL_quic_send_alert(WOLFSSL* ssl, int severity, int code)
+{
+    int ret;
+
+    WOLFSSL_ENTER("wolfSSL_quic_send_alert");
+    WOLFSSL_MSG_EX("quic_send_alert: 0x%x", code);
+
+    /* Recorded as given: TLS alerts stay in alert space as on TLS
+     * connections, transport codes arrive offset above it. The level drives
+     * the callers' duplicate-alert guards. */
+    ssl->alert_history.last_tx.code = code;
+    ssl->alert_history.last_tx.level = severity;
+
+    /* The callback byte is the code's low byte: the AlertDescription of a TLS
+     * alert, or the transport code itself. */
+    ret = !ssl->quic.method->send_alert(ssl, ssl->quic.enc_level_write,
+                                        (uint8_t)code);
+    if (ret) {
+        WOLFSSL_MSG("QUIC send_alert callback error");
+    }
+    return ret;
 }
 
 int wolfSSL_quic_forward_secrets(WOLFSSL* ssl, int ktype, int side)
@@ -1225,6 +1305,11 @@ int wolfSSL_quic_hkdf_expand(uint8_t* dest, size_t destlen,
 
     WOLFSSL_ENTER("wolfSSL_quic_hkdf_expand");
 
+    if (secretlen > INT_MAX || infolen > INT_MAX) {
+        ret = WOLFSSL_FAILURE;
+        goto cleanup;
+    }
+
     pctx = wolfSSL_EVP_PKEY_CTX_new_id(WC_NID_hkdf, NULL);
     if (pctx == NULL) {
         ret = WOLFSSL_FAILURE;
@@ -1264,6 +1349,11 @@ int wolfSSL_quic_hkdf(uint8_t* dest, size_t destlen,
     int ret = WOLFSSL_SUCCESS;
 
     WOLFSSL_ENTER("wolfSSL_quic_hkdf");
+
+    if (secretlen > INT_MAX || saltlen > INT_MAX || infolen > INT_MAX) {
+        ret = WOLFSSL_FAILURE;
+        goto cleanup;
+    }
 
     pctx = wolfSSL_EVP_PKEY_CTX_new_id(WC_NID_hkdf, NULL);
     if (pctx == NULL) {
@@ -1334,6 +1424,10 @@ int wolfSSL_quic_aead_encrypt(uint8_t* dest, WOLFSSL_EVP_CIPHER_CTX* ctx,
      * TODO: there is some fiddling in OpenSSL+quic in regard to CCM ciphers
      *       which we need to check.
      */
+    if (plainlen > INT_MAX || aadlen > INT_MAX) {
+        return WOLFSSL_FAILURE;
+    }
+
     if (wolfSSL_EVP_CipherInit(ctx, NULL, NULL, iv, 1) != WOLFSSL_SUCCESS
         || wolfSSL_EVP_CipherUpdate(
                 ctx, NULL, &len, aad, (int)aadlen) != WOLFSSL_SUCCESS
@@ -1359,7 +1453,7 @@ int wolfSSL_quic_aead_decrypt(uint8_t* dest, WOLFSSL_EVP_CIPHER_CTX* ctx,
     const uint8_t* tag;
 
     /* See rationale for wolfSSL_quic_aead_encrypt() on why this is here */
-    if (enclen > INT_MAX || ctx->authTagSz > (int)enclen) {
+    if (enclen > INT_MAX || aadlen > INT_MAX || ctx->authTagSz > (int)enclen) {
         return WOLFSSL_FAILURE;
     }
 

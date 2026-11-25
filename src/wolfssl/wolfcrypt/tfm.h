@@ -1,6 +1,6 @@
 /* tfm.h
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfSSL.
  *
@@ -370,6 +370,10 @@ while (0)
     mp_init(name)
 /* Type to cast to when using size macros. */
 #define MP_INT_SIZE     mp_int
+
+/* tfm.h allocates full-sized mp_int buffers, so DECL_MP_INT_SIZE_DYN cannot
+ * be undersized for any 'bits' value -- no check is needed. */
+#define MP_BITS_OVER_MAX(bits, max) 0
 
 
 #ifdef HAVE_WOLF_BIGINT
@@ -843,7 +847,7 @@ MP_API int  mp_2expt(mp_int* a, int b);
 
 MP_API int  mp_div(mp_int * a, mp_int * b, mp_int * c, mp_int * d);
 
-MP_API int  mp_cmp(mp_int *a, mp_int *b);
+MP_API int  mp_cmp(const mp_int *a, const mp_int *b);
 #define mp_cmp_ct(a, b, n) mp_cmp(a, b)
 MP_API int  mp_cmp_d(mp_int *a, mp_digit b);
 
